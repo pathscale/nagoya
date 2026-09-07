@@ -38,6 +38,10 @@ name = "vs_tokio"
 required-features = ["std"]
 
 [[example]]
+name = "counters"
+required-features = ["std"]
+
+[[example]]
 name = "submit_only"
 required-features = ["std"]
 
