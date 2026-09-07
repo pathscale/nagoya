@@ -17,9 +17,30 @@ default = ["std"]
 # threads, and the parker `block_on` uses when there is one to park.
 std = ["ps-st3/host"]
 
+# Pointed at the local checkout while pathscale/ps-st3#4 is open: the published
+# 0.5.0 does not have the submit fix, and the numbers in examples/ were taken
+# with it. Drop this line once that lands and 0.5.1 is out, or the benchmarks
+# quietly measure the wrong thing.
+[patch.crates-io]
+ps-st3 = { path = "/Users/revenge/code/ps-st3" }
+
 [dependencies]
 ps-st3 = { version = "0.5.0", default-features = false, features = ["fanout"] }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 
 [dev-dependencies]
 ps-st3 = { version = "0.5.0", features = ["fanout", "host"] }
+# The comparison arm. Only the scheduler is used; nothing here needs its I/O.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "vs_tokio"
+required-features = ["std"]
+
+[[example]]
+name = "submit_only"
+required-features = ["std"]
+
+[[example]]
+name = "where_the_time_is"
+required-features = ["std"]
