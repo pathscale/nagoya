@@ -65,6 +65,18 @@ name = "profile_tokio"
 required-features = ["std"]
 
 [[example]]
+name = "llm"
+required-features = ["std"]
+
+[[example]]
+name = "book"
+required-features = ["std"]
+
+[[example]]
+name = "producers"
+required-features = ["std"]
+
+[[example]]
 name = "iter"
 required-features = ["std"]
 
