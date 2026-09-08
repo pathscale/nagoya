@@ -19,6 +19,8 @@
 use alloc::sync::Arc;
 use core::future::Future;
 use core::mem;
+use core::cell::UnsafeCell;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -51,12 +53,37 @@ pub(crate) struct RawTask<F: Future> {
     /// Polled in place. Taking it out and putting it back would move it, which
     /// is the one thing a `Future` may not survive; the `Arc` never moves, so a
     /// pointer into it is a valid pin.
-    future: Mutex<Option<F>>,
+    ///
+    /// **No lock, because `state` already is one.** A thread reaches `run` only
+    /// by winning the `IDLE -> RUNNING` compare-exchange in `schedule`, and
+    /// nothing leaves `RUNNING` except that same thread. So the state machine
+    /// already grants exclusive access to this cell for exactly the window in
+    /// which it is touched, and a `Mutex` around it was a second lock enforcing
+    /// what the first one had proved: two acquisitions per poll for nothing.
+    future: UnsafeCell<Option<F>>,
     output: Mutex<Option<F::Output>>,
     waiter: Mutex<Option<Waker>>,
     finished: AtomicU8,
     state: AtomicU8,
     pool: Arc<Pool>,
+}
+
+// SAFETY: the `UnsafeCell` is what stops these being derived. Access to it is
+// serialised by `state`, as the field's own comment sets out: one thread at a
+// time, and the handover between them goes through an `AcqRel` compare-exchange
+// on `state`, which is the edge that publishes the writes. `F` and `F::Output`
+// are `Send`, so moving the task between threads moves them legally.
+unsafe impl<F> Send for RawTask<F>
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+}
+unsafe impl<F> Sync for RawTask<F>
+where
+    F: Future + Send,
+    F::Output: Send,
+{
 }
 
 impl<F> Joinable<F::Output> for RawTask<F>
@@ -85,7 +112,7 @@ where
 {
     pub(crate) fn spawn(future: F, pool: Arc<Pool>) -> Arc<dyn Joinable<F::Output>> {
         let task = Arc::new(Self {
-            future: Mutex::new(Some(future)),
+            future: UnsafeCell::new(Some(future)),
             output: Mutex::new(None),
             waiter: Mutex::new(None),
             finished: AtomicU8::new(0),
@@ -146,12 +173,21 @@ where
 
     /// Poll until the future is pending with no wake outstanding, or done.
     fn run(self: Arc<Self>) {
-        loop {
-            let waker = waker_of(self.clone());
-            let mut context = Context::from_waker(&waker);
+        // **One waker for the whole run, and it owns nothing.** Built from a
+        // borrowed pointer and never dropped, so it costs no reference count;
+        // the vtable's `clone` takes a real one for any waker that outlives
+        // this call. Building it inside the loop, which is what this replaces,
+        // took a count up and put it back down on every poll.
+        let waker = borrowed_waker(&self);
+        let mut context = Context::from_waker(&waker);
 
+        loop {
             let polled = {
-                let mut slot = self.future.lock();
+                // SAFETY: this thread holds `RUNNING`, which is exclusive: the
+                // only transition into it is the compare-exchange in
+                // `schedule`, and the only transitions out are made below by
+                // this thread. So nothing else may touch the cell now.
+                let slot = unsafe { &mut *self.future.get() };
                 let Some(future) = slot.as_mut() else {
                     self.state.store(IDLE, Ordering::Release);
                     return;
@@ -166,8 +202,13 @@ where
 
             match polled {
                 Poll::Ready(value) => {
+                    // Dropped before `state` says `DONE`, so this thread is
+                    // still the exclusive one when the future's destructor
+                    // runs.
+                    //
+                    // SAFETY: as above, this thread still holds `RUNNING`.
+                    drop(unsafe { (*self.future.get()).take() });
                     self.state.store(DONE, Ordering::Release);
-                    drop(self.future.lock().take());
                     self.finish(value);
                     return;
                 }
@@ -197,6 +238,24 @@ where
     }
 }
 
+/// A `Waker` over a borrowed `Arc<RawTask>`, which takes no reference count.
+///
+/// `ManuallyDrop` is the whole trick: the returned waker is never dropped, so
+/// the count it did not take is never given back. Anything that wants a waker
+/// outliving this call clones it, and the vtable's `clone` takes a real count.
+fn borrowed_waker<F>(task: &Arc<RawTask<F>>) -> ManuallyDrop<Waker>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let raw = RawWaker::new(Arc::as_ptr(task).cast(), vtable::<F>());
+    // SAFETY: the vtable is written for exactly this pointer type. The pointer
+    // is valid for as long as the caller's `Arc` is, which is the whole of
+    // `run`, and the waker never outlives it because `ManuallyDrop` stops it
+    // being dropped and nothing here moves it out.
+    ManuallyDrop::new(unsafe { Waker::from_raw(raw) })
+}
+
 /// Run one poll of the task this pointer owns.
 ///
 /// # Safety
@@ -212,21 +271,6 @@ where
     // `schedule`, which pairs this function with a pointer of this type.
     let task = unsafe { Arc::from_raw(pointer.as_ptr().cast::<RawTask<F>>()) };
     task.run();
-}
-
-/// A waker over `Arc<RawTask>`, which is a thin pointer because the task type is
-/// concrete here. An `Arc<dyn Joinable>` would be fat and would not fit the
-/// `*const ()` a `RawWaker` carries.
-fn waker_of<F>(task: Arc<RawTask<F>>) -> Waker
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let raw = RawWaker::new(Arc::into_raw(task).cast(), vtable::<F>());
-    // SAFETY: the vtable below is written for exactly this pointer type, and
-    // the pointer came from `Arc::into_raw`, so every entry has an `Arc` to act
-    // on and the counts stay balanced.
-    unsafe { Waker::from_raw(raw) }
 }
 
 fn vtable<F>() -> &'static RawWakerVTable
