@@ -90,6 +90,11 @@ fn pool_alone() -> f64 {
 }
 
 /// The same work as a future, through nagoya.
+///
+/// Not in `main`'s sweep: the point of this example is the ceiling the pool
+/// puts on nagoya, and that is arms 1 and 3. Kept because the arm is the first
+/// thing wanted whenever the ceiling moves.
+#[allow(dead_code)]
 fn through_nagoya() -> f64 {
     with_pool(|pool| {
         let executor = nagoya::Executor::new(pool.clone());

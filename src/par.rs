@@ -161,13 +161,17 @@ where
     }
 }
 
+/// Everything a loop needs to start: the shared half, the pool to put pieces
+/// on, the range still to cover, and how small a piece may get.
+type Pending = (Arc<dyn Split>, Arc<Pool>, Range<usize>, usize);
+
 /// A parallel loop that has not finished yet.
 ///
 /// Created by [`par_for_each`]. Poll it to start the work and again to learn
 /// that it is done.
 pub struct ParForEach {
     /// Everything needed to start, taken on the first poll.
-    state: Option<(Arc<dyn Split>, Arc<Pool>, Range<usize>, usize)>,
+    state: Option<Pending>,
     started: Option<Arc<dyn Split>>,
 }
 
