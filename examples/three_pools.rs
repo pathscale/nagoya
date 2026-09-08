@@ -176,6 +176,68 @@ fn nagoya_run() -> f64 {
     elapsed
 }
 
+static FORTE: forte::ThreadPool = forte::ThreadPool::new();
+
+/// forte, which claims both jobs: a lower-overhead `rayon_core` and an async
+/// executor. Same closure shape as the rayon and fanout arms.
+fn forte_closures() -> f64 {
+    FORTE.resize_to(workers());
+    let finish = Finish::new();
+    let start = Instant::now();
+    for _ in 0..TASKS {
+        let finish = finish.clone();
+        FORTE.spawn(move |_: &forte::Worker| finish.tick());
+    }
+    finish.wait();
+    let elapsed = start.elapsed().as_secs_f64();
+    FORTE.depopulate();
+    elapsed
+}
+
+/// forte again, as futures, which is the tokio and nagoya shape.
+fn forte_futures() -> f64 {
+    FORTE.resize_to(workers());
+    let finish = Finish::new();
+    let start = Instant::now();
+    for _ in 0..TASKS {
+        let finish = finish.clone();
+        FORTE.spawn(async move { finish.tick() }).detach();
+    }
+    finish.wait();
+    let elapsed = start.elapsed().as_secs_f64();
+    FORTE.depopulate();
+    elapsed
+}
+
+/// How many pieces `par_iter` actually splits 100,000 items into.
+///
+/// This is the question behind the whole comparison. `fold`'s identity closure
+/// runs once per chunk the splitter produces, so counting its calls counts the
+/// real scheduled work items. If that number is small, then rayon's headline
+/// figure is not "tasks per second" in the sense the other arms mean it.
+fn par_iter_chunks() -> usize {
+    use rayon::prelude::*;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers())
+        .build()
+        .expect("a pool");
+    let chunks = Arc::new(AtomicUsize::new(0));
+    let counter = chunks.clone();
+    pool.install(move || {
+        (0..TASKS)
+            .into_par_iter()
+            .fold(
+                || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    0usize
+                },
+                |acc, _| acc + 1,
+            )
+            .sum::<usize>()
+    });
+    chunks.load(Ordering::Relaxed)
+}
+
 /// Rayon on its own ground, so the number above is not read as rayon's ceiling.
 ///
 /// `par_iter` splits recursively *inside* the pool: the work never crosses the
@@ -221,19 +283,34 @@ fn main() {
     );
     let (mut fan, mut ray, mut tok, mut nag) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut par = Vec::new();
+    let (mut fc, mut ff) = (Vec::new(), Vec::new());
     for _ in 0..REPS {
         fan.push(measure(fanout_run));
         ray.push(measure(rayon_run));
         tok.push(measure(tokio_run));
         nag.push(measure(nagoya_run));
         par.push(measure(rayon_par_iter));
+        fc.push(measure(forte_closures));
+        ff.push(measure(forte_futures));
     }
     println!("a closure, run once:");
     report("rayon", ray);
+    report("forte", fc);
     report("st3::fanout", fan);
     println!("\na future, polled to completion:");
     report("tokio", tok);
+    report("forte", ff);
     report("nagoya (on st3::fanout)", nag);
     println!("\nfor scale, rayon doing what rayon is for:");
     report("rayon par_iter", par);
+    // Counted over several runs: the split depends on how stealing happens to
+    // go, so it is a range and not a constant.
+    let splits: Vec<usize> = (0..REPS).map(|_| par_iter_chunks()).collect();
+    let (low, high) = (
+        splits.iter().min().expect("a run"),
+        splits.iter().max().expect("a run"),
+    );
+    println!(
+        "\n  ...which splits {TASKS} items into {low} to {high} pieces over {REPS} runs.\n  So that row is a few hundred scheduled work items and {TASKS} loop\n  iterations, not {TASKS} tasks. It is not comparable to the rows above it."
+    );
 }

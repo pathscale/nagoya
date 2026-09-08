@@ -35,6 +35,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # The other comparison arm. Not an async runtime: a data-parallel pool, so it
 # only appears in the arms that submit a closure rather than a future.
 rayon = "1"
+# A third comparison arm, and the only one that claims both jobs at once: forte
+# advertises itself as a lower-overhead `rayon_core` *and* an async executor.
+forte = "1.0.0-beta.1"
 
 [[example]]
 name = "vs_tokio"
