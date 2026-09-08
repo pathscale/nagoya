@@ -46,10 +46,12 @@ use core::task::{Context, Poll};
 use st3::fanout::Pool;
 
 mod block_on;
+mod fork;
 mod par;
 mod task;
 
 pub use block_on::block_on;
+pub use fork::{Hook, Hooks, Registry, Scope};
 pub use par::{par_for, ParFor};
 
 /// A handle to a spawned task's output.

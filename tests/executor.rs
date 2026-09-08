@@ -189,3 +189,81 @@ fn a_task_can_await_a_parallel_loop() {
     }));
     assert_eq!(hits.load(Ordering::Relaxed), 1_000);
 }
+
+/// `join` runs both halves and returns both results.
+#[test]
+fn join_runs_both_halves() {
+    let running = Running::new(4);
+    let registry = nagoya::Registry::new(running.executor.pool().clone());
+    let (left, right) = registry.join(|| 6 * 7, || "both");
+    assert_eq!(left, 42);
+    assert_eq!(right, "both");
+}
+
+/// A scope may spawn work borrowing the caller's stack, and does not return
+/// until that work has finished touching it.
+#[test]
+fn a_scope_waits_for_borrowed_work() {
+    let running = Running::new(4);
+    let registry = nagoya::Registry::new(running.executor.pool().clone());
+    let mut cells = vec![0usize; 64];
+    registry.scope(|scope| {
+        for (index, cell) in cells.iter_mut().enumerate() {
+            scope.spawn(move |_| *cell = index * 2);
+        }
+    });
+    for (index, cell) in cells.iter().enumerate() {
+        assert_eq!(*cell, index * 2, "cell {index}");
+    }
+}
+
+/// The three hooks fire, and the deadlock one only when nothing is running.
+#[test]
+fn the_blocking_hooks_fire() {
+    let running = Running::new(2);
+    let acquired = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicUsize::new(0));
+    let deadlocked = Arc::new(AtomicUsize::new(0));
+    let (a, r, d) = (acquired.clone(), released.clone(), deadlocked.clone());
+    let registry = nagoya::Registry::with_hooks(
+        running.executor.pool().clone(),
+        nagoya::Hooks {
+            on_acquire: Some(Arc::new(move || {
+                a.fetch_add(1, Ordering::Relaxed);
+            })),
+            on_release: Some(Arc::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+            })),
+            on_deadlock: Some(Arc::new(move || {
+                d.fetch_add(1, Ordering::Relaxed);
+            })),
+        },
+    );
+
+    registry.mark_blocked_and_wait(|| {});
+    assert_eq!(released.load(Ordering::Relaxed), 1);
+    assert_eq!(acquired.load(Ordering::Relaxed), 1);
+    // Two workers, one blocked: one is still running, so no deadlock.
+    assert_eq!(deadlocked.load(Ordering::Relaxed), 0);
+    assert!(!registry.is_deadlocked());
+}
+
+/// Every thread blocked and none running is what the deadlock hook reports.
+#[test]
+fn every_thread_blocked_is_a_deadlock() {
+    let running = Running::new(1);
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = seen.clone();
+    let registry = nagoya::Registry::with_hooks(
+        running.executor.pool().clone(),
+        nagoya::Hooks {
+            on_deadlock: Some(Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })),
+            ..nagoya::Hooks::default()
+        },
+    );
+    // One worker, and it blocks: active reaches zero with one blocked.
+    registry.mark_blocked_and_wait(|| {});
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+}
