@@ -40,6 +40,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # The other comparison arm. Not an async runtime: a data-parallel pool, so it
 # only appears in the arms that submit a closure rather than a future.
 rayon = "1"
+# The order-book benchmark parses real JSON with the real parser, because the
+# thing being measured is how much of a trading path is `serde_json` and a
+# decimal string turned into an `f64`. Approximating that would decide the
+# answer in advance.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # A third comparison arm, and the only one that claims both jobs at once: forte
 # advertises itself as a lower-overhead `rayon_core` *and* an async executor.
 forte = "1.0.0-beta.1"
@@ -62,6 +68,10 @@ required-features = ["std"]
 
 [[example]]
 name = "profile_tokio"
+required-features = ["std"]
+
+[[example]]
+name = "queue"
 required-features = ["std"]
 
 [[example]]
