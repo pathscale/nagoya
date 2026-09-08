@@ -263,6 +263,37 @@ fn rayon_par_iter() -> f64 {
     start.elapsed().as_secs_f64()
 }
 
+/// nagoya's parallel loop, against rayon's on the same shape.
+///
+/// The one difference that is not incidental: this is a future. `install`
+/// blocks the calling thread; `block_on` here parks it, and inside a task it
+/// would suspend instead of blocking anything.
+fn nagoya_par_for_each() -> f64 {
+    let host = Arc::new(StdHost::new(workers()));
+    let pool = Pool::new(workers(), 1024, host);
+    let threads: Vec<_> = (0..workers())
+        .map(|id| {
+            let pool = pool.clone();
+            let runner = pool.runner(id);
+            thread::spawn(move || {
+                let _ = pool.run(runner);
+            })
+        })
+        .collect();
+    let finish = Finish::new();
+    let counter = finish.clone();
+    let start = Instant::now();
+    nagoya::block_on(nagoya::par_for_each(pool.clone(), 0..TASKS, move |_| {
+        counter.tick();
+    }));
+    let elapsed = start.elapsed().as_secs_f64();
+    pool.shut_down();
+    for thread in threads {
+        let _ = thread.join();
+    }
+    elapsed
+}
+
 fn measure(body: impl FnOnce() -> f64) -> (f64, f64) {
     let before = cpu_seconds();
     let wall = body();
@@ -288,6 +319,7 @@ fn main() {
     let (mut fan, mut ray, mut tok, mut nag) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut par = Vec::new();
     let (mut fc, mut ff) = (Vec::new(), Vec::new());
+    let mut np = Vec::new();
     for _ in 0..REPS {
         fan.push(measure(fanout_run));
         ray.push(measure(rayon_run));
@@ -296,6 +328,7 @@ fn main() {
         par.push(measure(rayon_par_iter));
         fc.push(measure(forte_closures));
         ff.push(measure(forte_futures));
+        np.push(measure(nagoya_par_for_each));
     }
     println!("a closure, run once:");
     report("rayon", ray);
@@ -305,8 +338,9 @@ fn main() {
     report("tokio", tok);
     report("forte", ff);
     report("nagoya (on st3::fanout)", nag);
-    println!("\nfor scale, rayon doing what rayon is for:");
+    println!("\na parallel loop, split recursively:");
     report("rayon par_iter", par);
+    report("nagoya par_for_each", np);
     // Counted over several runs: the split depends on how stealing happens to
     // go, so it is a range and not a constant.
     let splits: Vec<usize> = (0..REPS).map(|_| par_iter_chunks()).collect();

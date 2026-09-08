@@ -137,3 +137,55 @@ fn a_task_can_spawn_and_await_another() {
 
     assert_eq!(block_on(outer), Some(42));
 }
+
+/// A parallel loop runs every index exactly once.
+#[test]
+fn a_parallel_loop_covers_its_range() {
+    let running = Running::new(4);
+    let seen: Arc<Vec<AtomicUsize>> = Arc::new((0..10_000).map(|_| AtomicUsize::new(0)).collect());
+    let counter = seen.clone();
+    block_on(nagoya::par_for_each(
+        running.executor.pool().clone(),
+        0..10_000,
+        move |i| {
+            counter[i].fetch_add(1, Ordering::Relaxed);
+        },
+    ));
+    for (index, hits) in seen.iter().enumerate() {
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "index {index}");
+    }
+}
+
+/// An empty range completes, rather than hanging on a count that never reaches
+/// zero.
+#[test]
+fn an_empty_parallel_loop_finishes() {
+    let running = Running::new(2);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    block_on(nagoya::par_for_each(
+        running.executor.pool().clone(),
+        5..5,
+        move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        },
+    ));
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+/// A parallel loop awaited from inside a spawned task, which is the shape the
+/// two APIs exist to combine.
+#[test]
+fn a_task_can_await_a_parallel_loop() {
+    let running = Running::new(4);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let pool = running.executor.pool().clone();
+    block_on(running.executor.spawn(async move {
+        nagoya::par_for_each(pool, 0..1_000, move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        })
+        .await;
+    }));
+    assert_eq!(hits.load(Ordering::Relaxed), 1_000);
+}
