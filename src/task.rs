@@ -17,7 +17,7 @@ use core::future::Future;
 use core::ptr::NonNull;
 
 use async_task::{Runnable, Task};
-use st3::fanout::{Job, Pool};
+use st3::fanout::{Act, Job, Pool};
 
 /// Put `future` on `pool` and hand back the handle to its result.
 pub(crate) fn spawn<F>(future: F, pool: Arc<Pool>) -> Task<F::Output>
@@ -46,14 +46,25 @@ where
     task
 }
 
-/// Run one poll of the task this pointer owns.
+/// Run one poll of the task this pointer owns, or release it unrun.
+///
+/// The `Act::Drop` arm is not a formality. A pool dropped with work still
+/// queued hands every job this function with `Drop`, and taking the `Runnable`
+/// back and letting it fall out of scope is what releases the future and
+/// everything it captured. `async_task` treats that as cancelling the task,
+/// which is the right reading: the poll it was scheduled for will never happen.
 ///
 /// # Safety
 ///
 /// `pointer` must have come from `Runnable::into_raw` and not yet been given to
 /// `Runnable::from_raw`.
-unsafe fn poll_once(pointer: NonNull<()>) {
+unsafe fn poll_once(pointer: NonNull<()>, act: Act) {
     // SAFETY: the caller's obligation, discharged at the one call site above.
     let runnable = unsafe { Runnable::<()>::from_raw(pointer) };
-    runnable.run();
+    match act {
+        Act::Run => {
+            runnable.run();
+        }
+        Act::Drop => drop(runnable),
+    }
 }

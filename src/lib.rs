@@ -47,10 +47,12 @@ use st3::fanout::Pool;
 
 mod block_on;
 mod par;
+mod yield_now;
 mod task;
 
 pub use block_on::block_on;
 pub use par::{par_for, Cancel, ParFor};
+pub use yield_now::{yield_now, YieldNow};
 
 /// A handle to a spawned task's output.
 ///

@@ -243,3 +243,23 @@ fn dropping_a_loop_cancels_it() {
     drop(loop_);
     assert!(cancel.is_cancelled(), "dropping the future did not cancel it");
 }
+
+/// A yielding task finishes, and lets others run while it does.
+#[test]
+fn a_task_can_yield_its_worker() {
+    let running = Running::new(2);
+    let order = Arc::new(AtomicUsize::new(0));
+    let (first, second) = (order.clone(), order.clone());
+
+    let long = running.executor.spawn(async move {
+        for _ in 0..8 {
+            nagoya::yield_now().await;
+        }
+        first.fetch_add(1, Ordering::AcqRel)
+    });
+    let short = running.executor.spawn(async move { second.fetch_add(1, Ordering::AcqRel) });
+
+    let (long, short) = (block_on(long), block_on(short));
+    assert_eq!(long, Some(1), "the yielding task did not let the other in");
+    assert_eq!(short, Some(0));
+}
