@@ -71,31 +71,43 @@ name = "profile_tokio"
 required-features = ["std"]
 
 [[example]]
-name = "queue"
+name = "json-to-queue"
 required-features = ["std"]
 
 [[example]]
-name = "llm"
+name = "queue-upsert"
 required-features = ["std"]
 
 [[example]]
-name = "book"
+name = "queue-delete"
 required-features = ["std"]
 
 [[example]]
-name = "producers"
+name = "queue-search"
 required-features = ["std"]
 
 [[example]]
-name = "iter"
+name = "pipeline-process"
 required-features = ["std"]
 
 [[example]]
-name = "arrival"
+name = "queue-ownership"
 required-features = ["std"]
 
 [[example]]
-name = "burst"
+name = "queue-feeds"
+required-features = ["std"]
+
+[[example]]
+name = "layout-iter"
+required-features = ["std"]
+
+[[example]]
+name = "queue-arrival"
+required-features = ["std"]
+
+[[example]]
+name = "queue-burst"
 required-features = ["std"]
 
 [[example]]
