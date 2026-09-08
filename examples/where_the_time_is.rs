@@ -10,8 +10,8 @@
 //! If arm 1 is close to arm 2, the executor is not the problem and no amount of
 //! tuning it will help.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -19,7 +19,9 @@ use std::time::Instant;
 use st3::fanout::{Pool, StdHost};
 
 static WORKERS_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(8);
-fn workers() -> usize { WORKERS_N.load(Ordering::Relaxed) }
+fn workers() -> usize {
+    WORKERS_N.load(Ordering::Relaxed)
+}
 const TASKS: usize = 100_000;
 const REPS: usize = 5;
 

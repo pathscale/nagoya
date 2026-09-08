@@ -2,9 +2,9 @@
 //!
 //! If submitting into idle intakes is cheap, the collapse at eight workers is
 //! on the worker side - stealing, waking, draining - and not in `submit`.
+use st3::fanout::{Pool, StdHost};
 use std::sync::Arc;
 use std::time::Instant;
-use st3::fanout::{Pool, StdHost};
 
 const TASKS: usize = 100_000;
 

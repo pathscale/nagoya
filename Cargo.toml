@@ -32,13 +32,12 @@ spin = { version = "0.9", default-features = false, features = ["mutex", "spin_m
 ps-st3 = { version = "0.5.0", features = ["fanout", "host"] }
 # The comparison arm. Only the scheduler is used; nothing here needs its I/O.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# The other comparison arm. Not an async runtime: a data-parallel pool, so it
+# only appears in the arms that submit a closure rather than a future.
+rayon = "1"
 
 [[example]]
 name = "vs_tokio"
-required-features = ["std"]
-
-[[example]]
-name = "counters"
 required-features = ["std"]
 
 [[example]]
@@ -48,3 +47,20 @@ required-features = ["std"]
 [[example]]
 name = "where_the_time_is"
 required-features = ["std"]
+
+[[example]]
+name = "profile_me"
+required-features = ["std"]
+
+[[example]]
+name = "profile_tokio"
+required-features = ["std"]
+
+[[example]]
+name = "three_pools"
+required-features = ["std"]
+
+# Symbols in the optimised build. `sample` against a stripped binary reports
+# addresses, and an unreadable profile is not a finding.
+[profile.release]
+debug = 1
