@@ -71,46 +71,6 @@ name = "profile_tokio"
 required-features = ["std"]
 
 [[example]]
-name = "json-to-queue"
-required-features = ["std"]
-
-[[example]]
-name = "queue-upsert"
-required-features = ["std"]
-
-[[example]]
-name = "queue-delete"
-required-features = ["std"]
-
-[[example]]
-name = "queue-search"
-required-features = ["std"]
-
-[[example]]
-name = "pipeline-process"
-required-features = ["std"]
-
-[[example]]
-name = "queue-ownership"
-required-features = ["std"]
-
-[[example]]
-name = "queue-feeds"
-required-features = ["std"]
-
-[[example]]
-name = "layout-iter"
-required-features = ["std"]
-
-[[example]]
-name = "queue-arrival"
-required-features = ["std"]
-
-[[example]]
-name = "queue-burst"
-required-features = ["std"]
-
-[[example]]
 name = "wake_latency"
 required-features = ["std"]
 

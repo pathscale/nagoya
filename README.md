@@ -60,9 +60,9 @@ into a few hundred pieces, so it is not scheduling 100,000 of anything. It is
 not comparable to the first table, and neither is rayon's row to tokio's.
 
 Where this loses is CPU. nagoya's workers spin where forte's sleep, and closing
-that costs wake latency. `st3::fanout::Tuning` exposes the trade;
-[`docs/what-was-tried.md`](docs/what-was-tried.md) has the sweep, every
-experiment that failed, and why.
+that costs wake latency. `st3::fanout::Tuning` exposes the trade, and the
+sweep behind its defaults - along with every variant that lost - is recorded
+outside this repository.
 
 ## `no_std`
 
