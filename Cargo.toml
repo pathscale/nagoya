@@ -27,6 +27,12 @@ ps-st3 = { path = "/Users/revenge/code/ps-st3" }
 [dependencies]
 ps-st3 = { version = "0.5.0", default-features = false, features = ["fanout"] }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+# The task itself: one allocation holding the future, its state machine, its
+# waker vtable and its output, with `Runnable::into_raw` handing the pointer
+# straight to `fanout::Job`. This crate had its own; `async-task` is the same
+# design done by people who have been at it for years, it is what `forte` uses,
+# and with default features off it links no `std` and pulls in nothing.
+async-task = { version = "4.7", default-features = false }
 
 [dev-dependencies]
 ps-st3 = { version = "0.5.0", features = ["fanout", "host"] }

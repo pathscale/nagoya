@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use st3::fanout::{Pool, StdHost};
 
 fn main() {
-    let workers = 8;
+    let workers: usize = std::env::var("W").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let host = Arc::new(StdHost::new(workers));
     let pool = Pool::new(workers, 1024, host);
     let threads: Vec<_> = (0..workers)

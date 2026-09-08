@@ -54,27 +54,65 @@ pub use par::{par_for_each, ParForEach};
 
 /// A handle to a spawned task's output.
 ///
-/// Awaiting it yields `Some(output)`, or `None` if the output was already
-/// taken. Unlike Tokio's, dropping this does **not** detach-and-forget any
-/// differently from holding it: the task runs to completion either way, because
-/// there is nothing here that could cancel it.
+/// Awaiting it yields `Some(output)`, or `None` if the task was cancelled by
+/// dropping the handle before it finished.
+///
+/// **Dropping this detaches the task; it does not cancel it.** That is Tokio's
+/// behaviour and it was this crate's before, and it is worth stating because
+/// the `async_task::Task` underneath does the opposite: dropping *that* cancels.
+/// Preserving the documented behaviour cost one `Drop` impl and finding out the
+/// hard way, when a benchmark that spawns and drops handles stopped finishing.
+/// [`cancel`](JoinHandle::cancel) is how to ask for the other thing.
 pub struct JoinHandle<T> {
-    task: Arc<dyn task::Joinable<T>>,
+    /// `None` only between `Drop` taking it and the handle going away.
+    task: Option<async_task::Task<T>>,
+}
+
+impl<T> JoinHandle<T> {
+    fn task(&mut self) -> &mut async_task::Task<T> {
+        self.task.as_mut().expect("the task is taken only by `Drop`")
+    }
+
+    /// Stop the task at its next suspension point and throw away its output.
+    ///
+    /// A task already past its last poll finishes anyway: cancelling is a
+    /// request not to poll again, not a way to undo work already done.
+    pub fn cancel(mut self) {
+        if let Some(task) = self.task.take() {
+            drop(task);
+        }
+    }
+
+    /// Whether the task has finished, without waiting for it.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .expect("the task is taken only by `Drop`")
+            .is_finished()
+    }
+}
+
+impl<T> Drop for JoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.detach();
+        }
+    }
 }
 
 impl<T> Future for JoinHandle<T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.task.poll_output(context)
+        Pin::new(self.get_mut().task()).poll(context).map(Some)
     }
 }
 
 /// A pool with a place to put the next task.
 ///
-/// Spawning round-robins across workers. The pool steals, so a bad choice
-/// costs a steal rather than a stall, and counting is cheaper than asking
-/// which worker is least busy.
+/// Work goes to one injector that every worker drains, so there is nothing for
+/// a spawn to choose: the pool decides who runs it.
 pub struct Executor {
     pool: Arc<Pool>,
 }
@@ -93,9 +131,8 @@ impl Executor {
 
     /// Another handle to the same pool, for a task that spawns.
     ///
-    /// Spawning from inside a task needs an executor the task can own, and
-    /// this is one: the pool is shared, the round-robin counter is not, which
-    /// costs nothing but a slightly different spread.
+    /// Spawning from inside a task needs an executor the task can own, and this
+    /// is one: another handle to the same pool.
     #[must_use]
     pub fn clone_handle(&self) -> Self {
         Self::new(self.pool.clone())
@@ -114,7 +151,7 @@ impl Executor {
         F::Output: Send + 'static,
     {
         JoinHandle {
-            task: task::RawTask::spawn(future, self.pool.clone()),
+            task: Some(task::spawn(future, self.pool.clone())),
         }
     }
 }
