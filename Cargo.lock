@@ -245,6 +245,7 @@ dependencies = [
 name = "ps-st3"
 version = "0.5.0"
 dependencies = [
+ "crossbeam-queue",
  "crossbeam-utils",
  "spin",
 ]

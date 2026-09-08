@@ -6,17 +6,16 @@
 //!
 //! # Allocations
 //!
-//! Two per task: the task itself, and one `Box` per poll for the closure the
-//! pool takes. It was four. The output slot used to be its own `Arc` and the
-//! future its own `Box::pin`; both now live inside the task's single
-//! allocation.
+//! **One per task, and none per poll.** It was four. The output slot used to be
+//! its own `Arc` and the future its own `Box::pin`, and both now live inside
+//! the task's single allocation; the fourth was a `Box` per poll for the
+//! closure the pool took, and the pool no longer takes a closure.
 //!
-//! The remaining `Box` per poll cannot be removed from here. `fanout::Task` is
-//! `Box<dyn FnOnce()>`, so submitting anything means boxing it. A pool taking a
-//! `(pointer, fn)` pair instead would need no allocation at all, and that is a
-//! change to `ps-st3` rather than to this crate.
+//! `st3::fanout::Job` is a thin pointer and the function that runs it, so the
+//! task hands the pool the allocation it already lives in: `Arc::into_raw` on
+//! the way out, `Arc::from_raw` on the way in. Nothing is allocated to schedule
+//! a poll, however many times a future is woken.
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::mem;
@@ -24,8 +23,9 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use core::ptr::NonNull;
 use spin::Mutex;
-use st3::fanout::Pool;
+use st3::fanout::{Job, Pool};
 
 /// Nobody is polling and nobody has asked for one.
 const IDLE: u8 = 0;
@@ -57,7 +57,6 @@ pub(crate) struct RawTask<F: Future> {
     finished: AtomicU8,
     state: AtomicU8,
     pool: Arc<Pool>,
-    worker: usize,
 }
 
 impl<F> Joinable<F::Output> for RawTask<F>
@@ -84,7 +83,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    pub(crate) fn spawn(future: F, pool: Arc<Pool>, worker: usize) -> Arc<dyn Joinable<F::Output>> {
+    pub(crate) fn spawn(future: F, pool: Arc<Pool>) -> Arc<dyn Joinable<F::Output>> {
         let task = Arc::new(Self {
             future: Mutex::new(Some(future)),
             output: Mutex::new(None),
@@ -92,7 +91,6 @@ where
             finished: AtomicU8::new(0),
             state: AtomicU8::new(IDLE),
             pool,
-            worker,
         });
         task.clone().schedule();
         task
@@ -122,9 +120,23 @@ where
                         .compare_exchange(IDLE, RUNNING, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        let worker = self.worker;
                         let pool = self.pool.clone();
-                        pool.submit(worker, Box::new(move || self.run()));
+                        // The task *is* the job. `Arc::into_raw` hands the
+                        // pool the allocation this task already lives in, so a
+                        // poll costs no allocation at all; the matching
+                        // `Arc::from_raw` in `poll_once` takes the ownership
+                        // back. This used to box a closure per poll.
+                        let pointer = Arc::into_raw(self).cast::<()>().cast_mut();
+                        // SAFETY: `Arc::into_raw` never returns null, the
+                        // allocation stays alive because this holds the strong
+                        // count it just gave up, and `poll_once::<F>` is
+                        // written for exactly this pointer type. `run` catches
+                        // nothing, but neither did the closure it replaces, and
+                        // a panic in a future was already the caller's problem.
+                        let job = unsafe {
+                            Job::from_raw(NonNull::new_unchecked(pointer), poll_once::<F>)
+                        };
+                        pool.submit_job(job);
                         return;
                     }
                 }
@@ -183,6 +195,23 @@ where
             waker.wake();
         }
     }
+}
+
+/// Run one poll of the task this pointer owns.
+///
+/// # Safety
+///
+/// `pointer` must be an `Arc<RawTask<F>>` handed over by `Arc::into_raw`, whose
+/// strong count has not been given to anyone else.
+unsafe fn poll_once<F>(pointer: NonNull<()>)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    // SAFETY: the caller's obligation, discharged at the one call site in
+    // `schedule`, which pairs this function with a pointer of this type.
+    let task = unsafe { Arc::from_raw(pointer.as_ptr().cast::<RawTask<F>>()) };
+    task.run();
 }
 
 /// A waker over `Arc<RawTask>`, which is a thin pointer because the task type is

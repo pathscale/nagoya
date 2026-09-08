@@ -88,6 +88,7 @@ fn nagoya_run(yields: usize) -> f64 {
     let tuning = Tuning {
         rounds_before_park: std::env::var("ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
         backoff_spins: std::env::var("BACKOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
+        promote_every: std::env::var("PROMOTE").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
     };
     let pool = Pool::with_tuning(workers(), 1024, host, tuning);
     let threads: Vec<_> = (0..workers())

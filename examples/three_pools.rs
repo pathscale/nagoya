@@ -107,7 +107,11 @@ fn fanout_run() -> f64 {
     let start = Instant::now();
     for n in 0..TASKS {
         let finish = finish.clone();
-        pool.submit(n % workers(), Box::new(move || finish.tick()));
+        // `submit_fn`, not `submit`: the pool's queues hold a thin pointer and
+        // the function that runs it, so handing it a `Box<dyn FnOnce()>` means
+        // boxing that fat pointer again. One allocation against two.
+        let _ = n;
+        pool.submit_fn(move || finish.tick());
     }
     finish.wait();
     let elapsed = start.elapsed().as_secs_f64();

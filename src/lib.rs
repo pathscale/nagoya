@@ -40,7 +40,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
+
 use core::task::{Context, Poll};
 
 use st3::fanout::Pool;
@@ -75,7 +75,6 @@ impl<T> Future for JoinHandle<T> {
 /// which worker is least busy.
 pub struct Executor {
     pool: Arc<Pool>,
-    next: AtomicUsize,
 }
 
 impl Executor {
@@ -87,7 +86,6 @@ impl Executor {
     pub fn new(pool: Arc<Pool>) -> Self {
         Self {
             pool,
-            next: AtomicUsize::new(0),
         }
     }
 
@@ -113,9 +111,8 @@ impl Executor {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let worker = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.workers();
         JoinHandle {
-            task: task::RawTask::spawn(future, self.pool.clone(), worker),
+            task: task::RawTask::spawn(future, self.pool.clone()),
         }
     }
 }
