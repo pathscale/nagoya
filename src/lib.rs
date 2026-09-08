@@ -57,14 +57,14 @@ pub use block_on::block_on;
 /// differently from holding it: the task runs to completion either way, because
 /// there is nothing here that could cancel it.
 pub struct JoinHandle<T> {
-    slot: Arc<task::Slot<T>>,
+    task: Arc<dyn task::Joinable<T>>,
 }
 
 impl<T> Future for JoinHandle<T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.slot.poll(context)
+        self.task.poll_output(context)
     }
 }
 
@@ -115,7 +115,7 @@ impl Executor {
     {
         let worker = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.workers();
         JoinHandle {
-            slot: task::RawTask::spawn(future, self.pool.clone(), worker),
+            task: task::RawTask::spawn(future, self.pool.clone(), worker),
         }
     }
 }
