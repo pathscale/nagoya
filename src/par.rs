@@ -37,6 +37,51 @@ use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 use st3::fanout::Pool;
 
+/// A switch that stops a parallel loop.
+///
+/// Cheap to clone and to read: one `Relaxed` load per piece, which is a few
+/// hundred loads over a loop of any size, not one per item.
+///
+/// # What cancelling does and does not do
+///
+/// It stops work that **has not started**. A piece already running finishes its
+/// current chunk, because the body is a closure and a closure cannot be
+/// interrupted between two of its own instructions. So this bounds the work
+/// still to come, not the work in flight, and the bound is one leaf chunk per
+/// busy worker.
+///
+/// If that is too coarse, make the chunks smaller with
+/// [`ParFor::leaf`]. If it is far too coarse, what you want is for the body
+/// itself to check, and it can: clone this into the closure.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    /// A switch that has not been thrown.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop the loop. Idempotent, and callable from anywhere including from
+    /// inside the loop's own body.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the switch has been thrown.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl core::fmt::Debug for Cancel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Cancel").field(&self.is_cancelled()).finish()
+    }
+}
+
 /// How small a piece has to be before it is run rather than split further.
 ///
 /// **Not one item per worker.** An even split across eight workers is only
@@ -74,7 +119,9 @@ where
 {
     let len = range.end.saturating_sub(range.start);
     let leaf = (len / (pool.workers() * PIECES_PER_WORKER)).max(1);
+    let cancel = Cancel::new();
     ParFor {
+        cancel: cancel.clone(),
         state: Some((
             Arc::new(Shared {
                 body,
@@ -95,7 +142,7 @@ where
 /// type forgotten so every piece can name it.
 trait Split: Send + Sync {
     /// Run `range`, splitting it while it is larger than `leaf`.
-    fn work(self: Arc<Self>, pool: &Arc<Pool>, range: Range<usize>, leaf: usize);
+    fn work(self: Arc<Self>, pool: &Arc<Pool>, range: Range<usize>, leaf: usize, cancel: &Cancel);
     /// One piece finished. Completes the loop if it was the last.
     fn retire(&self);
     fn is_finished(&self) -> bool;
@@ -116,7 +163,15 @@ impl<F> Split for Shared<F>
 where
     F: Fn(usize) + Send + Sync + 'static,
 {
-    fn work(self: Arc<Self>, pool: &Arc<Pool>, range: Range<usize>, leaf: usize) {
+    fn work(self: Arc<Self>, pool: &Arc<Pool>, range: Range<usize>, leaf: usize, cancel: &Cancel) {
+        // Checked once per piece, not once per item. A piece is the unit of
+        // cancellation because it is the only boundary the runtime controls:
+        // between two items the body is running and nothing here can interrupt
+        // it.
+        if cancel.is_cancelled() {
+            self.retire();
+            return;
+        }
         let mut range = range;
         // Split iteratively rather than recursively, giving the right half to
         // the pool and keeping the left. Recursion here would put the whole
@@ -133,7 +188,8 @@ where
             self.outstanding.fetch_add(1, Ordering::AcqRel);
             let half = self.clone();
             let handle = pool.clone();
-            pool.submit_fn(move || half.work(&handle, right, leaf));
+            let switch = cancel.clone();
+            pool.submit_fn(move || half.work(&handle, right, leaf, &switch));
         }
         for index in range {
             (self.body)(index);
@@ -159,6 +215,7 @@ where
     fn park(&self, waker: &Waker) {
         *self.waiter.lock() = Some(waker.clone());
     }
+
 }
 
 /// Everything a loop needs to start: the shared half, the pool to put pieces
@@ -170,9 +227,64 @@ type Pending = (Arc<dyn Split>, Arc<Pool>, Range<usize>, usize);
 /// Created by [`par_for`]. Poll it to start the work and again to learn
 /// that it is done.
 pub struct ParFor {
+    cancel: Cancel,
     /// Everything needed to start, taken on the first poll.
     state: Option<Pending>,
     started: Option<Arc<dyn Split>>,
+}
+
+impl ParFor {
+    /// The switch that stops this loop.
+    ///
+    /// Clone it into the body to stop early on a result, hold it elsewhere to
+    /// stop on a timeout, or ignore it and let [`Drop`] do the work.
+    #[must_use]
+    pub fn cancel(&self) -> Cancel {
+        self.cancel.clone()
+    }
+
+    /// Use `cancel` as this loop's switch instead of its own.
+    ///
+    /// For a body that has to stop the loop it is inside: the token has to
+    /// exist before the closure is built, so the loop cannot be the thing that
+    /// creates it.
+    ///
+    /// Ignored once the loop has been polled.
+    #[must_use]
+    pub fn cancel_with(mut self, cancel: Cancel) -> Self {
+        if self.state.is_some() {
+            self.cancel = cancel;
+        }
+        self
+    }
+
+    /// How small a piece may get before it is run rather than split further.
+    ///
+    /// This is the loop's **cancellation granularity** as well as its
+    /// scheduling granularity: a cancelled loop stops at the next piece
+    /// boundary, so smaller pieces stop sooner and split more often. The
+    /// default is the range divided by eight times the worker count.
+    ///
+    /// Ignored once the loop has been polled, because by then the work is out.
+    #[must_use]
+    pub fn leaf(mut self, items: usize) -> Self {
+        if let Some((_, _, _, leaf)) = self.state.as_mut() {
+            *leaf = items.max(1);
+        }
+        self
+    }
+}
+
+/// **Dropping a `ParFor` cancels it.** That is what a future should do, and
+/// what this did not do until it was written down: a `select!` that timed out
+/// returned while the loop went on burning every worker it had.
+///
+/// Cancelling stops work that has not started. See [`Cancel`] for what that
+/// does and does not bound.
+impl Drop for ParFor {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl Future for ParFor {
@@ -187,7 +299,8 @@ impl Future for ParFor {
             // Splitting is itself work, and doing it on the pool means it is
             // parallel too: each piece splits its own half.
             let handle = pool.clone();
-            pool.submit_fn(move || shared.work(&handle, range, leaf));
+            let switch = this.cancel.clone();
+            pool.submit_fn(move || shared.work(&handle, range, leaf, &switch));
         }
 
         let Some(shared) = this.started.as_ref() else {

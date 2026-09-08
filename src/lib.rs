@@ -50,7 +50,7 @@ mod par;
 mod task;
 
 pub use block_on::block_on;
-pub use par::{par_for, ParFor};
+pub use par::{par_for, Cancel, ParFor};
 
 /// A handle to a spawned task's output.
 ///

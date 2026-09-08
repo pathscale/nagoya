@@ -189,3 +189,57 @@ fn a_task_can_await_a_parallel_loop() {
     }));
     assert_eq!(hits.load(Ordering::Relaxed), 1_000);
 }
+
+/// A cancelled loop stops, and stops soon rather than eventually.
+#[test]
+fn a_cancelled_loop_stops_early() {
+    let running = Running::new(4);
+    let done = Arc::new(AtomicUsize::new(0));
+    let counter = done.clone();
+    let loop_ = nagoya::par_for(running.executor.pool().clone(), 0..1_000_000, move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+    })
+    .leaf(64);
+    let cancel = loop_.cancel();
+    cancel.cancel();
+    block_on(loop_);
+    // Cancelled before the first poll, so nothing should have been handed out
+    // at all, let alone run to a million.
+    assert!(
+        done.load(Ordering::Relaxed) < 1_000_000,
+        "a cancelled loop ran every item"
+    );
+}
+
+/// The body can stop the loop it is running in, which is how a parallel search
+/// stops once it has found what it wanted.
+#[test]
+fn a_body_can_stop_its_own_loop() {
+    let running = Running::new(4);
+    let seen = Arc::new(AtomicUsize::new(0));
+    let cancel = nagoya::Cancel::new();
+    let (counter, trip) = (seen.clone(), cancel.clone());
+    let loop_ = nagoya::par_for(running.executor.pool().clone(), 0..2_000_000, move |_| {
+        if counter.fetch_add(1, Ordering::Relaxed) >= 1_000 {
+            trip.cancel();
+        }
+    })
+    .leaf(64)
+    .cancel_with(cancel.clone());
+    block_on(loop_);
+    assert!(cancel.is_cancelled());
+    let ran = seen.load(Ordering::Relaxed);
+    assert!(ran >= 1_000, "stopped before it found anything: {ran}");
+    assert!(ran < 2_000_000, "the body never stopped the loop: {ran}");
+}
+
+/// Dropping the future cancels the loop rather than leaving it running.
+#[test]
+fn dropping_a_loop_cancels_it() {
+    let running = Running::new(4);
+    let loop_ = nagoya::par_for(running.executor.pool().clone(), 0..1_000_000, |_| {});
+    let cancel = loop_.cancel();
+    assert!(!cancel.is_cancelled());
+    drop(loop_);
+    assert!(cancel.is_cancelled(), "dropping the future did not cancel it");
+}
