@@ -87,8 +87,9 @@ fn nagoya_run(yields: usize) -> f64 {
     let host = Arc::new(StdHost::new(workers()));
     let tuning = Tuning {
         rounds_before_park: std::env::var("ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
-        backoff_spins: std::env::var("BACKOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
+        backoff_spins: std::env::var("BACKOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(1024),
         promote_every: std::env::var("PROMOTE").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
+        injector_batch: std::env::var("BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(32),
     };
     let pool = Pool::with_tuning(workers(), 1024, host, tuning);
     let threads: Vec<_> = (0..workers())

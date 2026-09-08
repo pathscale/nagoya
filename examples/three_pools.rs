@@ -268,7 +268,7 @@ fn rayon_par_iter() -> f64 {
 /// The one difference that is not incidental: this is a future. `install`
 /// blocks the calling thread; `block_on` here parks it, and inside a task it
 /// would suspend instead of blocking anything.
-fn nagoya_par_for_each() -> f64 {
+fn nagoya_par_for() -> f64 {
     let host = Arc::new(StdHost::new(workers()));
     let pool = Pool::new(workers(), 1024, host);
     let threads: Vec<_> = (0..workers())
@@ -283,7 +283,7 @@ fn nagoya_par_for_each() -> f64 {
     let finish = Finish::new();
     let counter = finish.clone();
     let start = Instant::now();
-    nagoya::block_on(nagoya::par_for_each(pool.clone(), 0..TASKS, move |_| {
+    nagoya::block_on(nagoya::par_for(pool.clone(), 0..TASKS, move |_| {
         counter.tick();
     }));
     let elapsed = start.elapsed().as_secs_f64();
@@ -328,7 +328,7 @@ fn main() {
         par.push(measure(rayon_par_iter));
         fc.push(measure(forte_closures));
         ff.push(measure(forte_futures));
-        np.push(measure(nagoya_par_for_each));
+        np.push(measure(nagoya_par_for));
     }
     println!("a closure, run once:");
     report("rayon", ray);
@@ -340,7 +340,7 @@ fn main() {
     report("nagoya (on st3::fanout)", nag);
     println!("\na parallel loop, split recursively:");
     report("rayon par_iter", par);
-    report("nagoya par_for_each", np);
+    report("nagoya par_for", np);
     // Counted over several runs: the split depends on how stealing happens to
     // go, so it is a range and not a constant.
     let splits: Vec<usize> = (0..REPS).map(|_| par_iter_chunks()).collect();

@@ -15,7 +15,7 @@
 //! That is also the answer to what these two APIs have to do with each other.
 //! A task is a thing that can suspend; a parallel loop is a thing that cannot.
 //! Wrapping the loop in a task is what lets one runtime offer both, and it is
-//! why `par_for_each` returns something you `await` rather than something that
+//! why `par_for` returns something you `await` rather than something that
 //! parks your thread.
 //!
 //! # What it does not do
@@ -61,20 +61,20 @@ const PIECES_PER_WORKER: usize = 8;
 /// # fn example(pool: alloc::sync::Arc<st3::fanout::Pool>) {
 /// let hits = Arc::new(AtomicUsize::new(0));
 /// let counter = hits.clone();
-/// let loop_ = nagoya::par_for_each(pool, 0..1_000, move |_| {
+/// let loop_ = nagoya::par_for(pool, 0..1_000, move |_| {
 ///     counter.fetch_add(1, Ordering::Relaxed);
 /// });
 /// nagoya::block_on(loop_);
 /// assert_eq!(hits.load(Ordering::Relaxed), 1_000);
 /// # }
 /// ```
-pub fn par_for_each<F>(pool: Arc<Pool>, range: Range<usize>, body: F) -> ParForEach
+pub fn par_for<F>(pool: Arc<Pool>, range: Range<usize>, body: F) -> ParFor
 where
     F: Fn(usize) + Send + Sync + 'static,
 {
     let len = range.end.saturating_sub(range.start);
     let leaf = (len / (pool.workers() * PIECES_PER_WORKER)).max(1);
-    ParForEach {
+    ParFor {
         state: Some((
             Arc::new(Shared {
                 body,
@@ -167,15 +167,15 @@ type Pending = (Arc<dyn Split>, Arc<Pool>, Range<usize>, usize);
 
 /// A parallel loop that has not finished yet.
 ///
-/// Created by [`par_for_each`]. Poll it to start the work and again to learn
+/// Created by [`par_for`]. Poll it to start the work and again to learn
 /// that it is done.
-pub struct ParForEach {
+pub struct ParFor {
     /// Everything needed to start, taken on the first poll.
     state: Option<Pending>,
     started: Option<Arc<dyn Split>>,
 }
 
-impl Future for ParForEach {
+impl Future for ParFor {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {

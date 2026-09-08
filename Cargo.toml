@@ -1,6 +1,6 @@
 [package]
 name = "nagoya"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -9,7 +9,6 @@ repository = "https://github.com/pathscale/nagoya"
 readme = "README.md"
 keywords = ["async", "runtime", "executor", "no-std", "work-stealing"]
 categories = ["asynchronous", "concurrency", "no-std"]
-publish = false
 
 [features]
 default = ["std"]
@@ -63,6 +62,14 @@ required-features = ["std"]
 
 [[example]]
 name = "profile_tokio"
+required-features = ["std"]
+
+[[example]]
+name = "wake_latency"
+required-features = ["std"]
+
+[[example]]
+name = "counter_floor"
 required-features = ["std"]
 
 [[example]]

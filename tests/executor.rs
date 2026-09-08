@@ -144,7 +144,7 @@ fn a_parallel_loop_covers_its_range() {
     let running = Running::new(4);
     let seen: Arc<Vec<AtomicUsize>> = Arc::new((0..10_000).map(|_| AtomicUsize::new(0)).collect());
     let counter = seen.clone();
-    block_on(nagoya::par_for_each(
+    block_on(nagoya::par_for(
         running.executor.pool().clone(),
         0..10_000,
         move |i| {
@@ -163,7 +163,7 @@ fn an_empty_parallel_loop_finishes() {
     let running = Running::new(2);
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = hits.clone();
-    block_on(nagoya::par_for_each(
+    block_on(nagoya::par_for(
         running.executor.pool().clone(),
         5..5,
         move |_| {
@@ -182,7 +182,7 @@ fn a_task_can_await_a_parallel_loop() {
     let counter = hits.clone();
     let pool = running.executor.pool().clone();
     block_on(running.executor.spawn(async move {
-        nagoya::par_for_each(pool, 0..1_000, move |_| {
+        nagoya::par_for(pool, 0..1_000, move |_| {
             counter.fetch_add(1, Ordering::Relaxed);
         })
         .await;
