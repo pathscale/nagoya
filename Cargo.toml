@@ -65,6 +65,10 @@ name = "profile_tokio"
 required-features = ["std"]
 
 [[example]]
+name = "burst"
+required-features = ["std"]
+
+[[example]]
 name = "wake_latency"
 required-features = ["std"]
 
