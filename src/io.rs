@@ -87,6 +87,41 @@ pub trait Read {
             Ok(())
         }
     }
+
+    /// Append everything left to `buffer`, returning how many bytes were added.
+    ///
+    /// Grows in chunks rather than one byte at a time, and only keeps what was
+    /// actually read, so a source that ends early does not leave the caller
+    /// holding a tail of zeros it cannot distinguish from data.
+    fn read_to_end(
+        &mut self,
+        buffer: &mut alloc::vec::Vec<u8>,
+    ) -> impl Future<Output = Result<usize, Error>> + Send
+    where
+        Self: Send,
+    {
+        /// Big enough that a whole page arrives in one or two reads, small
+        /// enough not to over-allocate for a short file.
+        const CHUNK: usize = 8192;
+        async move {
+            let start = buffer.len();
+            loop {
+                let filled = buffer.len();
+                buffer.resize(filled + CHUNK, 0);
+                match self.read(&mut buffer[filled..]).await {
+                    Ok(0) => {
+                        buffer.truncate(filled);
+                        return Ok(filled - start);
+                    }
+                    Ok(n) => buffer.truncate(filled + n),
+                    Err(error) => {
+                        buffer.truncate(filled);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Writing bytes to something.
@@ -218,8 +253,11 @@ impl core::fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+// `core::error::Error`, not `std::error::Error`, and not behind the `std`
+// feature. A consumer without an operating system still wants `?` to work
+// against its own error type, and gating this would have made the trait
+// unusable in exactly the place it exists for.
+impl core::error::Error for Error {}
 
 #[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
