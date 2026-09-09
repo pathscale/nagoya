@@ -46,6 +46,8 @@ use core::task::{Context, Poll};
 use st3::fanout::Pool;
 
 mod block_on;
+#[cfg(feature = "std")]
+pub mod io;
 mod time;
 mod par;
 mod yield_now;

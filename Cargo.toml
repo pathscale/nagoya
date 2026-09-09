@@ -14,7 +14,7 @@ categories = ["asynchronous", "concurrency", "no-std"]
 default = ["std"]
 # Off, this crate does not link `std`. What it costs: `Runtime`, which owns
 # threads, and the parker `block_on` uses when there is one to park.
-std = ["ps-st3/host"]
+std = ["ps-st3/host", "dep:futures-io", "futures-io/std", "dep:futures-util", "futures-util/std", "futures-util/io"]
 
 # Pointed at the local checkout while pathscale/ps-st3#4 is open: the published
 # 0.5.0 does not have the submit fix, and the numbers in examples/ were taken
@@ -32,6 +32,11 @@ spin = { version = "0.9", default-features = false, features = ["mutex", "spin_m
 # design done by people who have been at it for years, it is what `forte` uses,
 # and with default features off it links no `std` and pulls in nothing.
 async-task = { version = "4.7", default-features = false }
+# The file traits `io` builds on. They belong to no runtime and link no `std`
+# with their own feature off, which is why the abstraction can exist here at
+# all rather than in whatever crate happens to own the storage engine.
+futures-io = { version = "0.3", default-features = false, optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
 ps-st3 = { version = "0.5.0", features = ["fanout", "host"] }
