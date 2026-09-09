@@ -119,7 +119,10 @@ impl<T> core::fmt::Debug for JoinHandle<T> {
             .debug_struct("JoinHandle")
             .field(
                 "finished",
-                &self.task.as_ref().is_some_and(async_task::Task::is_finished),
+                &self
+                    .task
+                    .as_ref()
+                    .is_some_and(async_task::Task::is_finished),
             )
             .finish()
     }

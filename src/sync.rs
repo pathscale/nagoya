@@ -278,7 +278,10 @@ impl Barrier {
 
 impl core::fmt::Debug for Barrier {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.debug_struct("Barrier").field("n", &self.n).finish_non_exhaustive()
+        formatter
+            .debug_struct("Barrier")
+            .field("n", &self.n)
+            .finish_non_exhaustive()
     }
 }
 
@@ -381,7 +384,9 @@ impl SemaphorePermit<'_> {
 
 impl core::fmt::Debug for SemaphorePermit<'_> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.debug_struct("SemaphorePermit").finish_non_exhaustive()
+        formatter
+            .debug_struct("SemaphorePermit")
+            .finish_non_exhaustive()
     }
 }
 
@@ -825,7 +830,11 @@ mod tests {
         }
 
         assert_eq!(passed.load(Ordering::Relaxed), 4);
-        assert_eq!(leaders.load(Ordering::Relaxed), 1, "exactly one waiter leads a rendezvous");
+        assert_eq!(
+            leaders.load(Ordering::Relaxed),
+            1,
+            "exactly one waiter leads a rendezvous"
+        );
     }
 
     #[test]
