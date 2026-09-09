@@ -247,15 +247,61 @@ impl Semaphore {
         Acquire { semaphore: self }
     }
 
+    /// Hand the semaphore `n` more permits than it was created with.
+    ///
+    /// The counterpart to [`SemaphorePermit::forget`]: together they let a
+    /// caller move a permit's *ownership* somewhere the borrow could not
+    /// follow, which is how a semaphore gets used as a one-shot gate rather
+    /// than as a pool of N interchangeable slots.
+    pub fn add_permits(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.permits.fetch_add(n, Ordering::AcqRel);
+        // One waker per permit. Waking only one and letting it cascade is
+        // wrong here: a woken task takes exactly one permit, so the rest would
+        // sleep through permits that are already available.
+        for _ in 0..n {
+            self.waiters.wake_one();
+        }
+    }
+
     fn release(&self) {
         self.permits.fetch_add(1, Ordering::AcqRel);
         self.waiters.wake_one();
     }
 }
 
+impl core::fmt::Debug for Semaphore {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Semaphore")
+            .field("available_permits", &self.available_permits())
+            .finish_non_exhaustive()
+    }
+}
+
 /// A held semaphore permit, returned on drop.
 pub struct SemaphorePermit<'a> {
     semaphore: &'a Semaphore,
+}
+
+impl SemaphorePermit<'_> {
+    /// Drop the permit without returning it, permanently shrinking the
+    /// semaphore by one.
+    ///
+    /// Pairs with [`Semaphore::add_permits`]. Forgetting every permit turns
+    /// the semaphore into a signal, where the count is a number of events that
+    /// happened rather than a number of slots that are free.
+    pub fn forget(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl core::fmt::Debug for SemaphorePermit<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("SemaphorePermit").finish_non_exhaustive()
+    }
 }
 
 impl Drop for SemaphorePermit<'_> {
@@ -667,6 +713,29 @@ mod tests {
         drop(b);
         drop(c);
         assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    #[test]
+    fn a_forgotten_permit_does_not_come_back() {
+        let semaphore = Semaphore::new(1);
+        block_on(semaphore.acquire()).forget();
+        assert_eq!(semaphore.available_permits(), 0);
+        assert!(semaphore.try_acquire().is_none());
+    }
+
+    #[test]
+    fn added_permits_are_a_signal_a_forgetting_waiter_can_count() {
+        // The gate shape: `add_permits` says an event happened, the waiter
+        // consumes exactly one and forgets it, so the count tracks events
+        // rather than returning to a fixed pool.
+        let semaphore = Semaphore::new(0);
+        semaphore.add_permits(3);
+        assert_eq!(semaphore.available_permits(), 3);
+        for _ in 0..3 {
+            block_on(semaphore.acquire()).forget();
+        }
+        assert_eq!(semaphore.available_permits(), 0);
+        assert!(semaphore.try_acquire().is_none());
     }
 
     #[test]
