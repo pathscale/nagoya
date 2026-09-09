@@ -175,8 +175,8 @@ where
         let mut range = range;
         // Split iteratively rather than recursively, giving the right half to
         // the pool and keeping the left. Recursion here would put the whole
-        // depth on a worker's stack, and a bare-metal target may not have one
-        // to spare.
+        // split depth on one worker's stack, which is a stack overflow waiting
+        // for a large enough range.
         while range.end - range.start > leaf {
             let middle = range.start + (range.end - range.start) / 2;
             let right = middle..range.end;
