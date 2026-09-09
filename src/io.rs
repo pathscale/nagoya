@@ -6,19 +6,31 @@
 //! holds: an epoll or io_uring reactor is the part that needs an operating
 //! system, and being able to run without one is the point of this crate.
 //!
-//! **A file abstraction is not a reactor.** It is a trait plus one
+//! **A file abstraction is not a reactor.** It is a set of traits plus one
 //! implementation for hosts that have `std`, exactly the shape [`Host`] already
-//! has for parking. A consumer on bare metal implements [`File`] over its own
-//! flash or block device and never links the module below.
+//! has for parking. A consumer on bare metal implements them over its own flash
+//! or block device and never links the host module.
 //!
-//! # Why it exists at all
+//! [`Host`]: st3::fanout::Host
 //!
-//! Because the operations do not fit in any existing trait and every storage
-//! crate therefore reinvents them. `futures-io` covers reading, writing and
-//! seeking one file, and nothing covers `sync_all`, `set_len`, `metadata`, or
-//! opening one in the first place. WorkTable had these in a private module and
-//! `data_bucket` could not name them at all, so the two halves of one storage
-//! engine disagreed about what a file was.
+//! # Why these traits and not `futures-io`
+//!
+//! Because `futures-io` is not portable, and it is easy to conclude otherwise.
+//! **Every one of its traits sits behind its own `std` feature.** Turn that off
+//! and the crate compiles to nothing at all: no `AsyncRead`, no `AsyncWrite`,
+//! no `AsyncSeek`. They take `std::io::Error` and `IoSlice`, so there was
+//! nowhere else for them to go.
+//!
+//! That is worth stating plainly because checking it the obvious way gives the
+//! wrong answer. The crate *builds* for `aarch64-unknown-none`, so a probe that
+//! only compiles it reports success; it is the exports that vanish. Anything
+//! written on top of those three is a `std` trait wearing a portable name.
+//!
+//! So the traits below are the same shape with two differences that matter:
+//! the error is [`Error`], which needs no operating system, and the seek origin
+//! is [`SeekFrom`] rather than `std::io::SeekFrom`. Under `std` the two
+//! interoperate: [`Compat`] wraps any `futures-io` type, and [`HostFile`] is a
+//! plain `std::fs::File` that already implements all of it.
 //!
 //! # Why the calls block
 //!
@@ -32,42 +44,113 @@
 //! So the right place for this work is a thread that owns it, not a worker
 //! shared with everything else. This module gives you the file; where you run
 //! it is yours to decide.
-//!
-//! # Why the whole module needs `std`, for now
-//!
-//! **`futures-io` puts every one of its traits behind its own `std` feature.**
-//! Turn that off and the crate compiles to nothing at all: no `AsyncRead`, no
-//! `AsyncWrite`, no `AsyncSeek`. They take `std::io::Error` and `IoSlice`, so
-//! there was nowhere else for them to go.
-//!
-//! That is worth stating plainly because it is easy to check the wrong way. The
-//! crate *builds* for `aarch64-unknown-none`, so a probe that only compiles it
-//! reports success; it is the exports that vanish. Any `File` trait written on
-//! top of those three is a `std` trait wearing a portable name, which includes
-//! `data_bucket`'s `AsyncFile`.
-//!
-//! A file trait that works without an operating system therefore needs its own
-//! read, write and seek, over an error type that is not `std::io::Error`. That
-//! is a deliberate piece of design and it is not done here. What is here is the
-//! shared home for the operations, so `worktable` and `data_bucket` stop
-//! disagreeing about what a file is while it gets done.
 
 use core::future::Future;
 
-/// A file this crate can read, write and seek, without naming whose runtime
-/// owns it.
+/// Where a seek counts from.
 ///
-/// The three supertraits come from `futures-io` because they belong to no
-/// runtime and are `no_std`-safe with their `std` feature off. The four methods
-/// are the ones no I/O trait carries.
-pub trait File: futures_io::AsyncRead + futures_io::AsyncWrite + futures_io::AsyncSeek + Unpin {
+/// `std::io::SeekFrom` in all but name, restated because that one needs an
+/// operating system and this does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekFrom {
+    /// Bytes from the beginning.
+    Start(u64),
+    /// Bytes from the end, where negative moves backwards into the file.
+    End(i64),
+    /// Bytes from the current position, where negative moves backwards.
+    Current(i64),
+}
+
+/// Reading bytes from something.
+pub trait Read {
+    /// Read into `buffer`, returning how many bytes arrived.
+    ///
+    /// A return of `Ok(0)` means the end, and is not an error.
+    fn read(&mut self, buffer: &mut [u8]) -> impl Future<Output = Result<usize, Error>> + Send;
+
+    /// Fill `buffer` completely, or fail.
+    ///
+    /// A short read is not an end condition here: the caller asked for a fixed
+    /// number of bytes, so running out is [`ErrorKind::UnexpectedEof`].
+    fn read_exact(&mut self, buffer: &mut [u8]) -> impl Future<Output = Result<(), Error>> + Send
+    where
+        Self: Send,
+    {
+        async move {
+            let mut filled = 0;
+            while filled < buffer.len() {
+                match self.read(&mut buffer[filled..]).await? {
+                    0 => return Err(Error::new(ErrorKind::UnexpectedEof)),
+                    n => filled += n,
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Writing bytes to something.
+pub trait Write {
+    /// Write some of `buffer`, returning how many bytes were taken.
+    fn write(&mut self, buffer: &[u8]) -> impl Future<Output = Result<usize, Error>> + Send;
+
+    /// Push whatever is buffered towards its destination.
+    ///
+    /// This is not durability. A write that has been flushed has left this
+    /// process; it has not necessarily reached the storage device. For that,
+    /// see [`File::sync_all`].
+    fn flush(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Write all of `buffer`, or fail.
+    fn write_all(&mut self, buffer: &[u8]) -> impl Future<Output = Result<(), Error>> + Send
+    where
+        Self: Send,
+    {
+        async move {
+            let mut written = 0;
+            while written < buffer.len() {
+                match self.write(&buffer[written..]).await? {
+                    // Nothing taken and no error: the destination will not
+                    // accept more, and looping would spin forever.
+                    0 => return Err(Error::new(ErrorKind::WriteZero)),
+                    n => written += n,
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Moving the cursor of something that has one.
+pub trait Seek {
+    /// Move the cursor, returning where it landed, counted from the start.
+    fn seek(&mut self, from: SeekFrom) -> impl Future<Output = Result<u64, Error>> + Send;
+
+    /// Where the cursor is, counted from the start.
+    fn stream_position(&mut self) -> impl Future<Output = Result<u64, Error>> + Send
+    where
+        Self: Send,
+    {
+        async move { self.seek(SeekFrom::Current(0)).await }
+    }
+}
+
+/// A file: readable, writable, seekable, and able to answer the handful of
+/// questions no I/O trait covers.
+///
+/// The four methods below are the reason this trait exists. Every storage crate
+/// needs them and none of `futures-io`, `tokio::io` or `std::io` puts them in a
+/// trait, so each one reinvents them privately and no two agree.
+pub trait File: Read + Write + Seek {
     /// Bytes currently in the file.
-    fn length(&self) -> impl Future<Output = Result<u64, Error>> + Send;
+    fn length(&mut self) -> impl Future<Output = Result<u64, Error>> + Send;
 
     /// Truncate or extend to `length`, zero-filling any new bytes.
     fn set_length(&mut self, length: u64) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Flush this file's contents *and* its metadata to the storage device.
+    ///
+    /// Unlike [`Write::flush`], this is the durability boundary.
     fn sync_all(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Flush this file's contents, leaving metadata to the platform.
@@ -79,9 +162,9 @@ pub trait File: futures_io::AsyncRead + futures_io::AsyncWrite + futures_io::Asy
 
 /// What went wrong.
 ///
-/// Deliberately not `std::io::Error`: this trait has to be implementable on a
-/// target that has no `std`. With `std` on, the two convert.
-#[derive(Debug)]
+/// Deliberately not `std::io::Error`: these traits have to be implementable on
+/// a target that has no `std`. With `std` on, the two convert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {
     kind: ErrorKind,
 }
@@ -113,6 +196,10 @@ pub enum ErrorKind {
     PermissionDenied,
     /// The read wanted more bytes than the file had left.
     UnexpectedEof,
+    /// The destination accepted no bytes and reported no error.
+    WriteZero,
+    /// The operation was cut short and can be retried as-is.
+    Interrupted,
     /// Anything else the platform reported.
     Other,
 }
@@ -123,6 +210,8 @@ impl core::fmt::Display for Error {
             ErrorKind::NotFound => "no such file",
             ErrorKind::PermissionDenied => "permission denied",
             ErrorKind::UnexpectedEof => "unexpected end of file",
+            ErrorKind::WriteZero => "the destination accepted no bytes",
+            ErrorKind::Interrupted => "interrupted",
             ErrorKind::Other => "file operation failed",
         };
         f.write_str(text)
@@ -139,6 +228,8 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::NotFound => ErrorKind::NotFound,
             std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
             std::io::ErrorKind::UnexpectedEof => ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::WriteZero => ErrorKind::WriteZero,
+            std::io::ErrorKind::Interrupted => ErrorKind::Interrupted,
             _ => ErrorKind::Other,
         })
     }
@@ -152,6 +243,8 @@ impl From<Error> for std::io::Error {
                 ErrorKind::NotFound => std::io::ErrorKind::NotFound,
                 ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
                 ErrorKind::UnexpectedEof => std::io::ErrorKind::UnexpectedEof,
+                ErrorKind::WriteZero => std::io::ErrorKind::WriteZero,
+                ErrorKind::Interrupted => std::io::ErrorKind::Interrupted,
                 ErrorKind::Other => std::io::ErrorKind::Other,
             },
             error,
@@ -160,48 +253,144 @@ impl From<Error> for std::io::Error {
 }
 
 #[cfg(feature = "std")]
+impl From<SeekFrom> for std::io::SeekFrom {
+    fn from(from: SeekFrom) -> Self {
+        match from {
+            SeekFrom::Start(n) => std::io::SeekFrom::Start(n),
+            SeekFrom::End(n) => std::io::SeekFrom::End(n),
+            SeekFrom::Current(n) => std::io::SeekFrom::Current(n),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
 pub use host::{
     append, create, create_dir_all, metadata, open, open_or_create, read, remove_dir_all,
-    remove_file, rename, write, HostFile,
+    remove_file, rename, write, Compat, HostFile,
 };
 
 #[cfg(feature = "std")]
 mod host {
     //! The implementation for a target that has a filesystem.
+    //!
+    //! Blocking `std::fs`, reached through `async fn`s that do not await
+    //! anything. That is not a pretence of asynchrony: it is the honest shape,
+    //! because the platform has no asynchronous file I/O to offer and the two
+    //! crates that claim otherwise are thread pools in a trench coat.
 
-    use super::{Error, File};
-    use core::future::Future;
+    use super::{Error, File, Read, Seek, SeekFrom, Write};
     use std::path::Path;
 
-    /// A [`File`] backed by `std::fs`, carrying the `futures-io` traits through
-    /// `AllowStdIo`.
-    ///
-    /// `AllowStdIo` and not `async-fs`: `async-fs` keeps a user-space write
-    /// buffer and flushes it when the handle drops, best effort and silently.
-    /// Its own documentation says errors detected on closing are ignored. A
-    /// storage engine that drops a handle then reads the file back gets its
-    /// last writes missing and no error, which is how it was found.
-    pub type HostFile = futures_util::io::AllowStdIo<std::fs::File>;
+    /// A [`File`] backed by `std::fs`.
+    #[derive(Debug)]
+    pub struct HostFile {
+        inner: std::fs::File,
+    }
+
+    impl HostFile {
+        /// Take an already-open file.
+        #[must_use]
+        pub fn new(inner: std::fs::File) -> Self {
+            Self { inner }
+        }
+
+        /// The file underneath, for the platform-specific things this trait
+        /// deliberately does not cover.
+        #[must_use]
+        pub fn get_ref(&self) -> &std::fs::File {
+            &self.inner
+        }
+    }
+
+    // `async fn` rather than a computed `Result` handed to an `async move`
+    // block: the second form runs the syscall when the method is called, so a
+    // future that is built and dropped unpolled would still have written. A
+    // future does nothing until it is polled, blocking body or not.
+    impl Read for HostFile {
+        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
+            std::io::Read::read(&mut self.inner, buffer).map_err(Error::from)
+        }
+    }
+
+    impl Write for HostFile {
+        async fn write(&mut self, buffer: &[u8]) -> Result<usize, Error> {
+            std::io::Write::write(&mut self.inner, buffer).map_err(Error::from)
+        }
+
+        async fn flush(&mut self) -> Result<(), Error> {
+            std::io::Write::flush(&mut self.inner).map_err(Error::from)
+        }
+    }
+
+    impl Seek for HostFile {
+        async fn seek(&mut self, from: SeekFrom) -> Result<u64, Error> {
+            std::io::Seek::seek(&mut self.inner, from.into()).map_err(Error::from)
+        }
+    }
 
     impl File for HostFile {
-        fn length(&self) -> impl Future<Output = Result<u64, Error>> + Send {
-            let result = self.get_ref().metadata().map(|m| m.len()).map_err(Error::from);
-            async move { result }
+        async fn length(&mut self) -> Result<u64, Error> {
+            self.inner.metadata().map(|m| m.len()).map_err(Error::from)
         }
 
-        fn set_length(&mut self, length: u64) -> impl Future<Output = Result<(), Error>> + Send {
-            let result = self.get_ref().set_len(length).map_err(Error::from);
-            async move { result }
+        async fn set_length(&mut self, length: u64) -> Result<(), Error> {
+            self.inner.set_len(length).map_err(Error::from)
         }
 
-        fn sync_all(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
-            let result = self.get_ref().sync_all().map_err(Error::from);
-            async move { result }
+        async fn sync_all(&mut self) -> Result<(), Error> {
+            self.inner.sync_all().map_err(Error::from)
         }
 
-        fn sync_data(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
-            let result = self.get_ref().sync_data().map_err(Error::from);
-            async move { result }
+        async fn sync_data(&mut self) -> Result<(), Error> {
+            self.inner.sync_data().map_err(Error::from)
+        }
+    }
+
+    /// Wraps a `futures-io` type so it satisfies [`Read`], [`Write`] and
+    /// [`Seek`].
+    ///
+    /// For consumers that already hold something from that ecosystem. It cannot
+    /// give you a [`File`]: the four methods there have no `futures-io`
+    /// equivalent, which is the whole reason [`File`] exists.
+    #[derive(Debug)]
+    pub struct Compat<T>(pub T);
+
+    impl<T> Read for Compat<T>
+    where
+        T: futures_io::AsyncRead + Unpin + Send,
+    {
+        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
+            futures_util::AsyncReadExt::read(&mut self.0, buffer)
+                .await
+                .map_err(Error::from)
+        }
+    }
+
+    impl<T> Write for Compat<T>
+    where
+        T: futures_io::AsyncWrite + Unpin + Send,
+    {
+        async fn write(&mut self, buffer: &[u8]) -> Result<usize, Error> {
+            futures_util::AsyncWriteExt::write(&mut self.0, buffer)
+                .await
+                .map_err(Error::from)
+        }
+
+        async fn flush(&mut self) -> Result<(), Error> {
+            futures_util::AsyncWriteExt::flush(&mut self.0)
+                .await
+                .map_err(Error::from)
+        }
+    }
+
+    impl<T> Seek for Compat<T>
+    where
+        T: futures_io::AsyncSeek + Unpin + Send,
+    {
+        async fn seek(&mut self, from: SeekFrom) -> Result<u64, Error> {
+            futures_util::AsyncSeekExt::seek(&mut self.0, from.into())
+                .await
+                .map_err(Error::from)
         }
     }
 
@@ -280,19 +469,121 @@ mod host {
     }
 }
 
+/// A [`File`] over a fixed byte array, implemented the way a consumer with no
+/// operating system would implement one over flash.
+///
+/// **This is a guard, not a utility.** `futures-io` compiles for a bare-metal
+/// target while exporting no traits at all, so "the crate builds" is not
+/// evidence that anything downstream can be written. This module touches no
+/// `std` and implements every method of every trait above, including the
+/// provided ones, so a change that quietly made them unimplementable off a host
+/// would stop compiling here.
+#[cfg(test)]
+mod portable {
+    use super::{Error, ErrorKind, File, Read, Seek, SeekFrom, Write};
+    use core::future::Future;
+
+    struct Ram {
+        bytes: [u8; 256],
+        length: u64,
+        at: u64,
+    }
+
+    impl Read for Ram {
+        fn read(&mut self, buffer: &mut [u8]) -> impl Future<Output = Result<usize, Error>> + Send {
+            let start = self.at as usize;
+            let end = (start + buffer.len()).min(self.length as usize);
+            let taken = end.saturating_sub(start);
+            buffer[..taken].copy_from_slice(&self.bytes[start..end]);
+            self.at += taken as u64;
+            async move { Ok(taken) }
+        }
+    }
+
+    impl Write for Ram {
+        fn write(&mut self, buffer: &[u8]) -> impl Future<Output = Result<usize, Error>> + Send {
+            let start = self.at as usize;
+            let result = if start >= self.bytes.len() {
+                Err(Error::new(ErrorKind::WriteZero))
+            } else {
+                let end = (start + buffer.len()).min(self.bytes.len());
+                let taken = end - start;
+                self.bytes[start..end].copy_from_slice(&buffer[..taken]);
+                self.at += taken as u64;
+                self.length = self.length.max(self.at);
+                Ok(taken)
+            };
+            async move { result }
+        }
+
+        async fn flush(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl Seek for Ram {
+        async fn seek(&mut self, from: SeekFrom) -> Result<u64, Error> {
+            self.at = match from {
+                SeekFrom::Start(n) => n,
+                SeekFrom::End(n) => self.length.saturating_add_signed(n),
+                SeekFrom::Current(n) => self.at.saturating_add_signed(n),
+            };
+            Ok(self.at)
+        }
+    }
+
+    impl File for Ram {
+        async fn length(&mut self) -> Result<u64, Error> {
+            Ok(self.length)
+        }
+
+        async fn set_length(&mut self, length: u64) -> Result<(), Error> {
+            self.length = length;
+            Ok(())
+        }
+
+        async fn sync_all(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn sync_data(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_consumer_with_no_filesystem_can_implement_the_whole_trait() {
+        let out = crate::block_on(async {
+            let mut device = Ram {
+                bytes: [0; 256],
+                length: 0,
+                at: 0,
+            };
+            device.write_all(b"disk").await?;
+            device.seek(SeekFrom::Start(0)).await?;
+            let mut back = [0u8; 4];
+            device.read_exact(&mut back).await?;
+            assert_eq!(device.stream_position().await?, 4);
+            assert_eq!(device.length().await?, 4);
+            device.sync_all().await?;
+            Ok::<_, Error>(back)
+        })
+        .unwrap();
+        assert_eq!(&out, b"disk");
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use super::{create, metadata, open, remove_file, File};
+    use super::{create, metadata, open, remove_file, ErrorKind, File, Read, Seek, SeekFrom, Write};
     use crate::block_on;
-    use futures_util::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-    use std::io::SeekFrom;
 
     fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("nagoya-io-{name}-{}", std::process::id()))
     }
 
     #[test]
-    fn a_file_round_trips_through_the_futures_traits() {
+    fn a_file_round_trips_through_the_traits() {
         let path = scratch("round-trip");
         block_on(async {
             let mut file = create(&path).await.unwrap();
@@ -311,8 +602,6 @@ mod tests {
         block_on(async {
             let mut file = create(&path).await.unwrap();
             file.write_all(b"0123456789").await.unwrap();
-            // `length` reads the file, not the buffer, so it has to see the
-            // write without a flush of its own.
             file.sync_all().await.unwrap();
             assert_eq!(file.length().await.unwrap(), 10);
 
@@ -326,9 +615,47 @@ mod tests {
     }
 
     #[test]
+    fn reading_past_the_end_is_not_silently_short() {
+        let path = scratch("short");
+        block_on(async {
+            let mut file = create(&path).await.unwrap();
+            file.write_all(b"four").await.unwrap();
+            file.seek(SeekFrom::Start(0)).await.unwrap();
+
+            // `read` reports the end as zero bytes and no error.
+            let mut plenty = [0u8; 64];
+            assert_eq!(file.read(&mut plenty).await.unwrap(), 4);
+            assert_eq!(file.read(&mut plenty).await.unwrap(), 0);
+
+            // `read_exact` asked for a fixed count, so running out is an error.
+            file.seek(SeekFrom::Start(0)).await.unwrap();
+            let mut exact = [0u8; 64];
+            let error = file.read_exact(&mut exact).await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seeking_reports_where_it_landed() {
+        let path = scratch("seek");
+        block_on(async {
+            let mut file = create(&path).await.unwrap();
+            file.write_all(&[0u8; 100]).await.unwrap();
+
+            assert_eq!(file.seek(SeekFrom::Start(10)).await.unwrap(), 10);
+            assert_eq!(file.seek(SeekFrom::Current(5)).await.unwrap(), 15);
+            assert_eq!(file.seek(SeekFrom::Current(-5)).await.unwrap(), 10);
+            assert_eq!(file.seek(SeekFrom::End(-1)).await.unwrap(), 99);
+            assert_eq!(file.stream_position().await.unwrap(), 99);
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn opening_something_that_is_not_there_says_so() {
         let error = block_on(open(scratch("absent"))).unwrap_err();
-        assert_eq!(error.kind(), super::ErrorKind::NotFound);
+        assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 
     #[test]
