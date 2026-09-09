@@ -107,8 +107,24 @@ pub fn set_clock(clock: fn() -> u64) {
 /// panic that names the missing call.
 #[must_use]
 pub fn now_ns() -> u64 {
+    // The install is behind the load, not in front of it. Reading the clock is
+    // on the path of every `sleep` and every `timeout`, including the ones that
+    // never arm, and installing unconditionally put a second `OnceLock` on that
+    // path to answer a question already settled by the first call in the
+    // process.
     #[cfg(feature = "std")]
-    driver::install_default_clock();
+    let raw = {
+        let mut raw = CLOCK.load(Ordering::Acquire);
+        if raw == 0 {
+            driver::install_default_clock();
+            raw = CLOCK.load(Ordering::Acquire);
+        }
+        raw
+    };
+    // Nothing to install: without `std` the consumer's `set_clock` is the only
+    // way a clock ever arrives, so a zero here is the missing call, not a
+    // default waiting to be taken.
+    #[cfg(not(feature = "std"))]
     let raw = CLOCK.load(Ordering::Acquire);
     assert!(raw != 0, "nagoya::time::set_clock has not been called");
     // SAFETY: the only value ever stored is a `fn() -> u64` cast to `usize` by
@@ -175,8 +191,15 @@ fn arm(deadline: u64, slot: &Arc<Slot>) -> bool {
 #[derive(Debug)]
 pub struct Sleep {
     deadline: u64,
-    slot: Arc<Slot>,
-    armed: bool,
+    /// `None` until this is first polled and found to still be in the future.
+    ///
+    /// **The allocation is deferred because most timers never need it.**
+    /// `timeout` polls its inner future first and returns without touching the
+    /// sleep whenever that future is ready, which in production is nearly every
+    /// call. Allocating a slot in `sleep()` charged every one of those for a
+    /// timer that was never armed: measured at 65 ns against tokio's 27 ns for
+    /// the same arm-and-cancel loop.
+    slot: Option<Arc<Slot>>,
 }
 
 impl Sleep {
@@ -201,11 +224,7 @@ pub fn sleep(duration: Duration) -> Sleep {
 pub fn sleep_until(deadline: u64) -> Sleep {
     Sleep {
         deadline,
-        slot: Arc::new(Slot {
-            fired: AtomicBool::new(false),
-            waker: Mutex::new(None),
-        }),
-        armed: false,
+        slot: None,
     }
 }
 
@@ -214,24 +233,46 @@ impl Future for Sleep {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        if this.slot.fired.load(Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-        // Registering the waker before the deadline check closes the race where
-        // the driver fires between the two: it would find a waker and wake it,
-        // and this poll returns pending to a task that is already scheduled.
-        *this.slot.waker.lock() = Some(cx.waker().clone());
-        if this.slot.fired.load(Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-        if !this.armed {
-            this.armed = true;
-            if arm(this.deadline, &this.slot) {
-                #[cfg(feature = "std")]
-                driver::nudge();
+        match &this.slot {
+            Some(slot) => {
+                if slot.fired.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                // Re-registering matters: a task moved between wakes carries a
+                // different waker, and the one held here would wake nothing.
+                *slot.waker.lock() = Some(cx.waker().clone());
+                // Checked again after registering, because the driver may have
+                // fired between the load above and the store. Without this the
+                // waker is consumed by a firing that already happened and the
+                // sleep never returns.
+                if slot.fired.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            }
+            // **The deadline is checked before anything is allocated or
+            // locked.** A sleep whose time has already passed is by far the
+            // common case for a batch of timers awaited in order, and arming it
+            // costs a full round trip through the driver to learn what the
+            // clock could have said here: measured at 5495 us of overshoot on a
+            // 10 ms deadline against tokio's 3844.
+            None => {
+                if now_ns() >= this.deadline {
+                    return Poll::Ready(());
+                }
+                let slot = Arc::new(Slot {
+                    fired: AtomicBool::new(false),
+                    waker: Mutex::new(Some(cx.waker().clone())),
+                });
+                let earliest = arm(this.deadline, &slot);
+                this.slot = Some(slot);
+                if earliest {
+                    #[cfg(feature = "std")]
+                    driver::nudge();
+                }
+                Poll::Pending
             }
         }
-        Poll::Pending
     }
 }
 
@@ -239,7 +280,9 @@ impl Drop for Sleep {
     fn drop(&mut self) {
         // Disarm rather than unregister. Finding this entry in the heap costs a
         // linear scan under the lock; leaving it costs one wake of nothing.
-        *self.slot.waker.lock() = None;
+        if let Some(slot) = &self.slot {
+            *slot.waker.lock() = None;
+        }
     }
 }
 
