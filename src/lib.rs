@@ -110,6 +110,21 @@ impl<T> JoinHandle<T> {
     }
 }
 
+/// Deliberately not derived: a derive would demand `T: Debug` from every
+/// consumer that puts a handle in a `#[derive(Debug)]` struct, and a handle's
+/// output type is exactly the thing they cannot see yet.
+impl<T> core::fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("JoinHandle")
+            .field(
+                "finished",
+                &self.task.as_ref().is_some_and(async_task::Task::is_finished),
+            )
+            .finish()
+    }
+}
+
 impl<T> Drop for JoinHandle<T> {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
