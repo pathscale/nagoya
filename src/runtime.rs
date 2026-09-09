@@ -58,6 +58,10 @@ impl Runtime {
             std::thread::Builder::new()
                 .name(alloc::format!("nagoya-{id}"))
                 .spawn(move || {
+                    // Tells the scheduler that a wake happening on this thread
+                    // belongs to worker `id`, so it can skip the injector. See
+                    // `task::mark_current`.
+                    let _current = crate::task::mark_current(&pool, id);
                     let _ = pool.run(runner);
                 })
                 .expect("a runtime thread");
