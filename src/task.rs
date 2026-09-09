@@ -19,10 +19,10 @@ use core::ptr::NonNull;
 use async_task::{Runnable, Task};
 use st3::fanout::{Act, Job, Pool};
 
-/// Which pool worker this thread is, while it is running one.
-///
-/// A raw pointer rather than an id, so a process with two pools cannot hand
-/// one pool's job to the other's worker. It is compared and never dereferenced.
+// Which pool worker this thread is, while it is running one.
+//
+// A raw pointer rather than an id, so a process with two pools cannot hand one
+// pool's job to the other's worker. It is compared and never dereferenced.
 #[cfg(feature = "std")]
 std::thread_local! {
     static CURRENT: core::cell::Cell<Option<(*const Pool, usize)>> =
