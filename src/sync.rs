@@ -201,6 +201,87 @@ impl Notified<'_> {
     }
 }
 
+/// A rendezvous for a fixed number of tasks.
+///
+/// Every waiter blocks until `n` of them have arrived, then all are released
+/// together. Reusable: the next `n` arrivals rendezvous again.
+///
+/// The benchmark case is what this is for. A harness that starts `n` client
+/// tasks and times them has to release them at one instant, or the first
+/// task's warm-up is measured against the last task's steady state and the
+/// number means nothing. A barrier is how that instant is defined.
+pub struct Barrier {
+    n: usize,
+    state: Mutex<BarrierState>,
+    notify: Notify,
+}
+
+struct BarrierState {
+    arrived: usize,
+    /// Bumped on each release, so a waiter can tell "my group has gone" from
+    /// "someone else's group has". Without it a task that is slow to be
+    /// scheduled after the wake rejoins the *next* rendezvous and hangs.
+    generation: usize,
+}
+
+impl Barrier {
+    /// A barrier that releases once `n` tasks have arrived.
+    ///
+    /// `n` of 0 or 1 never blocks, which is what a single-threaded run of a
+    /// harness wants rather than a special case at every call site.
+    #[must_use]
+    pub fn new(n: usize) -> Self {
+        Self {
+            n,
+            state: Mutex::new(BarrierState {
+                arrived: 0,
+                generation: 0,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Wait for the rest of the group.
+    ///
+    /// Returns `true` for exactly one waiter per rendezvous, the one whose
+    /// arrival completed it. Callers use that to elect a task to do the
+    /// once-per-round work without a second primitive.
+    pub async fn wait(&self) -> bool {
+        let generation = {
+            let mut state = self.state.lock();
+            state.arrived += 1;
+            if state.arrived >= self.n {
+                state.arrived = 0;
+                state.generation = state.generation.wrapping_add(1);
+                drop(state);
+                self.notify.notify_waiters();
+                return true;
+            }
+            state.generation
+        };
+
+        loop {
+            // Register before re-reading the generation. `notify_waiters`
+            // retains no permit, so a release landing between the read and the
+            // await would be lost and this task would wait for a rendezvous
+            // that already happened.
+            let notified = self.notify.notified();
+            let mut notified = core::pin::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.lock().generation != generation {
+                return false;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl core::fmt::Debug for Barrier {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("Barrier").field("n", &self.n).finish_non_exhaustive()
+    }
+}
+
 /// A counting semaphore.
 pub struct Semaphore {
     permits: AtomicUsize,
@@ -713,6 +794,46 @@ mod tests {
         drop(b);
         drop(c);
         assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    #[test]
+    fn a_barrier_releases_only_once_everyone_has_arrived() {
+        use crate::runtime::Runtime;
+
+        let runtime = Runtime::new(4);
+        let barrier = Arc::new(Barrier::new(4));
+        let passed = Arc::new(AtomicUsize::new(0));
+        // Counted before and after, so a barrier that let anyone through early
+        // is visible rather than merely suspected.
+        let leaders = Arc::new(AtomicUsize::new(0));
+
+        let handles: alloc::vec::Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let passed = passed.clone();
+                let leaders = leaders.clone();
+                runtime.spawn(async move {
+                    if barrier.wait().await {
+                        leaders.fetch_add(1, Ordering::Relaxed);
+                    }
+                    passed.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+            .collect();
+        for handle in handles {
+            block_on(handle);
+        }
+
+        assert_eq!(passed.load(Ordering::Relaxed), 4);
+        assert_eq!(leaders.load(Ordering::Relaxed), 1, "exactly one waiter leads a rendezvous");
+    }
+
+    #[test]
+    fn a_barrier_of_one_never_blocks() {
+        let barrier = Barrier::new(1);
+        assert!(block_on(barrier.wait()));
+        // Reusable: a second rendezvous behaves like the first.
+        assert!(block_on(barrier.wait()));
     }
 
     #[test]
