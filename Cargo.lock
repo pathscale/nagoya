@@ -275,7 +275,7 @@ dependencies = [
 [[package]]
 name = "ps-st3"
 version = "0.5.0"
-source = "git+https://github.com/pathscale/ps-st3?branch=perf%2Fskip-the-wake-when-nobody-sleeps#169865de08f02c1400fb4c1c97e85752362f1dc1"
+source = "git+https://github.com/pathscale/ps-st3?branch=perf%2Fskip-the-wake-when-nobody-sleeps#a03cb63a78c494b0f1c40e8366a36b08e3dfa2fa"
 dependencies = [
  "atomic-wait",
  "crossbeam-queue",
