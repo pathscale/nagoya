@@ -3,15 +3,18 @@
 //! Batched rather than one huge spawn: the spawn loop outruns the workers, so a
 //! single batch of the size this needs would hold millions of live tasks and
 //! measure the allocator instead of the scheduler.
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use st3::fanout::{Pool, StdHost};
 
 fn main() {
-    let workers: usize = std::env::var("W").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let workers: usize = std::env::var("W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     let host = Arc::new(StdHost::new(workers));
     let pool = Pool::new(workers, 1024, host);
     let threads: Vec<_> = (0..workers)

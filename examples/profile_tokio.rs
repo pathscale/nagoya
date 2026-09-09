@@ -1,6 +1,6 @@
 //! The same batched first-poll workload on tokio, so the two profiles compare.
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() {

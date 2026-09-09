@@ -13,8 +13,8 @@
 //!
 //! One task at a time, submitted to an idle pool, timed to completion.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -25,15 +25,24 @@ const SAMPLES: usize = 2_000;
 
 fn tuning() -> Tuning {
     Tuning {
-        rounds_before_park: std::env::var("ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
-        backoff_spins: std::env::var("BACKOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(1024),
+        rounds_before_park: std::env::var("ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64),
+        backoff_spins: std::env::var("BACKOFF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024),
         promote_every: 64,
         injector_batch: 32,
     }
 }
 
 fn workers() -> usize {
-    std::env::var("W").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    std::env::var("W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
 }
 
 struct Done {
