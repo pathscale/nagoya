@@ -46,12 +46,14 @@ use core::task::{Context, Poll};
 use st3::fanout::Pool;
 
 mod block_on;
+mod time;
 mod par;
 mod yield_now;
 mod task;
 
 pub use block_on::block_on;
 pub use par::{par_for, Cancel, ParFor};
+pub use time::{now_ns, poll as poll_timers, set_clock, sleep, sleep_until, timeout, Elapsed, Sleep, Timeout};
 pub use yield_now::{yield_now, YieldNow};
 
 /// A handle to a spawned task's output.
