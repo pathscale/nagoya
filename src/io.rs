@@ -3,32 +3,32 @@
 //! # Why this is here and not a reactor
 //!
 //! The crate documentation says there will be no I/O driver, and that still
-//! holds: an epoll or io_uring reactor is the part that needs an operating
-//! system, and being able to run without one is the point of this crate.
+//! holds: an epoll or io_uring reactor is a large amount of platform, and not
+//! linking one is the point of this crate.
 //!
 //! **A file abstraction is not a reactor.** It is a set of traits plus one
-//! implementation for hosts that have `std`, exactly the shape [`Host`] already
-//! has for parking. A consumer on bare metal implements them over its own flash
-//! or block device and never links the host module.
+//! implementation over `std::fs`, exactly the shape [`Host`] already has for
+//! parking: a consumer that does not want the `std` one supplies its own.
 //!
 //! [`Host`]: st3::fanout::Host
 //!
 //! # Why these traits and not `futures-io`
 //!
-//! Because `futures-io` is not portable, and it is easy to conclude otherwise.
-//! **Every one of its traits sits behind its own `std` feature.** Turn that off
-//! and the crate compiles to nothing at all: no `AsyncRead`, no `AsyncWrite`,
-//! no `AsyncSeek`. They take `std::io::Error` and `IoSlice`, so there was
-//! nowhere else for them to go.
+//! Because `futures-io` cannot be used without `std`, and it is easy to
+//! conclude otherwise. **Every one of its traits sits behind its own `std`
+//! feature.** Turn that off and the crate compiles to nothing at all: no
+//! `AsyncRead`, no `AsyncWrite`, no `AsyncSeek`. They take `std::io::Error` and
+//! `IoSlice`, so there was nowhere else for them to go.
 //!
 //! That is worth stating plainly because checking it the obvious way gives the
-//! wrong answer. The crate *builds* for `aarch64-unknown-none`, so a probe that
-//! only compiles it reports success; it is the exports that vanish. Anything
-//! written on top of those three is a `std` trait wearing a portable name.
+//! wrong answer: the crate still *compiles* with the feature off, so a probe
+//! that only builds it reports success, and it is the exports that vanish.
+//! Anything written on top of those three is a `std` trait wearing a portable
+//! name.
 //!
-//! So the traits below are the same shape with two differences that matter:
-//! the error is [`Error`], which needs no operating system, and the seek origin
-//! is [`SeekFrom`] rather than `std::io::SeekFrom`. Under `std` the two
+//! So the traits below are the same shape with two differences that matter: the
+//! error is [`Error`] rather than `std::io::Error`, and the seek origin is
+//! [`SeekFrom`] rather than `std::io::SeekFrom`. With `std` on, the two
 //! interoperate: [`Compat`] wraps any `futures-io` type, and [`HostFile`] is a
 //! plain `std::fs::File` that already implements all of it.
 //!
@@ -49,8 +49,8 @@ use core::future::Future;
 
 /// Where a seek counts from.
 ///
-/// `std::io::SeekFrom` in all but name, restated because that one needs an
-/// operating system and this does not.
+/// `std::io::SeekFrom` in all but name, restated because that one is in `std`
+/// and this is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeekFrom {
     /// Bytes from the beginning.
@@ -85,6 +85,41 @@ pub trait Read {
                 }
             }
             Ok(())
+        }
+    }
+
+    /// Append everything left to `buffer`, returning how many bytes were added.
+    ///
+    /// Grows in chunks rather than one byte at a time, and only keeps what was
+    /// actually read, so a source that ends early does not leave the caller
+    /// holding a tail of zeros it cannot distinguish from data.
+    fn read_to_end(
+        &mut self,
+        buffer: &mut alloc::vec::Vec<u8>,
+    ) -> impl Future<Output = Result<usize, Error>> + Send
+    where
+        Self: Send,
+    {
+        /// Big enough that a whole page arrives in one or two reads, small
+        /// enough not to over-allocate for a short file.
+        const CHUNK: usize = 8192;
+        async move {
+            let start = buffer.len();
+            loop {
+                let filled = buffer.len();
+                buffer.resize(filled + CHUNK, 0);
+                match self.read(&mut buffer[filled..]).await {
+                    Ok(0) => {
+                        buffer.truncate(filled);
+                        return Ok(filled - start);
+                    }
+                    Ok(n) => buffer.truncate(filled + n),
+                    Err(error) => {
+                        buffer.truncate(filled);
+                        return Err(error);
+                    }
+                }
+            }
         }
     }
 }
@@ -218,8 +253,11 @@ impl core::fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+// `core::error::Error`, not `std::error::Error`, and not behind the `std`
+// feature. A consumer building without `std` still wants `?` to work against
+// its own error type, and gating this would have made the trait unusable in
+// exactly the place it exists for.
+impl core::error::Error for Error {}
 
 #[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
@@ -469,15 +507,15 @@ mod host {
     }
 }
 
-/// A [`File`] over a fixed byte array, implemented the way a consumer with no
-/// operating system would implement one over flash.
+/// A [`File`] over a fixed byte array, implemented the way a consumer that does
+/// not want the `std` one would implement it.
 ///
-/// **This is a guard, not a utility.** `futures-io` compiles for a bare-metal
-/// target while exporting no traits at all, so "the crate builds" is not
-/// evidence that anything downstream can be written. This module touches no
+/// **This is a guard, not a utility.** `futures-io` still compiles with its
+/// `std` feature off while exporting no traits at all, so "the crate builds" is
+/// not evidence that anything downstream can be written. This module touches no
 /// `std` and implements every method of every trait above, including the
-/// provided ones, so a change that quietly made them unimplementable off a host
-/// would stop compiling here.
+/// provided ones, so a change that quietly made them unimplementable without
+/// `std` would stop compiling here.
 #[cfg(test)]
 mod portable {
     use super::{Error, ErrorKind, File, Read, Seek, SeekFrom, Write};
