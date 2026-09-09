@@ -89,7 +89,22 @@ impl Waiters {
 /// work that was already announced.
 pub struct Notify {
     permit: AtomicBool,
+    /// Bumped by [`Notify::notify_waiters`], which leaves no permit.
+    ///
+    /// A `Notified` snapshots this when it is created, so a broadcast landing
+    /// between creation and the first poll is still observed. That is the race
+    /// `tokio`'s `Notified::enable` exists for, and taking it at construction
+    /// costs one relaxed load instead of an intrusive list.
+    generation: AtomicUsize,
     waiters: Waiters,
+}
+
+impl core::fmt::Debug for Notify {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Notify")
+            .field("permit", &self.permit.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Notify {
@@ -104,6 +119,7 @@ impl Notify {
     pub const fn new() -> Self {
         Self {
             permit: AtomicBool::new(false),
+            generation: AtomicUsize::new(0),
             waiters: Waiters::new(),
         }
     }
@@ -116,44 +132,72 @@ impl Notify {
 
     /// Wake every current waiter. Leaves no permit.
     pub fn notify_waiters(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.waiters.wake_all();
     }
 
     /// Wait for a notification, taking a stored permit if one is there.
     pub fn notified(&self) -> Notified<'_> {
-        Notified { notify: self }
+        Notified {
+            notify: self,
+            generation: self.generation.load(Ordering::Acquire),
+        }
     }
 }
 
 /// The future returned by [`Notify::notified`].
 pub struct Notified<'a> {
     notify: &'a Notify,
+    /// The broadcast generation when this was created.
+    generation: usize,
+}
+
+impl Notified<'_> {
+    /// Whether a notification is already waiting for this future.
+    ///
+    /// **This is not `tokio`'s `enable` and does not need to be.** There, the
+    /// future must be linked into the waiter list before the caller reads any
+    /// state, or a notification in between is lost. Here the two ways of
+    /// notifying are both already durable across that window: `notify_one`
+    /// leaves a permit that outlives it, and `notify_waiters` bumps a
+    /// generation this future snapshotted when it was created. So the race the
+    /// call guards against cannot happen, and the method exists to keep the
+    /// registration point visible at the call site, which is worth having.
+    pub fn enable(self: Pin<&mut Self>) -> bool {
+        self.notify.permit.load(Ordering::Acquire)
+            || self.notify.generation.load(Ordering::Acquire) != self.generation
+    }
 }
 
 impl Future for Notified<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        if self
-            .notify
-            .permit
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        if self.is_notified() {
             return Poll::Ready(());
         }
         // Registered before the second look, so a notification landing between
         // the two still finds a waker to call.
         self.notify.waiters.push(context.waker());
+        if self.is_notified() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+}
+
+impl Notified<'_> {
+    /// Take a permit, or observe that a broadcast has happened since creation.
+    fn is_notified(&self) -> bool {
         if self
             .notify
             .permit
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return Poll::Ready(());
+            return true;
         }
-        Poll::Pending
+        self.notify.generation.load(Ordering::Acquire) != self.generation
     }
 }
 
@@ -354,6 +398,42 @@ impl<T: ?Sized> RwLock<T> {
     /// The write half of [`Self::read_owned`].
     pub fn write_owned(self: Arc<Self>) -> WriteOwned<T> {
         WriteOwned { lock: Some(self) }
+    }
+
+    /// An owned read lock, or `None` if a writer holds it.
+    pub fn try_read_owned(self: Arc<Self>) -> Option<OwnedRwLockReadGuard<T>> {
+        self.try_read_raw()
+            .then(|| OwnedRwLockReadGuard { lock: self })
+    }
+
+    /// An owned write lock, or `None` if the lock is held at all.
+    pub fn try_write_owned(self: Arc<Self>) -> Option<OwnedRwLockWriteGuard<T>> {
+        self.try_write_raw()
+            .then(|| OwnedRwLockWriteGuard { lock: self })
+    }
+}
+
+impl<T: Default> Default for RwLock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: ?Sized> core::fmt::Debug for RwLock<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The value is deliberately not shown: reading it would need the lock,
+        // and a `Debug` that can block is a debugging hazard rather than a help.
+        let state = self.state.load(Ordering::Relaxed);
+        let held = if state == WRITER {
+            "write"
+        } else if state == 0 {
+            "free"
+        } else {
+            "read"
+        };
+        f.debug_struct("RwLock")
+            .field("held", &held)
+            .finish_non_exhaustive()
     }
 }
 

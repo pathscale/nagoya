@@ -28,9 +28,9 @@
 //!
 //! [`Host`]: st3::fanout::Host
 
+use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::collections::BinaryHeap;
 use core::cmp::Ordering as CmpOrdering;
 use core::future::Future;
 use core::pin::Pin;
@@ -453,7 +453,10 @@ mod tests {
 
     #[test]
     fn a_timeout_gives_up_on_one_that_does_not_finish() {
-        let out = block_on(timeout(Duration::from_millis(20), sleep(Duration::from_secs(30))));
+        let out = block_on(timeout(
+            Duration::from_millis(20),
+            sleep(Duration::from_secs(30)),
+        ));
         assert_eq!(out, Err(Elapsed));
     }
 
@@ -461,7 +464,10 @@ mod tests {
     fn a_future_ready_at_its_deadline_wins() {
         // The inner future is polled first on every wake, so this completes
         // rather than racing its own timer. Same duration on both sides.
-        let out = block_on(timeout(Duration::from_millis(20), sleep(Duration::from_millis(20))));
+        let out = block_on(timeout(
+            Duration::from_millis(20),
+            sleep(Duration::from_millis(20)),
+        ));
         assert_eq!(out, Ok(()));
     }
 

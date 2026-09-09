@@ -7,8 +7,8 @@
 //!
 //! No workers are started. The pool fills up and nothing runs.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use st3::fanout::{Job, Pool, StdHost};
@@ -50,9 +50,12 @@ fn main() {
         let pool = Pool::new(8, 1024, Arc::new(StdHost::new(8)));
         for n in 0..TASKS {
             let counter = counter.clone();
-            pool.submit(n % 8, Box::new(move || {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }));
+            pool.submit(
+                n % 8,
+                Box::new(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }),
+            );
         }
     });
     let by_fn = time(|| {

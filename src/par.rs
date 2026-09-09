@@ -215,7 +215,6 @@ where
     fn park(&self, waker: &Waker) {
         *self.waiter.lock() = Some(waker.clone());
     }
-
 }
 
 /// Everything a loop needs to start: the shared half, the pool to put pieces

@@ -435,7 +435,10 @@ mod host {
     /// Open an existing file for reading and writing.
     pub async fn open(path: impl AsRef<Path>) -> Result<HostFile, Error> {
         Ok(HostFile::new(
-            std::fs::OpenOptions::new().read(true).write(true).open(path)?,
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?,
         ))
     }
 
@@ -467,7 +470,10 @@ mod host {
     /// Open for appending, creating it if absent.
     pub async fn append(path: impl AsRef<Path>) -> Result<HostFile, Error> {
         Ok(HostFile::new(
-            std::fs::OpenOptions::new().append(true).create(true).open(path)?,
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)?,
         ))
     }
 
@@ -613,7 +619,9 @@ mod portable {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use super::{create, metadata, open, remove_file, ErrorKind, File, Read, Seek, SeekFrom, Write};
+    use super::{
+        create, metadata, open, remove_file, ErrorKind, File, Read, Seek, SeekFrom, Write,
+    };
     use crate::block_on;
 
     fn scratch(name: &str) -> std::path::PathBuf {

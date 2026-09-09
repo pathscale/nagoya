@@ -15,8 +15,8 @@
 //! CPU is user + system across every thread, so an arm that finishes quickly by
 //! burning eight cores cannot hide it.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -26,7 +26,10 @@ use st3::fanout::{Pool, StdHost};
 const TASKS: usize = 100_000;
 const REPS: usize = 5;
 fn workers() -> usize {
-    std::env::var("W").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    std::env::var("W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
 }
 
 fn cpu_seconds() -> f64 {

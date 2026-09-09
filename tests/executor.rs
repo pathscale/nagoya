@@ -241,7 +241,10 @@ fn dropping_a_loop_cancels_it() {
     let cancel = loop_.cancel();
     assert!(!cancel.is_cancelled());
     drop(loop_);
-    assert!(cancel.is_cancelled(), "dropping the future did not cancel it");
+    assert!(
+        cancel.is_cancelled(),
+        "dropping the future did not cancel it"
+    );
 }
 
 /// A yielding task finishes, and lets others run while it does.
@@ -257,7 +260,9 @@ fn a_task_can_yield_its_worker() {
         }
         first.fetch_add(1, Ordering::AcqRel)
     });
-    let short = running.executor.spawn(async move { second.fetch_add(1, Ordering::AcqRel) });
+    let short = running
+        .executor
+        .spawn(async move { second.fetch_add(1, Ordering::AcqRel) });
 
     let (long, short) = (block_on(long), block_on(short));
     assert_eq!(long, Some(1), "the yielding task did not let the other in");
