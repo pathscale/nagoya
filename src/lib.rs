@@ -48,6 +48,10 @@ use st3::fanout::Pool;
 mod block_on;
 pub mod io;
 mod par;
+// Owns threads, so it needs `std`. See its module comment for why a crate built
+// not to own threads carries one that does.
+#[cfg(feature = "std")]
+pub mod runtime;
 // The four async primitives a consumer was otherwise taking from `tokio::sync`.
 // They are runtime-agnostic there too, which is exactly why the dependency was
 // easy to acquire and hard to notice: see the module comment.
