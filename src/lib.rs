@@ -47,14 +47,20 @@ use st3::fanout::Pool;
 
 mod block_on;
 pub mod io;
-mod time;
 mod par;
-mod yield_now;
+// The four async primitives a consumer was otherwise taking from `tokio::sync`.
+// They are runtime-agnostic there too, which is exactly why the dependency was
+// easy to acquire and hard to notice: see the module comment.
+pub mod sync;
 mod task;
+mod time;
+mod yield_now;
 
 pub use block_on::block_on;
 pub use par::{par_for, Cancel, ParFor};
-pub use time::{now_ns, poll as poll_timers, set_clock, sleep, sleep_until, timeout, Elapsed, Sleep, Timeout};
+pub use time::{
+    now_ns, poll as poll_timers, set_clock, sleep, sleep_until, timeout, Elapsed, Sleep, Timeout,
+};
 pub use yield_now::{yield_now, YieldNow};
 
 /// A handle to a spawned task's output.
@@ -75,7 +81,9 @@ pub struct JoinHandle<T> {
 
 impl<T> JoinHandle<T> {
     fn task(&mut self) -> &mut async_task::Task<T> {
-        self.task.as_mut().expect("the task is taken only by `Drop`")
+        self.task
+            .as_mut()
+            .expect("the task is taken only by `Drop`")
     }
 
     /// Stop the task at its next suspension point and throw away its output.
@@ -129,9 +137,7 @@ impl Executor {
     /// which is what keeps this free of an operating system.
     #[must_use]
     pub fn new(pool: Arc<Pool>) -> Self {
-        Self {
-            pool,
-        }
+        Self { pool }
     }
 
     /// Another handle to the same pool, for a task that spawns.
