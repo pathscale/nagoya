@@ -1,0 +1,109 @@
+//! A pool that owns its threads, for callers that have nowhere else to put them.
+//!
+//! # Why this exists in a crate whose point is not owning threads
+//!
+//! [`Executor`](crate::Executor) deliberately takes a pool whose threads the
+//! caller provides. That is the property that lets this crate run without an
+//! operating system, and it is not negotiable.
+//!
+//! But it pushes a real problem onto some callers. A storage engine has
+//! background work that is *intrinsic to it* rather than to its user: a vacuum
+//! sweep and a persistence writer are the engine's business, they must keep
+//! running, and no caller should have to know they exist in order to hand over
+//! a thread for them. Faced with that, the engine reached for `tokio::spawn`,
+//! which works because tokio has an implicit global runtime to find. That one
+//! call put the whole of `tokio` into a `no_std` dependency graph.
+//!
+//! So: this is the explicit version of the thing that was being got implicitly.
+//! It owns threads, it needs `std`, and it says so in its name and its feature
+//! gate, rather than arriving as a side effect of a `spawn`.
+//!
+//! **Off without `std`, and that is the honest outcome.** A build with no
+//! threads has no background worker, and an engine that needs one has to say
+//! what it does instead rather than pretend the problem is absent.
+
+use alloc::sync::Arc;
+use core::future::Future;
+
+use st3::fanout::{Pool, StdHost};
+
+use crate::{Executor, JoinHandle};
+
+/// A work-stealing pool that started its own threads.
+///
+/// Dropping this does **not** stop the threads: they are detached, because the
+/// tasks on them are the ones nobody else is watching, and tearing them down
+/// under a running sweep is worse than letting them run. A caller that wants
+/// them stopped stops the work, not the runtime.
+pub struct Runtime {
+    executor: Executor,
+}
+
+impl Runtime {
+    /// A runtime with `workers` threads.
+    ///
+    /// # Panics
+    ///
+    /// If a thread cannot be started. There is no useful way to continue: the
+    /// caller asked for background execution and the platform refused it, and
+    /// returning a runtime that silently runs nothing would be worse.
+    #[must_use]
+    pub fn new(workers: usize) -> Self {
+        let workers = workers.max(1);
+        let host = Arc::new(StdHost::new(workers));
+        let pool = Pool::new(workers, 1024, host);
+        for id in 0..workers {
+            let pool = pool.clone();
+            let runner = pool.runner(id);
+            std::thread::Builder::new()
+                .name(alloc::format!("nagoya-{id}"))
+                .spawn(move || {
+                    let _ = pool.run(runner);
+                })
+                .expect("a runtime thread");
+        }
+        Self {
+            executor: Executor::new(pool),
+        }
+    }
+
+    /// Run a future on this runtime's threads.
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.executor.spawn(future)
+    }
+
+    /// The executor underneath, for a caller that wants to hand it on.
+    #[must_use]
+    pub fn executor(&self) -> &Executor {
+        &self.executor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block_on;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_runtime_runs_what_it_is_given() {
+        let runtime = Runtime::new(2);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handles: alloc::vec::Vec<_> = (0..64)
+            .map(|_| {
+                let counter = counter.clone();
+                runtime.spawn(async move {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+            .collect();
+        for handle in handles {
+            block_on(handle);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 64);
+    }
+}
