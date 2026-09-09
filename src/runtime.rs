@@ -83,11 +83,64 @@ impl Runtime {
     }
 }
 
+/// Threads for the shared pool.
+///
+/// The machine's parallelism, which is also what `tokio::spawn` gave the
+/// callers this replaces. Keeping the number the same is the point: changing
+/// the thread count and the runtime in one step makes any measurement of the
+/// swap unreadable.
+fn shared_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, core::num::NonZeroUsize::get)
+}
+
+/// One pool per process, started on first use.
+///
+/// # Why this exists, given that an ambient runtime is what went wrong
+///
+/// This is the same shape as `tokio`'s implicit global, and that global is
+/// precisely how a whole runtime got into a `no_std` dependency graph without
+/// anyone writing it down. So it is worth being explicit about why it is back.
+///
+/// The alternative is each crate growing its own `OnceLock<Runtime>`. Two such
+/// crates in one process start two pools and the process pays for both, with
+/// neither able to steal the other's idle threads. A storage engine and
+/// whatever else the binary links are not coordinating on this, and cannot.
+/// One pool is the correct answer to that.
+///
+/// What makes it different from the thing it resembles: it is behind `std`, so
+/// a `--no-default-features` build cannot reach it and cannot silently acquire
+/// threads. That gate is exactly the one `tokio::spawn` did not have.
+///
+/// A caller that wants its own threads, its own count, or a pool it can stop
+/// still builds a [`Runtime`] directly. This is the convenience, not the API.
+pub fn background() -> &'static Runtime {
+    static SHARED: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| Runtime::new(shared_threads()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block_on;
     use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn the_shared_pool_is_one_pool() {
+        assert!(core::ptr::eq(background(), background()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handles: alloc::vec::Vec<_> = (0..32)
+            .map(|_| {
+                let counter = counter.clone();
+                background().spawn(async move {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+            .collect();
+        for handle in handles {
+            block_on(handle);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 32);
+    }
 
     #[test]
     fn a_runtime_runs_what_it_is_given() {
