@@ -16,25 +16,9 @@ default = ["std"]
 # threads, and the parker `block_on` uses when there is one to park.
 std = ["ps-st3/host", "dep:futures-io", "futures-io/std", "dep:futures-util", "futures-util/std", "futures-util/io"]
 
-# Pointed at pathscale/ps-st3#4 while that is open. **This is not a preference,
-# it is a compile dependency**: `Act`, `Job`, `Pool::submit_fn` and
-# `Pool::submit_job` do not exist in the published 0.5.0, so this crate does not
-# build against it at all. An earlier version of this comment said only that the
-# benchmark numbers came from the branch, which reads as though the patch could
-# be dropped at a cost in accuracy. It cannot.
-#
-# It also used to be `path = "/Users/revenge/code/ps-st3"`, an absolute path on
-# one machine, so the branch built there and nowhere else: any other clone, any
-# CI runner, and any reviewer got a resolution failure. A git patch is the same
-# pin without the machine.
-#
-# Delete this whole block once ps-st3 0.5.1 is published, and drop the version
-# requirement below to match it.
-[patch.crates-io]
-ps-st3 = { git = "https://github.com/pathscale/ps-st3", branch = "perf/skip-the-wake-when-nobody-sleeps" }
 
 [dependencies]
-ps-st3 = { version = "0.5.0", default-features = false, features = ["fanout"] }
+ps-st3 = { version = "^0.6", default-features = false, features = ["fanout"] }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 # The task itself: one allocation holding the future, its state machine, its
 # waker vtable and its output, with `Runnable::into_raw` handing the pointer
@@ -49,7 +33,7 @@ futures-io = { version = "0.3", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
-ps-st3 = { version = "0.5.0", features = ["fanout", "host"] }
+ps-st3 = { version = "^0.6", features = ["fanout", "host"] }
 # The comparison arm. Only the scheduler is used; nothing here needs its I/O.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # The other comparison arm. Not an async runtime: a data-parallel pool, so it

@@ -90,24 +90,34 @@ impl std::future::Future for Yields {
 
 fn nagoya_run(yields: usize) -> f64 {
     let host = Arc::new(StdHost::new(workers()));
-    let tuning = Tuning {
-        rounds_before_park: std::env::var("ROUNDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64),
-        backoff_spins: std::env::var("BACKOFF")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024),
-        promote_every: std::env::var("PROMOTE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64),
-        injector_batch: std::env::var("BATCH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32),
-    };
+    // Built from a preset rather than as a literal: `Tuning` is
+    // `#[non_exhaustive]` from ps-st3 0.6, so a field it gains later is not a
+    // breaking change and this example does not have to be edited again.
+    let tuning = Tuning::locality()
+        .with_rounds_before_park(
+            std::env::var("ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+        )
+        .with_backoff_spins(
+            std::env::var("BACKOFF")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024),
+        )
+        .with_promote_every(
+            std::env::var("PROMOTE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+        )
+        .with_injector_batch(
+            std::env::var("BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32),
+        );
     let pool = Pool::with_tuning(workers(), 1024, host, tuning);
     let threads: Vec<_> = (0..workers())
         .map(|id| {
