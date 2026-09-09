@@ -16,12 +16,22 @@ default = ["std"]
 # threads, and the parker `block_on` uses when there is one to park.
 std = ["ps-st3/host", "dep:futures-io", "futures-io/std", "dep:futures-util", "futures-util/std", "futures-util/io"]
 
-# Pointed at the local checkout while pathscale/ps-st3#4 is open: the published
-# 0.5.0 does not have the submit fix, and the numbers in examples/ were taken
-# with it. Drop this line once that lands and 0.5.1 is out, or the benchmarks
-# quietly measure the wrong thing.
+# Pointed at pathscale/ps-st3#4 while that is open. **This is not a preference,
+# it is a compile dependency**: `Act`, `Job`, `Pool::submit_fn` and
+# `Pool::submit_job` do not exist in the published 0.5.0, so this crate does not
+# build against it at all. An earlier version of this comment said only that the
+# benchmark numbers came from the branch, which reads as though the patch could
+# be dropped at a cost in accuracy. It cannot.
+#
+# It also used to be `path = "/Users/revenge/code/ps-st3"`, an absolute path on
+# one machine, so the branch built there and nowhere else: any other clone, any
+# CI runner, and any reviewer got a resolution failure. A git patch is the same
+# pin without the machine.
+#
+# Delete this whole block once ps-st3 0.5.1 is published, and drop the version
+# requirement below to match it.
 [patch.crates-io]
-ps-st3 = { path = "/Users/revenge/code/ps-st3" }
+ps-st3 = { git = "https://github.com/pathscale/ps-st3", branch = "perf/skip-the-wake-when-nobody-sleeps" }
 
 [dependencies]
 ps-st3 = { version = "0.5.0", default-features = false, features = ["fanout"] }
