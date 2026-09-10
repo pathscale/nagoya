@@ -22,13 +22,14 @@
 //! a runtime that is only ever polled should not own a thread it does not use.
 //!
 //! Without `std` there is no thread and no clock, so the consumer supplies
-//! both: [`set_clock`] once, then [`poll`] from a tick interrupt or its own
-//! loop. That is the whole no_std contract, and it is why the registry and the
-//! driver are separate things in this file.
+//! both: [`set_clock`] once, then [`poll`] from a normal execution context.
+//! A tick interrupt must only signal deferred work; it must not call `poll`,
+//! register/drop timers, or invoke scheduler wakers. Those paths use locks and
+//! allocation and are not interrupt-safe. The host's deferred loop processes
+//! the signal and calls `poll(now_ns())` after returning from the interrupt.
 //!
 //! [`Host`]: st3::fanout::Host
 
-use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::Ordering as CmpOrdering;
@@ -42,13 +43,13 @@ use spin::Mutex;
 
 /// One pending timer, shared between the future and the registry.
 ///
-/// The future owns one end and the heap the other, so a cancelled timer can be
-/// disarmed without finding and removing its heap entry: the entry survives to
-/// its deadline and fires nothing.
+/// The heap index is maintained under `PENDING`. Cancellation uses it to
+/// remove an entry in O(log n), without scanning or retaining a tombstone.
 #[derive(Debug)]
 struct Slot {
     fired: AtomicBool,
     waker: Mutex<Option<Waker>>,
+    index: AtomicUsize,
 }
 
 /// A deadline and what to wake at it.
@@ -72,7 +73,7 @@ impl PartialOrd for Entry {
     }
 }
 impl Ord for Entry {
-    /// Reversed, because `BinaryHeap` is a max-heap and the earliest deadline
+    /// Reversed, because the registry is a max-heap and the earliest deadline
     /// is the one wanted first.
     fn cmp(&self, other: &Self) -> CmpOrdering {
         other
@@ -82,7 +83,92 @@ impl Ord for Entry {
     }
 }
 
-static PENDING: Mutex<Option<BinaryHeap<Entry>>> = Mutex::new(None);
+const NOT_QUEUED: usize = usize::MAX;
+
+// Indexed max-heap using Entry's reversed deadline ordering. Every move updates
+// its slot index; index reads and writes are serialized by the registry lock.
+#[derive(Default)]
+struct TimerHeap {
+    entries: Vec<Entry>,
+}
+
+impl TimerHeap {
+    fn peek(&self) -> Option<&Entry> {
+        self.entries.first()
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.entries.swap(a, b);
+        self.entries[a].slot.index.store(a, Ordering::Relaxed);
+        self.entries[b].slot.index.store(b, Ordering::Relaxed);
+    }
+
+    fn sift_up(&mut self, mut index: usize) {
+        while index > 0 {
+            let parent = (index - 1) / 2;
+            if self.entries[index] <= self.entries[parent] {
+                break;
+            }
+            self.swap(index, parent);
+            index = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut index: usize) {
+        // Checking for a child this way avoids overflowing 2 * index + 1.
+        while index < self.entries.len() / 2 {
+            let left = 2 * index + 1;
+            let right = left + 1;
+            let child = if right < self.entries.len() && self.entries[right] > self.entries[left] {
+                right
+            } else {
+                left
+            };
+            if self.entries[index] >= self.entries[child] {
+                break;
+            }
+            self.swap(index, child);
+            index = child;
+        }
+    }
+
+    fn push(&mut self, entry: Entry) {
+        let index = self.entries.len();
+        self.entries.push(entry);
+        self.entries[index]
+            .slot
+            .index
+            .store(index, Ordering::Relaxed);
+        self.sift_up(index);
+    }
+
+    fn remove(&mut self, index: usize) -> Entry {
+        let entry = self.entries.swap_remove(index);
+        entry.slot.index.store(NOT_QUEUED, Ordering::Relaxed);
+        if index < self.entries.len() {
+            self.entries[index]
+                .slot
+                .index
+                .store(index, Ordering::Relaxed);
+            if index > 0 && self.entries[index] > self.entries[(index - 1) / 2] {
+                self.sift_up(index);
+            } else {
+                self.sift_down(index);
+            }
+        }
+        entry
+    }
+
+    fn pop(&mut self) -> Option<Entry> {
+        if self.entries.is_empty() {
+            None
+        } else {
+            Some(self.remove(0))
+        }
+    }
+}
+
+static PENDING: Mutex<Option<TimerHeap>> = Mutex::new(None);
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static CLOCK: AtomicUsize = AtomicUsize::new(0);
 
@@ -135,9 +221,10 @@ pub fn now_ns() -> u64 {
 
 /// Fire every timer due at `now`, and report when the next one is due.
 ///
-/// The driver for this is a thread with `std`. Without one, call it from a tick
-/// interrupt or an idle loop; nothing else pumps the registry, and a timer that
-/// is never polled never fires.
+/// The driver is a thread with `std`, or the host's deferred-work/idle loop
+/// without it. This function takes ordinary spin locks, allocates, and invokes
+/// arbitrary wakers. Do not call it from an interrupt, signal handler, or any
+/// context that can preempt another timer operation on the same execution lane.
 ///
 /// Returns `None` when nothing is pending, so a caller with nothing else to do
 /// can sleep until something registers rather than spinning on an empty heap.
@@ -173,7 +260,7 @@ pub fn poll(now: u64) -> Option<u64> {
 /// earliest pending timer.
 fn arm(deadline: u64, slot: &Arc<Slot>) -> bool {
     let mut guard = PENDING.lock();
-    let heap = guard.get_or_insert_with(BinaryHeap::new);
+    let heap = guard.get_or_insert_with(TimerHeap::default);
     let earliest = heap.peek().is_none_or(|entry| deadline < entry.deadline);
     heap.push(Entry {
         deadline,
@@ -185,9 +272,8 @@ fn arm(deadline: u64, slot: &Arc<Slot>) -> bool {
 
 /// A future that is ready once its deadline has passed.
 ///
-/// Dropping one disarms it. The heap entry survives until its deadline, holding
-/// nothing and waking nothing, so a cancelled `timeout` costs one dead entry
-/// for as long as it had left to run rather than forever.
+/// Dropping an armed sleep removes its heap entry in O(log n). Registration,
+/// polling, and dropping must run outside interrupt/signal-handler contexts.
 #[derive(Debug)]
 pub struct Sleep {
     deadline: u64,
@@ -263,6 +349,7 @@ impl Future for Sleep {
                 let slot = Arc::new(Slot {
                     fired: AtomicBool::new(false),
                     waker: Mutex::new(Some(cx.waker().clone())),
+                    index: AtomicUsize::new(NOT_QUEUED),
                 });
                 let earliest = arm(this.deadline, &slot);
                 this.slot = Some(slot);
@@ -278,10 +365,25 @@ impl Future for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        // Disarm rather than unregister. Finding this entry in the heap costs a
-        // linear scan under the lock; leaving it costs one wake of nothing.
         if let Some(slot) = &self.slot {
-            *slot.waker.lock() = None;
+            let removed = {
+                let mut guard = PENDING.lock();
+                let index = slot.index.load(Ordering::Relaxed);
+                if index == NOT_QUEUED {
+                    None
+                } else {
+                    Some(
+                        guard
+                            .as_mut()
+                            .expect("queued timer has a registry")
+                            .remove(index),
+                    )
+                }
+            };
+            // Release heap ownership and the captured task outside PENDING.
+            drop(removed);
+            let waker = slot.waker.lock().take();
+            drop(waker);
         }
     }
 }
@@ -419,6 +521,83 @@ mod tests {
     use crate::block_on;
     use core::time::Duration;
     use std::time::Instant;
+
+    fn slot() -> alloc::sync::Arc<super::Slot> {
+        alloc::sync::Arc::new(super::Slot {
+            fired: core::sync::atomic::AtomicBool::new(false),
+            waker: spin::Mutex::new(None),
+            index: core::sync::atomic::AtomicUsize::new(super::NOT_QUEUED),
+        })
+    }
+
+    #[test]
+    fn indexed_heap_removal_preserves_order_and_indices() {
+        use core::sync::atomic::Ordering;
+        let mut heap = super::TimerHeap::default();
+        let mut slots = alloc::vec::Vec::new();
+        for (seq, deadline) in [90, 10, 50, 10, 80, 20, 60, 30, 70, 40]
+            .into_iter()
+            .enumerate()
+        {
+            let slot = slot();
+            heap.push(super::Entry {
+                deadline,
+                seq: seq as u64,
+                slot: slot.clone(),
+            });
+            slots.push(slot);
+        }
+        for id in [2, 0, 7] {
+            let index = slots[id].index.load(Ordering::Relaxed);
+            let removed = heap.remove(index);
+            assert!(alloc::sync::Arc::ptr_eq(&removed.slot, &slots[id]));
+            assert_eq!(slots[id].index.load(Ordering::Relaxed), super::NOT_QUEUED);
+            for (index, entry) in heap.entries.iter().enumerate() {
+                assert_eq!(entry.slot.index.load(Ordering::Relaxed), index);
+            }
+        }
+        let mut order = alloc::vec::Vec::new();
+        while let Some(entry) = heap.pop() {
+            assert_eq!(entry.slot.index.load(Ordering::Relaxed), super::NOT_QUEUED);
+            order.push((entry.deadline, entry.seq));
+        }
+        assert_eq!(
+            order,
+            [
+                (10, 1),
+                (10, 3),
+                (20, 5),
+                (40, 9),
+                (60, 6),
+                (70, 8),
+                (80, 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_an_armed_sleep_releases_registry_ownership_immediately() {
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::Context;
+        use std::sync::Arc;
+        use std::task::{Wake, Waker};
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(Noop));
+        let mut sleep = super::sleep_until(u64::MAX);
+        assert!(Pin::new(&mut sleep)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        let weak = Arc::downgrade(sleep.slot.as_ref().unwrap());
+        drop(sleep);
+        assert!(
+            weak.upgrade().is_none(),
+            "canceled timer is still retained by the registry"
+        );
+    }
 
     #[test]
     fn a_sleep_waits_at_least_its_duration() {
