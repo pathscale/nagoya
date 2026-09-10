@@ -111,6 +111,20 @@ impl Runtime {
     pub fn executor(&self) -> &Executor {
         &self.executor
     }
+
+    /// The pool underneath, for the APIs that take one directly.
+    ///
+    /// [`crate::par_for`] takes an `Arc<Pool>` rather than an executor,
+    /// because it schedules closures and never builds a task. Without this a
+    /// caller wanting `par_for` on a tuned pool had to build the `Pool`
+    /// itself, which meant its threads were never marked as pool workers, and
+    /// **that marker is the only thing that makes `local_wakes` do anything**.
+    /// So every locality-flavored tuning silently ran as spread, which is the
+    /// exact trap `Runtime::with_tuning` exists to close.
+    #[must_use]
+    pub fn pool(&self) -> &Arc<Pool> {
+        self.executor.pool()
+    }
 }
 
 /// Threads for the shared pool.
