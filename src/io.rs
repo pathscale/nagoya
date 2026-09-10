@@ -79,9 +79,11 @@ pub trait Read {
         async move {
             let mut filled = 0;
             while filled < buffer.len() {
-                match self.read(&mut buffer[filled..]).await? {
-                    0 => return Err(Error::new(ErrorKind::UnexpectedEof)),
-                    n => filled += n,
+                match self.read(&mut buffer[filled..]).await {
+                    Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof)),
+                    Ok(n) => filled += n,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
                 }
             }
             Ok(())
@@ -114,6 +116,9 @@ pub trait Read {
                         return Ok(filled - start);
                     }
                     Ok(n) => buffer.truncate(filled + n),
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {
+                        buffer.truncate(filled);
+                    }
                     Err(error) => {
                         buffer.truncate(filled);
                         return Err(error);
@@ -144,11 +149,13 @@ pub trait Write {
         async move {
             let mut written = 0;
             while written < buffer.len() {
-                match self.write(&buffer[written..]).await? {
+                match self.write(&buffer[written..]).await {
                     // Nothing taken and no error: the destination will not
                     // accept more, and looping would spin forever.
-                    0 => return Err(Error::new(ErrorKind::WriteZero)),
-                    n => written += n,
+                    Ok(0) => return Err(Error::new(ErrorKind::WriteZero)),
+                    Ok(n) => written += n,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
                 }
             }
             Ok(())

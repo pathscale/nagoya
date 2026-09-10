@@ -27,7 +27,9 @@
 //! that it will not be, and neither is worth the unsafe until something asks
 //! for it. Move what you need into the closure, or put it in an `Arc`.
 
-use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
+use alloc::sync::{Arc, Weak};
 use core::future::Future;
 use core::ops::Range;
 use core::pin::Pin;
@@ -97,6 +99,10 @@ const PIECES_PER_WORKER: usize = 8;
 /// happens until it is polled: the first poll is what hands the work over, so
 /// a loop that is created and dropped costs one allocation and no work.
 ///
+/// With `std` and unwinding enabled, a body panic cancels remaining work and
+/// is rethrown by the awaiting future after all published pieces retire.
+/// Without `std`, panic handling is the host's responsibility.
+///
 /// ```
 /// # use core::sync::atomic::{AtomicUsize, Ordering};
 /// # use alloc::sync::Arc;
@@ -129,6 +135,8 @@ where
                 outstanding: AtomicUsize::new(1),
                 finished: AtomicBool::new(false),
                 waiter: Mutex::new(None),
+                #[cfg(feature = "std")]
+                panic: Mutex::new(None),
             }) as Arc<dyn Split>,
             pool,
             range,
@@ -147,6 +155,10 @@ trait Split: Send + Sync {
     fn retire(&self);
     fn is_finished(&self) -> bool;
     fn park(&self, waker: &Waker);
+    #[cfg(feature = "std")]
+    fn record_panic(&self, payload: Box<dyn core::any::Any + Send>);
+    #[cfg(feature = "std")]
+    fn resume_panic(&self);
 }
 
 struct Shared<F> {
@@ -157,6 +169,8 @@ struct Shared<F> {
     outstanding: AtomicUsize,
     finished: AtomicBool,
     waiter: Mutex<Option<Waker>>,
+    #[cfg(feature = "std")]
+    panic: Mutex<Option<Box<dyn core::any::Any + Send>>>,
 }
 
 impl<F> Split for Shared<F>
@@ -169,7 +183,6 @@ where
         // between two items the body is running and nothing here can interrupt
         // it.
         if cancel.is_cancelled() {
-            self.retire();
             return;
         }
         let mut range = range;
@@ -177,7 +190,7 @@ where
         // the pool and keeping the left. Recursion here would put the whole
         // split depth on one worker's stack, which is a stack overflow waiting
         // for a large enough range.
-        while range.end - range.start > leaf {
+        while range.end.saturating_sub(range.start) > leaf {
             let middle = range.start + (range.end - range.start) / 2;
             let right = middle..range.end;
             range = range.start..middle;
@@ -186,15 +199,18 @@ where
             // the piece finish and retire against a count that has not been
             // raised yet, which would complete the loop early.
             self.outstanding.fetch_add(1, Ordering::AcqRel);
-            let half = self.clone();
-            let handle = pool.clone();
-            let switch = cancel.clone();
-            pool.submit_fn(move || half.work(&handle, right, leaf, &switch));
+            let piece = Piece {
+                shared: self.clone(),
+                pool: Arc::downgrade(pool),
+                range: right,
+                leaf,
+                cancel: cancel.clone(),
+            };
+            pool.submit_fn(move || piece.run());
         }
         for index in range {
             (self.body)(index);
         }
-        self.retire();
     }
 
     fn retire(&self) {
@@ -213,7 +229,69 @@ where
     }
 
     fn park(&self, waker: &Waker) {
-        *self.waiter.lock() = Some(waker.clone());
+        let old = self.waiter.lock().replace(waker.clone());
+        drop(old);
+    }
+
+    #[cfg(feature = "std")]
+    fn record_panic(&self, payload: Box<dyn core::any::Any + Send>) {
+        let mut pending = self.panic.lock();
+        if pending.is_none() {
+            *pending = Some(payload);
+        } else {
+            drop(pending);
+            drop(payload);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn resume_panic(&self) {
+        let payload = self.panic.lock().take();
+        if let Some(payload) = payload {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+// One counted piece, including while it is queued. Dropping an unrun closure
+// must retire it too; keeping retirement only at the end of work() loses that
+// accounting on panic, cancellation, and pool destruction.
+struct Piece {
+    shared: Arc<dyn Split>,
+    pool: Weak<Pool>,
+    range: Range<usize>,
+    leaf: usize,
+    cancel: Cancel,
+}
+
+impl Piece {
+    fn run(self) {
+        let Some(pool) = self.pool.upgrade() else {
+            self.cancel.cancel();
+            return;
+        };
+        #[cfg(feature = "std")]
+        {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.shared
+                    .clone()
+                    .work(&pool, self.range.clone(), self.leaf, &self.cancel);
+            }));
+            if let Err(payload) = result {
+                self.cancel.cancel();
+                self.shared.record_panic(payload);
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        self.shared
+            .clone()
+            .work(&pool, self.range.clone(), self.leaf, &self.cancel);
+    }
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        self.shared.retire();
     }
 }
 
@@ -294,12 +372,21 @@ impl Future for ParFor {
 
         if let Some((shared, pool, range, leaf)) = this.state.take() {
             this.started = Some(shared.clone());
+            if range.is_empty() || this.cancel.is_cancelled() {
+                shared.retire();
+                return Poll::Ready(());
+            }
             // Hand the whole range to the pool rather than splitting it here.
             // Splitting is itself work, and doing it on the pool means it is
             // parallel too: each piece splits its own half.
-            let handle = pool.clone();
-            let switch = this.cancel.clone();
-            pool.submit_fn(move || shared.work(&handle, range, leaf, &switch));
+            let piece = Piece {
+                shared,
+                pool: Arc::downgrade(&pool),
+                range,
+                leaf,
+                cancel: this.cancel.clone(),
+            };
+            pool.submit_fn(move || piece.run());
         }
 
         let Some(shared) = this.started.as_ref() else {
@@ -309,12 +396,16 @@ impl Future for ParFor {
         };
 
         if shared.is_finished() {
+            #[cfg(feature = "std")]
+            shared.resume_panic();
             return Poll::Ready(());
         }
         // Registered before the flag is read again, so a piece that finishes
         // between the two still finds a waker to call.
         shared.park(context.waker());
         if shared.is_finished() {
+            #[cfg(feature = "std")]
+            shared.resume_panic();
             return Poll::Ready(());
         }
         Poll::Pending

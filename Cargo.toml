@@ -14,7 +14,7 @@ categories = ["asynchronous", "concurrency", "no-std"]
 default = ["std"]
 # Off, this crate does not link `std`. What it costs: `Runtime`, which owns
 # threads, and the parker `block_on` uses when there is one to park.
-std = ["ps-st3/host", "dep:futures-io", "futures-io/std", "dep:futures-util", "futures-util/std", "futures-util/io"]
+std = ["ps-st3/host", "async-task/std", "dep:futures-io", "futures-io/std", "dep:futures-util", "futures-util/std", "futures-util/io"]
 
 
 [dependencies]

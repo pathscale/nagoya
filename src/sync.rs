@@ -26,11 +26,11 @@
 //! depend on it, that is the moment to write the queue properly rather than to
 //! discover it in production.
 //!
-//! **Not `no_std`-free of allocation.** The waiter lists are `VecDeque<Waker>`,
-//! so this needs `alloc`, which the rest of the crate needs anyway.
+//! **Requires `alloc`.** Contended waits use reusable indexed slots.
+//! Uncontended acquisition does not allocate a waiter.
 
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::ops::{Deref, DerefMut};
@@ -40,43 +40,203 @@ use core::task::{Context, Poll, Waker};
 
 use spin::Mutex;
 
-/// The waiter list every primitive here shares.
-///
-/// A spin lock rather than a blocking one because it is held for the length of
-/// a push or a pop and nothing else, and because a blocking mutex would need
-/// the very thing this module exists to avoid.
-#[derive(Default)]
-struct Waiters(Mutex<VecDeque<Waker>>);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WakeKind {
+    Queued,
+    One,
+    All,
+}
+
+struct Waiter {
+    previous: Option<usize>,
+    next: Option<usize>,
+    kind: WakeKind,
+    waker: Option<Waker>,
+}
+
+enum WaiterSlot {
+    Live(Waiter),
+    Free(Option<usize>),
+}
+
+// Stable slot indices belong to futures, not wakers. A granted slot remains
+// live until its future acknowledges or cancels it. This permits O(1) removal
+// without an intrusive pointer, a per-waiter Arc, or a scan on cancellation.
+struct WaitQueue {
+    slots: Vec<WaiterSlot>,
+    free: Option<usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+}
+
+impl WaitQueue {
+    const fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            free: None,
+            head: None,
+            tail: None,
+        }
+    }
+
+    fn get(&self, id: usize) -> &Waiter {
+        match &self.slots[id] {
+            WaiterSlot::Live(waiter) => waiter,
+            WaiterSlot::Free(_) => unreachable!("registration already released"),
+        }
+    }
+
+    fn get_mut(&mut self, id: usize) -> &mut Waiter {
+        match &mut self.slots[id] {
+            WaiterSlot::Live(waiter) => waiter,
+            WaiterSlot::Free(_) => unreachable!("registration already released"),
+        }
+    }
+
+    fn enqueue(&mut self, id: usize) {
+        let tail = self.tail;
+        let waiter = self.get_mut(id);
+        waiter.previous = tail;
+        waiter.next = None;
+        waiter.kind = WakeKind::Queued;
+        if let Some(tail) = tail {
+            self.get_mut(tail).next = Some(id);
+        } else {
+            self.head = Some(id);
+        }
+        self.tail = Some(id);
+    }
+
+    fn unlink(&mut self, id: usize) {
+        let waiter = self.get(id);
+        let (previous, next) = (waiter.previous, waiter.next);
+        if let Some(previous) = previous {
+            self.get_mut(previous).next = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(next) = next {
+            self.get_mut(next).previous = previous;
+        } else {
+            self.tail = previous;
+        }
+        let waiter = self.get_mut(id);
+        waiter.previous = None;
+        waiter.next = None;
+    }
+
+    // Return any replaced waker so its destructor runs outside the queue lock.
+    fn register(&mut self, token: &mut Option<usize>, waker: Option<&Waker>) -> Option<Waker> {
+        let id = match *token {
+            Some(id) => {
+                if self.get(id).kind != WakeKind::Queued {
+                    self.enqueue(id);
+                }
+                id
+            }
+            None => {
+                let waiter = Waiter {
+                    previous: None,
+                    next: None,
+                    kind: WakeKind::Queued,
+                    waker: None,
+                };
+                let id = if let Some(id) = self.free {
+                    self.free = match &self.slots[id] {
+                        WaiterSlot::Free(next) => *next,
+                        WaiterSlot::Live(_) => unreachable!("free-list entry is live"),
+                    };
+                    self.slots[id] = WaiterSlot::Live(waiter);
+                    id
+                } else {
+                    self.slots.push(WaiterSlot::Live(waiter));
+                    self.slots.len() - 1
+                };
+                *token = Some(id);
+                self.enqueue(id);
+                id
+            }
+        };
+        let waiter = self.get_mut(id);
+        if let Some(waker) = waker {
+            if !waiter
+                .waker
+                .as_ref()
+                .is_some_and(|old| old.will_wake(waker))
+            {
+                return waiter.waker.replace(waker.clone());
+            }
+        }
+        None
+    }
+
+    fn remove(&mut self, token: &mut Option<usize>) -> Option<Waiter> {
+        let id = token.take()?;
+        if self.get(id).kind == WakeKind::Queued {
+            self.unlink(id);
+        }
+        let old = core::mem::replace(&mut self.slots[id], WaiterSlot::Free(self.free));
+        self.free = Some(id);
+        match old {
+            WaiterSlot::Live(waiter) => Some(waiter),
+            WaiterSlot::Free(_) => unreachable!("registration already released"),
+        }
+    }
+
+    // Outer Option means a waiter was granted, even if enable() has not
+    // supplied a waker yet.
+    fn grant_one(&mut self) -> Option<Option<Waker>> {
+        let id = self.head?;
+        self.unlink(id);
+        let waiter = self.get_mut(id);
+        waiter.kind = WakeKind::One;
+        Some(waiter.waker.take())
+    }
+
+    fn grant_all(&mut self) -> Vec<Waker> {
+        let mut wakers = Vec::new();
+        while let Some(id) = self.head {
+            self.unlink(id);
+            let waiter = self.get_mut(id);
+            waiter.kind = WakeKind::All;
+            if let Some(waker) = waiter.waker.take() {
+                wakers.push(waker);
+            }
+        }
+        wakers
+    }
+}
+
+struct Waiters(Mutex<WaitQueue>);
 
 impl Waiters {
     const fn new() -> Self {
-        Self(Mutex::new(VecDeque::new()))
+        Self(Mutex::new(WaitQueue::new()))
     }
 
-    fn push(&self, waker: &Waker) {
-        let mut queue = self.0.lock();
-        // Replacing an equivalent waker rather than pushing a second one: a
-        // future polled twice before it completes would otherwise leave a stale
-        // entry that wakes a task which has already moved on.
-        if queue.iter().any(|w| w.will_wake(waker)) {
-            return;
+    fn register(&self, token: &mut Option<usize>, waker: &Waker) {
+        let old = self.0.lock().register(token, Some(waker));
+        drop(old);
+    }
+
+    fn remove(&self, token: &mut Option<usize>) -> Option<WakeKind> {
+        if token.is_none() {
+            return None;
         }
-        queue.push_back(waker.clone());
+        let removed = self.0.lock().remove(token);
+        removed.map(|waiter| waiter.kind)
     }
 
     fn wake_one(&self) {
-        let waker = self.0.lock().pop_front();
+        let waker = self.0.lock().grant_one().flatten();
         if let Some(waker) = waker {
             waker.wake();
         }
     }
 
     fn wake_all(&self) {
-        // Drained under the lock, woken outside it: `wake` runs arbitrary
-        // scheduler code, and holding a spin lock across that invites the
-        // woken task to spin on the lock its waker still holds.
-        let drained: VecDeque<Waker> = core::mem::take(&mut *self.0.lock());
-        for waker in drained {
+        let wakers = self.0.lock().grant_all();
+        for waker in wakers {
             waker.wake();
         }
     }
@@ -91,10 +251,8 @@ pub struct Notify {
     permit: AtomicBool,
     /// Bumped by [`Notify::notify_waiters`], which leaves no permit.
     ///
-    /// A `Notified` snapshots this when it is created, so a broadcast landing
-    /// between creation and the first poll is still observed. That is the race
-    /// `tokio`'s `Notified::enable` exists for, and taking it at construction
-    /// costs one relaxed load instead of an intrusive list.
+    /// Snapshotted at construction so broadcasts before the first poll are
+    /// observed. Single notifications are owned by registered waiter slots.
     generation: AtomicUsize,
     waiters: Waiters,
 }
@@ -126,14 +284,37 @@ impl Notify {
 
     /// Wake one waiter, or leave a permit for the next one to arrive.
     pub fn notify_one(&self) {
-        self.permit.store(true, Ordering::Release);
-        self.waiters.wake_one();
+        let waker = {
+            let mut queue = self.waiters.0.lock();
+            self.grant_one(&mut queue)
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn grant_one(&self, queue: &mut WaitQueue) -> Option<Waker> {
+        match queue.grant_one() {
+            Some(waker) => waker,
+            None => {
+                // Registration and this fallback share a lock: a waiter
+                // cannot appear between the empty check and permit store.
+                self.permit.store(true, Ordering::Release);
+                None
+            }
+        }
     }
 
     /// Wake every current waiter. Leaves no permit.
     pub fn notify_waiters(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        self.waiters.wake_all();
+        let wakers = {
+            let mut queue = self.waiters.0.lock();
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            queue.grant_all()
+        };
+        for waker in wakers {
+            waker.wake();
+        }
     }
 
     /// Wait for a notification, taking a stored permit if one is there.
@@ -141,6 +322,9 @@ impl Notify {
         Notified {
             notify: self,
             generation: self.generation.load(Ordering::Acquire),
+            registration: None,
+            done: false,
+            reserved_one: false,
         }
     }
 }
@@ -150,22 +334,18 @@ pub struct Notified<'a> {
     notify: &'a Notify,
     /// The broadcast generation when this was created.
     generation: usize,
+    registration: Option<usize>,
+    done: bool,
+    // enable() may reserve a notification before poll delivers it. Dropping
+    // during that window must transfer the notification, not consume it.
+    reserved_one: bool,
 }
 
 impl Notified<'_> {
-    /// Whether a notification is already waiting for this future.
-    ///
-    /// **This is not `tokio`'s `enable` and does not need to be.** There, the
-    /// future must be linked into the waiter list before the caller reads any
-    /// state, or a notification in between is lost. Here the two ways of
-    /// notifying are both already durable across that window: `notify_one`
-    /// leaves a permit that outlives it, and `notify_waiters` bumps a
-    /// generation this future snapshotted when it was created. So the race the
-    /// call guards against cannot happen, and the method exists to keep the
-    /// registration point visible at the call site, which is worth having.
+    /// Register before checking external state, reserving a notification if
+    /// one is already available. Returns whether this future is now ready.
     pub fn enable(self: Pin<&mut Self>) -> bool {
-        self.notify.permit.load(Ordering::Acquire)
-            || self.notify.generation.load(Ordering::Acquire) != self.generation
+        self.get_mut().ready_or_register(None)
     }
 }
 
@@ -173,13 +353,9 @@ impl Future for Notified<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        if self.is_notified() {
-            return Poll::Ready(());
-        }
-        // Registered before the second look, so a notification landing between
-        // the two still finds a waker to call.
-        self.notify.waiters.push(context.waker());
-        if self.is_notified() {
+        let this = self.get_mut();
+        if this.ready_or_register(Some(context.waker())) {
+            this.reserved_one = false;
             return Poll::Ready(());
         }
         Poll::Pending
@@ -187,17 +363,83 @@ impl Future for Notified<'_> {
 }
 
 impl Notified<'_> {
-    /// Take a permit, or observe that a broadcast has happened since creation.
-    fn is_notified(&self) -> bool {
-        if self
-            .notify
-            .permit
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+    fn ready_or_register(&mut self, waker: Option<&Waker>) -> bool {
+        if self.done {
             return true;
         }
-        self.notify.generation.load(Ordering::Acquire) != self.generation
+        if self.registration.is_none()
+            && self.notify.generation.load(Ordering::Acquire) != self.generation
+        {
+            self.done = true;
+            return true;
+        }
+        // The uncontended stored-permit path does not allocate or lock.
+        if self.registration.is_none()
+            && self
+                .notify
+                .permit
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.done = true;
+            self.reserved_one = true;
+            return true;
+        }
+        let mut queue = self.notify.waiters.0.lock();
+        let assigned = self
+            .registration
+            .map(|id| queue.get(id).kind)
+            .filter(|kind| *kind != WakeKind::Queued);
+        let notification = if assigned.is_some() {
+            assigned
+        } else if self.notify.generation.load(Ordering::Acquire) != self.generation {
+            Some(WakeKind::All)
+        } else if self.notify.permit.swap(false, Ordering::AcqRel) {
+            Some(WakeKind::One)
+        } else {
+            None
+        };
+        if let Some(kind) = notification {
+            let removed = queue.remove(&mut self.registration);
+            self.done = true;
+            self.reserved_one = kind == WakeKind::One;
+            drop(queue);
+            drop(removed);
+            return true;
+        }
+        let old = queue.register(&mut self.registration, waker);
+        drop(queue);
+        drop(old);
+        false
+    }
+}
+
+impl Drop for Notified<'_> {
+    fn drop(&mut self) {
+        if self.reserved_one {
+            self.notify.notify_one();
+            return;
+        }
+        if self.registration.is_none() {
+            return;
+        }
+        let (removed, waker) = {
+            let mut queue = self.notify.waiters.0.lock();
+            let removed = queue.remove(&mut self.registration);
+            let waker = if removed
+                .as_ref()
+                .is_some_and(|entry| entry.kind == WakeKind::One)
+            {
+                self.notify.grant_one(&mut queue)
+            } else {
+                None
+            };
+            (removed, waker)
+        };
+        drop(removed);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
@@ -328,7 +570,10 @@ impl Semaphore {
 
     /// Wait for a permit.
     pub fn acquire(&self) -> Acquire<'_> {
-        Acquire { semaphore: self }
+        Acquire {
+            semaphore: self,
+            registration: None,
+        }
     }
 
     /// Hand the semaphore `n` more permits than it was created with.
@@ -399,20 +644,36 @@ impl Drop for SemaphorePermit<'_> {
 /// The future returned by [`Semaphore::acquire`].
 pub struct Acquire<'a> {
     semaphore: &'a Semaphore,
+    registration: Option<usize>,
 }
 
 impl<'a> Future for Acquire<'a> {
     type Output = SemaphorePermit<'a>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(permit) = self.semaphore.try_acquire() {
+        let this = self.get_mut();
+        if let Some(permit) = this.semaphore.try_acquire() {
+            this.semaphore.waiters.remove(&mut this.registration);
             return Poll::Ready(permit);
         }
-        self.semaphore.waiters.push(context.waker());
-        if let Some(permit) = self.semaphore.try_acquire() {
+        this.semaphore
+            .waiters
+            .register(&mut this.registration, context.waker());
+        if let Some(permit) = this.semaphore.try_acquire() {
+            this.semaphore.waiters.remove(&mut this.registration);
             return Poll::Ready(permit);
         }
         Poll::Pending
+    }
+}
+
+impl Drop for Acquire<'_> {
+    fn drop(&mut self) {
+        if self.semaphore.waiters.remove(&mut self.registration) == Some(WakeKind::One)
+            && self.semaphore.available_permits() != 0
+        {
+            self.semaphore.waiters.wake_one();
+        }
     }
 }
 
@@ -509,12 +770,18 @@ impl<T: ?Sized> RwLock<T> {
 
     /// Wait for a read lock.
     pub fn read(&self) -> Read<'_, T> {
-        Read { lock: self }
+        Read {
+            lock: self,
+            registration: None,
+        }
     }
 
     /// Wait for a write lock.
     pub fn write(&self) -> Write<'_, T> {
-        Write { lock: self }
+        Write {
+            lock: self,
+            registration: None,
+        }
     }
 }
 
@@ -524,12 +791,18 @@ impl<T: ?Sized> RwLock<T> {
     /// The guard a caller can hold across an await without naming a lifetime,
     /// which is what `tokio::sync`'s owned guards were used for here.
     pub fn read_owned(self: Arc<Self>) -> ReadOwned<T> {
-        ReadOwned { lock: Some(self) }
+        ReadOwned {
+            lock: Some(self),
+            registration: None,
+        }
     }
 
     /// The write half of [`Self::read_owned`].
     pub fn write_owned(self: Arc<Self>) -> WriteOwned<T> {
-        WriteOwned { lock: Some(self) }
+        WriteOwned {
+            lock: Some(self),
+            registration: None,
+        }
     }
 
     /// An owned read lock, or `None` if a writer holds it.
@@ -663,18 +936,24 @@ impl<T: ?Sized> Drop for OwnedRwLockWriteGuard<T> {
 /// The future returned by [`RwLock::read`].
 pub struct Read<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
+    registration: Option<usize>,
 }
 
 impl<'a, T: ?Sized> Future for Read<'a, T> {
     type Output = RwLockReadGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.lock.try_read_raw() {
-            return Poll::Ready(RwLockReadGuard { lock: self.lock });
+        let this = self.get_mut();
+        if this.lock.try_read_raw() {
+            this.lock.waiters.remove(&mut this.registration);
+            return Poll::Ready(RwLockReadGuard { lock: this.lock });
         }
-        self.lock.waiters.push(context.waker());
-        if self.lock.try_read_raw() {
-            return Poll::Ready(RwLockReadGuard { lock: self.lock });
+        this.lock
+            .waiters
+            .register(&mut this.registration, context.waker());
+        if this.lock.try_read_raw() {
+            this.lock.waiters.remove(&mut this.registration);
+            return Poll::Ready(RwLockReadGuard { lock: this.lock });
         }
         Poll::Pending
     }
@@ -683,18 +962,24 @@ impl<'a, T: ?Sized> Future for Read<'a, T> {
 /// The future returned by [`RwLock::write`].
 pub struct Write<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
+    registration: Option<usize>,
 }
 
 impl<'a, T: ?Sized> Future for Write<'a, T> {
     type Output = RwLockWriteGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.lock.try_write_raw() {
-            return Poll::Ready(RwLockWriteGuard { lock: self.lock });
+        let this = self.get_mut();
+        if this.lock.try_write_raw() {
+            this.lock.waiters.remove(&mut this.registration);
+            return Poll::Ready(RwLockWriteGuard { lock: this.lock });
         }
-        self.lock.waiters.push(context.waker());
-        if self.lock.try_write_raw() {
-            return Poll::Ready(RwLockWriteGuard { lock: self.lock });
+        this.lock
+            .waiters
+            .register(&mut this.registration, context.waker());
+        if this.lock.try_write_raw() {
+            this.lock.waiters.remove(&mut this.registration);
+            return Poll::Ready(RwLockWriteGuard { lock: this.lock });
         }
         Poll::Pending
     }
@@ -703,6 +988,7 @@ impl<'a, T: ?Sized> Future for Write<'a, T> {
 /// The future returned by [`RwLock::read_owned`].
 pub struct ReadOwned<T: ?Sized> {
     lock: Option<Arc<RwLock<T>>>,
+    registration: Option<usize>,
 }
 
 impl<T: ?Sized> Future for ReadOwned<T> {
@@ -712,11 +998,14 @@ impl<T: ?Sized> Future for ReadOwned<T> {
         let this = self.get_mut();
         let lock = this.lock.as_ref().expect("polled after completion");
         if lock.try_read_raw() {
+            lock.waiters.remove(&mut this.registration);
             let lock = this.lock.take().expect("just checked");
             return Poll::Ready(OwnedRwLockReadGuard { lock });
         }
-        lock.waiters.push(context.waker());
+        lock.waiters
+            .register(&mut this.registration, context.waker());
         if lock.try_read_raw() {
+            lock.waiters.remove(&mut this.registration);
             let lock = this.lock.take().expect("just checked");
             return Poll::Ready(OwnedRwLockReadGuard { lock });
         }
@@ -727,6 +1016,7 @@ impl<T: ?Sized> Future for ReadOwned<T> {
 /// The future returned by [`RwLock::write_owned`].
 pub struct WriteOwned<T: ?Sized> {
     lock: Option<Arc<RwLock<T>>>,
+    registration: Option<usize>,
 }
 
 impl<T: ?Sized> Future for WriteOwned<T> {
@@ -736,15 +1026,46 @@ impl<T: ?Sized> Future for WriteOwned<T> {
         let this = self.get_mut();
         let lock = this.lock.as_ref().expect("polled after completion");
         if lock.try_write_raw() {
+            lock.waiters.remove(&mut this.registration);
             let lock = this.lock.take().expect("just checked");
             return Poll::Ready(OwnedRwLockWriteGuard { lock });
         }
-        lock.waiters.push(context.waker());
+        lock.waiters
+            .register(&mut this.registration, context.waker());
         if lock.try_write_raw() {
+            lock.waiters.remove(&mut this.registration);
             let lock = this.lock.take().expect("just checked");
             return Poll::Ready(OwnedRwLockWriteGuard { lock });
         }
         Poll::Pending
+    }
+}
+
+impl<T: ?Sized> Drop for Read<'_, T> {
+    fn drop(&mut self) {
+        self.lock.waiters.remove(&mut self.registration);
+    }
+}
+
+impl<T: ?Sized> Drop for Write<'_, T> {
+    fn drop(&mut self) {
+        self.lock.waiters.remove(&mut self.registration);
+    }
+}
+
+impl<T: ?Sized> Drop for ReadOwned<T> {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.lock {
+            lock.waiters.remove(&mut self.registration);
+        }
+    }
+}
+
+impl<T: ?Sized> Drop for WriteOwned<T> {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.lock {
+            lock.waiters.remove(&mut self.registration);
+        }
     }
 }
 
@@ -801,6 +1122,7 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 2);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn a_barrier_releases_only_once_everyone_has_arrived() {
         use crate::runtime::Runtime;

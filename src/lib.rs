@@ -76,8 +76,11 @@ pub use yield_now::{yield_now, YieldNow};
 
 /// A handle to a spawned task's output.
 ///
-/// Awaiting it yields `Some(output)`, or `None` if the task was cancelled by
-/// dropping the handle before it finished.
+/// Awaiting yields `Some(output)`, or `None` if its runnable was canceled
+/// because the pool was destroyed before it could run. With `std` and
+/// unwinding enabled, a task panic is rethrown when its handle is awaited,
+/// rather than terminating the worker. Without `std`, panic handling belongs
+/// to the host. Abort-on-panic builds cannot isolate a panic in either mode.
 ///
 /// **Dropping this detaches the task; it does not cancel it.** That is Tokio's
 /// behaviour and it was this crate's before, and it is worth stating because
@@ -87,11 +90,11 @@ pub use yield_now::{yield_now, YieldNow};
 /// [`cancel`](JoinHandle::cancel) is how to ask for the other thing.
 pub struct JoinHandle<T> {
     /// `None` only between `Drop` taking it and the handle going away.
-    task: Option<async_task::Task<T>>,
+    task: Option<async_task::FallibleTask<T>>,
 }
 
 impl<T> JoinHandle<T> {
-    fn task(&mut self) -> &mut async_task::Task<T> {
+    fn task(&mut self) -> &mut async_task::FallibleTask<T> {
         self.task
             .as_mut()
             .expect("the task is taken only by `Drop`")
@@ -129,7 +132,7 @@ impl<T> core::fmt::Debug for JoinHandle<T> {
                 &self
                     .task
                     .as_ref()
-                    .is_some_and(async_task::Task::is_finished),
+                    .is_some_and(async_task::FallibleTask::is_finished),
             )
             .finish()
     }
@@ -147,8 +150,24 @@ impl<T> Future for JoinHandle<T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(self.get_mut().task()).poll(context).map(Some)
+        Pin::new(self.get_mut().task()).poll(context)
     }
+}
+
+/// Host-supplied identity of the execution lane currently running a pool worker.
+///
+/// Implementations must return an identity for the calling lane, not for the
+/// lane that originally created the executor. Return `None` off a worker or
+/// for a different pool. Invalid worker indices fall back to shared routing.
+/// Keep this lookup bounded and nonblocking: it runs on every task wake.
+/// Context implementations must not strongly own their pool; use a weak
+/// reference or a host-owned identity to avoid a queue ownership cycle.
+///
+/// This interface requires only `core`/`alloc`. A no_std host can use its
+/// scheduler's execution-local storage without acquiring OS-thread ownership.
+pub trait WorkerContext: Send + Sync {
+    /// The calling lane's worker index for `pool`, if it is currently running it.
+    fn current_worker(&self, pool: &Pool) -> Option<usize>;
 }
 
 /// A pool with a place to put the next task.
@@ -157,6 +176,7 @@ impl<T> Future for JoinHandle<T> {
 /// a spawn to choose: the pool decides who runs it.
 pub struct Executor {
     pool: Arc<Pool>,
+    context: Option<Arc<dyn WorkerContext>>,
 }
 
 impl Executor {
@@ -166,7 +186,32 @@ impl Executor {
     /// which is what keeps this free of an operating system.
     #[must_use]
     pub fn new(pool: Arc<Pool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            context: None,
+        }
+    }
+
+    /// Use host-provided execution-local identity for locality scheduling.
+    ///
+    /// Unlike `Runtime`, this does not create threads or require `std`.
+    #[must_use]
+    pub fn with_worker_context(pool: Arc<Pool>, context: Arc<dyn WorkerContext>) -> Self {
+        Self {
+            pool,
+            context: Some(context),
+        }
+    }
+
+    /// Run a caller-owned worker thread with nagoya's thread-local identity.
+    ///
+    /// The runner must belong to this executor's pool. Returns `false` if the
+    /// worker is already running, as `Pool::run` does. For a custom/no_std host,
+    /// use `with_worker_context` and drive the pool directly.
+    #[cfg(feature = "std")]
+    pub fn run_worker(&self, runner: st3::fanout::Runner) -> bool {
+        let _current = task::mark_current(&self.pool, runner.id());
+        self.pool.run(runner)
     }
 
     /// Another handle to the same pool, for a task that spawns.
@@ -175,7 +220,10 @@ impl Executor {
     /// is one: another handle to the same pool.
     #[must_use]
     pub fn clone_handle(&self) -> Self {
-        Self::new(self.pool.clone())
+        Self {
+            pool: self.pool.clone(),
+            context: self.context.clone(),
+        }
     }
 
     /// The pool this executor spawns onto.
@@ -191,7 +239,7 @@ impl Executor {
         F::Output: Send + 'static,
     {
         JoinHandle {
-            task: Some(task::spawn(future, self.pool.clone())),
+            task: Some(task::spawn(future, self.pool.clone(), self.context.clone()).fallible()),
         }
     }
 }

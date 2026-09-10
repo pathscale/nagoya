@@ -268,3 +268,102 @@ fn a_task_can_yield_its_worker() {
     assert_eq!(long, Some(1), "the yielding task did not let the other in");
     assert_eq!(short, Some(0));
 }
+
+#[test]
+fn a_reversed_empty_range_finishes_without_starting_workers() {
+    let pool = Pool::new(1, 256, Arc::new(StdHost::new(1)));
+    let mut loop_ = Box::pin(nagoya::par_for(pool, 10..5, |_| panic!("empty range ran")));
+    struct Noop;
+    impl std::task::Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker = std::task::Waker::from(Arc::new(Noop));
+    assert!(loop_
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_ready());
+}
+
+#[test]
+fn unrun_tasks_do_not_keep_their_containing_pool_alive() {
+    struct Dropped(Arc<AtomicUsize>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let pool = Pool::new(1, 256, Arc::new(StdHost::new(1)));
+    let weak_pool = Arc::downgrade(&pool);
+    let executor = Executor::new(pool.clone());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let captured = Dropped(drops.clone());
+    let handle = executor.spawn(async move {
+        drop(captured);
+    });
+    drop(executor);
+    drop(pool);
+    assert!(weak_pool.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    // Pool destruction canceled the runnable, not the caller's join handle.
+    assert_eq!(block_on(handle), None);
+}
+
+#[test]
+fn dropping_a_pool_retires_queued_parallel_pieces() {
+    let pool = Pool::new(1, 256, Arc::new(StdHost::new(1)));
+    let weak_pool = Arc::downgrade(&pool);
+    let mut loop_ = Box::pin(nagoya::par_for(pool.clone(), 0..10, |_| {
+        panic!("unrun body")
+    }));
+    struct Noop;
+    impl std::task::Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker = std::task::Waker::from(Arc::new(Noop));
+    let mut context = Context::from_waker(&waker);
+    assert!(loop_.as_mut().poll(&mut context).is_pending());
+    drop(pool);
+    assert!(weak_pool.upgrade().is_none());
+    assert!(loop_.as_mut().poll(&mut context).is_ready());
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn a_panicking_task_does_not_take_the_only_worker_with_it() {
+    let running = Running::new(1);
+    let failed = running.executor.spawn(async { panic!("task failure") });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(nagoya::timeout(std::time::Duration::from_secs(2), failed))
+    }));
+    assert!(
+        outcome.is_err(),
+        "the task panic was not propagated to its awaiter"
+    );
+    let next = running.executor.spawn(async { 42 });
+    assert_eq!(
+        block_on(nagoya::timeout(std::time::Duration::from_secs(2), next)),
+        Ok(Some(42)),
+    );
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn a_panicking_parallel_body_retires_its_piece_and_preserves_the_worker() {
+    let running = Running::new(1);
+    let loop_ = nagoya::par_for(running.executor.pool().clone(), 0..32, |_| {
+        panic!("body failure")
+    })
+    .leaf(1);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(nagoya::timeout(std::time::Duration::from_secs(2), loop_))
+    }));
+    assert!(
+        outcome.is_err(),
+        "the parallel-loop panic was not propagated"
+    );
+    let next = running.executor.spawn(async { 42 });
+    assert_eq!(
+        block_on(nagoya::timeout(std::time::Duration::from_secs(2), next)),
+        Ok(Some(42)),
+    );
+}

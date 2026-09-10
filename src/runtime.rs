@@ -55,27 +55,21 @@ impl Runtime {
     /// A runtime with `workers` threads, at `tuning`, whose threads are named
     /// `{label}-{id}`.
     ///
-    /// # Why this has to exist here rather than in the caller
-    ///
-    /// A caller can already build a [`Pool`] at any tuning and run it on its
-    /// own threads. What it cannot do is [`crate::task::mark_current`], which
-    /// is private, and **that marker is the only thing that makes
-    /// `local_wakes` do anything**: without it a wake takes the injector no
-    /// matter what the tuning says.
-    ///
-    /// So a pool built outside this module silently runs any locality-flavored
-    /// tuning as if it were spread. That is not a small difference, it is the
-    /// entire mechanism the tuning selects, and it is invisible: the pool
-    /// works, the tuning is set, and the behaviour it asks for never happens.
-    /// A comparison between two such pools would attribute to the scheduler a
-    /// difference that was only ever a missing thread-local.
+    /// Worker identity is installed automatically. Callers owning their own
+    /// threads can instead use [`Executor::run_worker`]; custom/no_std hosts
+    /// can supply [`crate::WorkerContext`] without creating an owned runtime.
     ///
     /// # Panics
     ///
-    /// If a thread cannot be started, for the reason [`Runtime::new`] gives.
+    /// If a thread cannot be started, or `workers` exceeds `usize::BITS`,
+    /// the underlying pool's worker bitmap capacity.
     #[must_use]
     pub fn with_tuning(workers: usize, tuning: Tuning, label: &str) -> Self {
         let workers = workers.max(1);
+        assert!(
+            workers <= usize::BITS as usize,
+            "worker count exceeds the pool bitmap capacity"
+        );
         let host = Arc::new(StdHost::new(workers));
         let pool = Pool::with_tuning(workers, 1024, host, tuning);
         for id in 0..workers {
@@ -114,13 +108,8 @@ impl Runtime {
 
     /// The pool underneath, for the APIs that take one directly.
     ///
-    /// [`crate::par_for`] takes an `Arc<Pool>` rather than an executor,
-    /// because it schedules closures and never builds a task. Without this a
-    /// caller wanting `par_for` on a tuned pool had to build the `Pool`
-    /// itself, which meant its threads were never marked as pool workers, and
-    /// **that marker is the only thing that makes `local_wakes` do anything**.
-    /// So every locality-flavored tuning silently ran as spread, which is the
-    /// exact trap `Runtime::with_tuning` exists to close.
+    /// [`crate::par_for`] takes an `Arc<Pool>` because it schedules closures
+    /// without building async tasks.
     #[must_use]
     pub fn pool(&self) -> &Arc<Pool> {
         self.executor.pool()
@@ -129,12 +118,15 @@ impl Runtime {
 
 /// Threads for the shared pool.
 ///
-/// The machine's parallelism, which is also what `tokio::spawn` gave the
-/// callers this replaces. Keeping the number the same is the point: changing
-/// the thread count and the runtime in one step makes any measurement of the
-/// swap unreadable.
+/// Use the machine's parallelism up to the pool's supported bitmap capacity.
 fn shared_threads() -> usize {
-    std::thread::available_parallelism().map_or(2, core::num::NonZeroUsize::get)
+    supported_default_threads(
+        std::thread::available_parallelism().map_or(2, core::num::NonZeroUsize::get),
+    )
+}
+
+fn supported_default_threads(available: usize) -> usize {
+    available.clamp(1, usize::BITS as usize)
 }
 
 /// One pool per process, started on first use.
@@ -167,6 +159,23 @@ mod tests {
     use super::*;
     use crate::block_on;
     use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn automatic_worker_count_respects_the_bitmap_capacity() {
+        assert_eq!(supported_default_threads(0), 1);
+        assert_eq!(supported_default_threads(2), 2);
+        assert_eq!(supported_default_threads(usize::MAX), usize::BITS as usize);
+    }
+
+    #[test]
+    fn an_owned_runtime_installs_worker_identity() {
+        let runtime = Runtime::with_tuning(1, Tuning::locality(), "identity-test");
+        let pool = runtime.pool().clone();
+        let task = runtime.spawn(async move { crate::task::current_worker(&pool) });
+        let worker = block_on(task);
+        runtime.pool().shut_down();
+        assert_eq!(worker, Some(Some(0)));
+    }
 
     #[test]
     fn the_shared_pool_is_one_pool() {
@@ -202,110 +211,5 @@ mod tests {
             block_on(handle);
         }
         assert_eq!(counter.load(Ordering::Relaxed), 64);
-    }
-}
-
-/// What [`Runtime::with_tuning`] exists for, demonstrated rather than asserted.
-///
-/// The claim is that a pool built outside this module cannot honour a
-/// locality tuning, because [`crate::task::mark_current`] is private and that
-/// marker is the whole mechanism. A test that only checked the marked pool
-/// would pass just as well if the marker did nothing, so both are run.
-#[cfg(test)]
-mod local_wakes {
-    use super::{Executor, Runtime, Tuning};
-    use alloc::sync::Arc;
-    use alloc::vec::Vec;
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{Context, Poll};
-    use st3::fanout::{Pool, StdHost};
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-
-    const WORKERS: usize = 4;
-    const YIELDS: usize = 400;
-
-    /// Self-wakes `left` times, recording which thread ran each poll.
-    ///
-    /// The thread identity is the observable. `local_wakes` means a task that
-    /// wakes itself goes back to the worker that was running it, so the set of
-    /// threads that polled one task has exactly one member.
-    struct RecordYields {
-        left: usize,
-        seen: Arc<Mutex<HashSet<std::thread::ThreadId>>>,
-    }
-
-    impl Future for RecordYields {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-            self.seen
-                .lock()
-                .expect("the set holds no state a panic could corrupt")
-                .insert(std::thread::current().id());
-            if self.left == 0 {
-                return Poll::Ready(());
-            }
-            self.left -= 1;
-            context.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-
-    fn threads_that_polled_one_task(executor: &Executor) -> usize {
-        let seen = Arc::new(Mutex::new(HashSet::new()));
-        let task = RecordYields {
-            left: YIELDS,
-            seen: seen.clone(),
-        };
-        crate::block_on(executor.spawn(task));
-        let count = seen.lock().expect("the set").len();
-        count
-    }
-
-    #[test]
-    fn a_marked_pool_keeps_a_self_waking_task_on_one_worker() {
-        let runtime = Runtime::with_tuning(WORKERS, Tuning::locality(), "test-marked");
-        assert_eq!(
-            threads_that_polled_one_task(runtime.executor()),
-            1,
-            "a locality-tuned runtime let a self-wake leave its worker, so the marker is not being set"
-        );
-    }
-
-    /// The same tuning, on a pool this module did not build.
-    ///
-    /// This is what `WorkTable` was doing for every flavor but the default,
-    /// and it is why `with_tuning` had to exist: the tuning is set, the pool
-    /// works, and the behaviour it asks for silently never happens.
-    #[test]
-    fn an_unmarked_pool_cannot_honour_the_same_tuning() {
-        let host = Arc::new(StdHost::new(WORKERS));
-        let pool = Pool::with_tuning(WORKERS, 1024, host, Tuning::locality());
-        let threads: Vec<_> = (0..WORKERS)
-            .map(|id| {
-                let pool = pool.clone();
-                let runner = pool.runner(id);
-                std::thread::spawn(move || {
-                    // No `mark_current`, because it is private. That is the
-                    // whole of the difference from the test above.
-                    let _ = pool.run(runner);
-                })
-            })
-            .collect();
-        let executor = Executor::new(pool.clone());
-
-        let count = threads_that_polled_one_task(&executor);
-
-        pool.shut_down();
-        for thread in threads {
-            let _ = thread.join();
-        }
-
-        assert!(
-            count > 1,
-            "an unmarked pool kept the task on one worker, which would mean the marker is not the mechanism \
-             `local_wakes` depends on and this whole API is unnecessary"
-        );
     }
 }
