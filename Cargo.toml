@@ -18,7 +18,13 @@ std = ["ps-st3/host", "dep:futures-io", "futures-io/std", "dep:futures-util", "f
 
 
 [dependencies]
-ps-st3 = { version = "^0.6", default-features = false, features = ["fanout"] }
+# `^0.6.1`, not `^0.6`. 0.6.1 carries three wake fixes and 0.6.0 does not:
+# a burst of submits naming the same sleeper, private work waking the wrong
+# worker, and a nudge that never fired because its condition could not be
+# true at the default batch size. `^0.6` accepts 0.6.0, so a lockfile pinning
+# it would silently build a pool without any of them, and every scheduler
+# number measured against this crate would stop being reproducible.
+ps-st3 = { version = "^0.6.1", default-features = false, features = ["fanout"] }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 # The task itself: one allocation holding the future, its state machine, its
 # waker vtable and its output, with `Runnable::into_raw` handing the pointer
@@ -33,7 +39,7 @@ futures-io = { version = "0.3", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
-ps-st3 = { version = "^0.6", features = ["fanout", "host"] }
+ps-st3 = { version = "^0.6.1", features = ["fanout", "host"] }
 # The comparison arm. Only the scheduler is used; nothing here needs its I/O.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # The other comparison arm. Not an async runtime: a data-parallel pool, so it
