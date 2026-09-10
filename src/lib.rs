@@ -62,6 +62,13 @@ mod yield_now;
 
 pub use block_on::block_on;
 pub use par::{par_for, Cancel, ParFor};
+/// The idle policy a pool runs with, from the queues underneath.
+///
+/// Re-exported because selecting one is a nagoya-level decision and every
+/// caller that makes it would otherwise have to name `ps-st3` as a direct
+/// dependency to spell the type, for one struct, in a graph that already
+/// contains it transitively.
+pub use st3::fanout::Tuning;
 pub use time::{
     now_ns, poll as poll_timers, set_clock, sleep, sleep_until, timeout, Elapsed, Sleep, Timeout,
 };
