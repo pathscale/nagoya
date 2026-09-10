@@ -43,6 +43,29 @@ jobs:
       - if: steps.version.outputs.changed == 'true'
         run: cargo check --no-default-features
 
+      # Checked before the upload rather than during it. This crate has no
+      # repository-level `CARGO_REGISTRY_TOKEN`, and every publish run so far
+      # short-circuited on "version unchanged", so the upload path has never
+      # actually run here. The first real release would be the first time the
+      # token is exercised, and an absent one surfaces as an authentication
+      # error from `cargo publish` after the package is built, which reads like
+      # a registry problem rather than a missing secret.
+      - if: steps.version.outputs.changed == 'true'
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is empty."
+            echo
+            echo "Set it on pathscale/nagoya, or at the organisation level with this"
+            echo "repository in scope:"
+            echo "  gh secret set CARGO_REGISTRY_TOKEN --repo pathscale/nagoya"
+            echo
+            echo "Nothing downstream resolves until this crate publishes: worktable"
+            echo "requires nagoya ^0.1.1, and nagoya requires ps-st3 ^0.6.1."
+            exit 1
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
       - if: steps.version.outputs.changed == 'true'
         run: cargo publish --token "$CARGO_REGISTRY_TOKEN"
         env:
