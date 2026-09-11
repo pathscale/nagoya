@@ -3,6 +3,9 @@
 The [user guide](docs/user-guide.md) covers task and worker lifetimes, submit,
 parallel loops, cancellation, timers, synchronization, files, custom hosts,
 tuning and interoperability. Its Rust examples are compiled as rustdoc tests.
+For the print edition, run `sh scripts/build-guide.sh` with Pandoc and Typst
+installed. It regenerates `docs/user-guide.typ` and `docs/user-guide.pdf` from
+the same tested Markdown source.
 
 An async runtime that does not need an operating system.
 
