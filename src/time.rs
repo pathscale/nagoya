@@ -175,8 +175,8 @@ static CLOCK: AtomicUsize = AtomicUsize::new(0);
 /// Tell this module how to read a monotonic clock, in nanoseconds.
 ///
 /// Required before any timer is used without `std`, where there is no clock to
-/// default to. With `std` this is already set and calling it replaces the
-/// default, which is worth doing only to share an origin with something else.
+/// default to. With `std`, the default is installed lazily on the first clock
+/// read. A custom clock must be installed before then to take effect.
 ///
 /// Only the first call takes effect, so a late caller cannot move time under a
 /// timer that is already pending.
