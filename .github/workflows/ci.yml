@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  portable:
+    name: Portable core (${{ matrix.rust }})
+    runs-on: ubicloud-standard-2
+    strategy:
+      matrix:
+        rust: [stable, '1.85.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - run: cargo check --lib --no-default-features
+
+  hosted:
+    name: Hosted tests and guide examples
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo test --all-features
+      - run: cargo clippy --all-targets --all-features -- -D warnings

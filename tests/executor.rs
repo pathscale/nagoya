@@ -270,17 +270,14 @@ fn a_task_can_yield_its_worker() {
 }
 
 #[test]
+#[allow(clippy::reversed_empty_ranges)] // The reversed range is the regression input.
 fn a_reversed_empty_range_finishes_without_starting_workers() {
     let pool = Pool::new(1, 256, Arc::new(StdHost::new(1)));
     let mut loop_ = Box::pin(nagoya::par_for(pool, 10..5, |_| panic!("empty range ran")));
-    struct Noop;
-    impl std::task::Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-    let waker = std::task::Waker::from(Arc::new(Noop));
+    let waker = std::task::Waker::noop();
     assert!(loop_
         .as_mut()
-        .poll(&mut Context::from_waker(&waker))
+        .poll(&mut Context::from_waker(waker))
         .is_ready());
 }
 
@@ -315,12 +312,8 @@ fn dropping_a_pool_retires_queued_parallel_pieces() {
     let mut loop_ = Box::pin(nagoya::par_for(pool.clone(), 0..10, |_| {
         panic!("unrun body")
     }));
-    struct Noop;
-    impl std::task::Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-    let waker = std::task::Waker::from(Arc::new(Noop));
-    let mut context = Context::from_waker(&waker);
+    let waker = std::task::Waker::noop();
+    let mut context = Context::from_waker(waker);
     assert!(loop_.as_mut().poll(&mut context).is_pending());
     drop(pool);
     assert!(weak_pool.upgrade().is_none());
