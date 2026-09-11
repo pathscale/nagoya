@@ -388,6 +388,14 @@ pool's ID can route work to the wrong lane. No\_std hosts provide
 scheduling, allocation and the timer-driving contract; disabling `std`
 does not supply these services.
 
+Hosts may also implement `with_current_worker(&mut dyn FnMut(&Pool, usize))`
+to visit a pool borrowed from the active worker scope. Keep an Arc lease in
+that scope, call the visitor synchronously, and never retain it. Nagoya checks
+the pool and worker ID before consuming a runnable. This avoids a pool-wide
+reference-count update on each local wake. The default method preserves the
+`current_worker` fallback. Queued tasks retain only a weak pool reference,
+so they cannot keep their containing pool alive in a cycle.
+
 === Blocking without Rust std
 
 A host may use libc and OS wait primitives without linking Rust std. Enable
@@ -436,10 +444,23 @@ The Rust setters are `with_rounds_before_park`, `with_backoff_spins`,
 `with_injector_batch`, `with_lifo_run_limit`, `with_local_wakes`,
 `with_promote_every`, `with_share_displaced` and `with_stealable_inbox`.
 The last exposes displaced jobs through a stealable FIFO inbox, while retaining
-a private warm LIFO slot. It takes precedence over `share_displaced`; it has no
+a warm LIFO slot that becomes stealable at its fairness quota. It takes precedence over `share_displaced`; it has no
 effect when local wake routing is disabled. Smaller LIFO quotas offer other
 work more frequent opportunities. A quota boundary with a ready local job does
 not count as idle work.
+
+The experimental Rust presets are `Tuning::almost_tokio()` and
+`Tuning::parking()`. The first combines a three-poll warm slot with a
+stealable FIFO inbox; the second parks after an unsuccessful work search.
+Both are Nagoya policies and preserve no_std support. They do not add DSL
+grammar or use the Tokio runtime. For example:
+
+```rust
+let rt = nagoya::runtime::Runtime::with_tuning(
+    8, nagoya::Tuning::almost_tokio(), "almost_tokio");
+let parked = nagoya::runtime::Runtime::with_tuning(
+    8, nagoya::Tuning::parking(), "parking");
+```
 
 WorkTable's six named flavors are WorkTable registry policy, not six
 different Nagoya executors. Distinct flavor pools can interfere through

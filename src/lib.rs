@@ -172,6 +172,17 @@ impl<T> Future for JoinHandle<T> {
 pub trait WorkerContext: Send + Sync {
     /// The calling lane's worker index for `pool`, if it is currently running it.
     fn current_worker(&self, pool: &Pool) -> Option<usize>;
+
+    /// Visit the current worker's pool through a scope-owned borrow.
+    ///
+    /// Optional fast path for hosts whose worker scope already keeps the pool
+    /// alive. The default uses the existing current_worker fallback instead.
+    /// Call visit synchronously with a valid pool borrow and worker id; never
+    /// retain it. Report only the worker currently executing on this thread.
+    /// Store ownership in the running worker scope, not in this context or a
+    /// queued task, to avoid task/pool ownership cycles. Nagoya verifies the
+    /// target pool and id before consuming the runnable.
+    fn with_current_worker(&self, _visit: &mut dyn FnMut(&Pool, usize)) {}
 }
 
 /// A pool with a place to put the next task.

@@ -412,3 +412,46 @@ fn host_block_on_resumes_after_a_delayed_external_wake() {
     // A retained waker can safely signal after completion; it owns its host.
     waker.wake();
 }
+
+#[test]
+fn scoped_host_hints_are_checked_and_consume_each_runnable_once() {
+    struct Scoped {
+        target: std::sync::Weak<Pool>,
+        foreign: std::sync::Weak<Pool>,
+    }
+    impl nagoya::WorkerContext for Scoped {
+        fn current_worker(&self, _: &Pool) -> Option<usize> {
+            None
+        }
+        fn with_current_worker(&self, visit: &mut dyn FnMut(&Pool, usize)) {
+            let target = self.target.upgrade().unwrap();
+            let foreign = self.foreign.upgrade().unwrap();
+            // Incorrect and repeated host hints must not duplicate or misroute work.
+            visit(&foreign, 0);
+            visit(&target, usize::MAX);
+            visit(&target, 0);
+            visit(&target, 0);
+        }
+    }
+    let running = Running::new(1);
+    let foreign = Pool::new(1, 64, Arc::new(StdHost::new(1)));
+    let executor = Executor::with_worker_context(
+        running.executor.pool().clone(),
+        Arc::new(Scoped {
+            target: Arc::downgrade(running.executor.pool()),
+            foreign: Arc::downgrade(&foreign),
+        }),
+    );
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    assert_eq!(
+        block_on(executor.spawn(async move {
+            nagoya::yield_now().await;
+            seen.fetch_add(1, Ordering::Relaxed);
+            42
+        })),
+        Some(42)
+    );
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    assert_eq!(foreign.completed(0), 0);
+}
