@@ -581,15 +581,11 @@ mod tests {
         use core::pin::Pin;
         use core::task::Context;
         use std::sync::Arc;
-        use std::task::{Wake, Waker};
-        struct Noop;
-        impl Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(Noop));
+        use std::task::Waker;
+        let waker = Waker::noop();
         let mut sleep = super::sleep_until(u64::MAX);
         assert!(Pin::new(&mut sleep)
-            .poll(&mut Context::from_waker(&waker))
+            .poll(&mut Context::from_waker(waker))
             .is_pending());
         let weak = Arc::downgrade(sleep.slot.as_ref().unwrap());
         drop(sleep);
