@@ -1,11 +1,12 @@
 # nagoya
 
-The [user guide](docs/user-guide.md) covers task and worker lifetimes, submit,
+The [user guide](docs/user-guide.typ) covers task and worker lifetimes, submit,
 parallel loops, cancellation, timers, synchronization, files, custom hosts,
 tuning and interoperability. Its Rust examples are compiled as rustdoc tests.
-For the print edition, run `sh scripts/build-guide.sh` with Pandoc and Typst
-installed. It regenerates `docs/user-guide.typ` and `docs/user-guide.pdf` from
-the same tested Markdown source.
+Read [Why Nagoya](docs/why-nagoya.typ) for the design, an example and measured tradeoffs.
+Run `sh scripts/build-guide.sh` with Typst installed to build both PDFs in `docs/`.
+Typst is the only maintained guide; its Rust examples are extracted during the
+build and checked by `cargo test --doc`.
 
 An async runtime that does not need an operating system.
 
@@ -41,7 +42,7 @@ install that context. There are three integration choices:
 WorkTable's S3 adapter uses blocking `ureq` calls behind its async interface.
 Those calls occupy the polling thread. That choice removes the reactor
 requirement; it does not make network I/O nonblocking or establish a universal
-performance advantage. See the [interoperability guide](docs/user-guide.md#interoperability-and-limitations).
+performance advantage. See the interoperability section of the [guide](docs/user-guide.typ).
 
 ## Two shapes, one runtime
 
