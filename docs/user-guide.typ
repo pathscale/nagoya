@@ -450,17 +450,16 @@ effect when local wake routing is disabled. Smaller LIFO quotas offer other
 work more frequent opportunities. A quota boundary with a ready local job does
 not count as idle work.
 
-The experimental Rust presets are `Tuning::almost_tokio()` and
-`Tuning::parking()`. The first combines a three-poll warm slot with a
-stealable FIFO inbox; the second parks after an unsuccessful work search.
-Both are Nagoya policies and preserve no_std support. They do not add DSL
-grammar or use the Tokio runtime. For example:
+The opt-in Rust preset `Tuning::almost_tokio()` combines a three-poll warm
+slot with a stealable FIFO inbox and parks after an unsuccessful work search,
+without idle spin rounds. It preserves no_std support and adds no DSL grammar.
+This is a Nagoya policy, not the Tokio runtime. Dated benchmark reports called
+it `parking`; the earlier aggressive-spin `almost_tokio` preset was retired.
+For example:
 
 ```rust
 let rt = nagoya::runtime::Runtime::with_tuning(
     8, nagoya::Tuning::almost_tokio(), "almost_tokio");
-let parked = nagoya::runtime::Runtime::with_tuning(
-    8, nagoya::Tuning::parking(), "parking");
 ```
 
 WorkTable's six named flavors are WorkTable registry policy, not six
