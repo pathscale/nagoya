@@ -12,9 +12,10 @@ Typst is the canonical documentation source. Run `sh scripts/build-guide.sh`
 to create both PDFs in `docs/`; Rust examples are extracted and checked by
 `cargo test --doc`.
 
-Version 0.1.2 adds `Executor::submit` and `block_on_with_host`. It requires
-ps-st3 0.6.2. Until those versions are published, use the release checkouts and
-one consistent Cargo patch graph. Merge and publish dependencies first.
+Version 0.1.2 adds `Executor::submit` and `block_on_with_host`. It accepts
+ps-st3 through `^0.6`; this release was validated with 0.6.2. Use `cargo update
+-p ps-st3` in an existing checkout to pick up the scheduler fixes. Until Nagoya
+0.1.2 is published, use the release checkout with one consistent Cargo patch graph.
 
 `block_on` uses a spinning fallback without std. Use `block_on_with_host`
 with a dedicated host wait slot when the caller should block. See the guide
