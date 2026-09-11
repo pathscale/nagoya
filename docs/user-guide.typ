@@ -435,7 +435,8 @@ service; it does not require Rust's thread-local macro.
 <tuning-and-measurement>
 `Runtime::with_tuning(workers, tuning, label)` names worker threads
 `label-id` and installs worker identity. `Tuning` is re-exported from
-ps-st3. Use `Tuning::default()` or its named presets and change one
+ps-st3. The default is locality with four empty search rounds and 128 spin
+hints per round before host parking. Use `Tuning::default()` or its named presets and change one
 public field at a time. Worker count, queue batching, local wake
 routing, private-task sharing, and idle spin/backoff policy trade
 throughput, tail latency and CPU use.
