@@ -331,6 +331,7 @@ preserves an existing file. File methods block the calling thread
 despite their async signatures. Put long disk work on threads owned for
 that purpose.
 
+// doctest: no_run
 ```rust
 use nagoya::io::{Read, Write, Seek, SeekFrom, File};
 nagoya::block_on(async {
