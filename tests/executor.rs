@@ -360,3 +360,55 @@ fn a_panicking_parallel_body_retires_its_piece_and_preserves_the_worker() {
         Ok(Some(42)),
     );
 }
+
+#[test]
+fn host_block_on_retains_a_wake_delivered_during_poll() {
+    let host = Arc::new(st3::fanout::AtomicHost::new(1, || 0));
+    let mut polled = false;
+    let future = core::future::poll_fn(move |cx| {
+        if polled {
+            return Poll::Ready(42);
+        }
+        polled = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    });
+    assert_eq!(nagoya::block_on_with_host(future, host, 0), 42);
+}
+
+#[test]
+fn host_block_on_resumes_after_a_delayed_external_wake() {
+    use std::sync::mpsc;
+    let (send_waker, receive_waker) = mpsc::channel();
+    let (send_result, receive_result) = mpsc::channel();
+    let ready = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let input = ready.clone();
+    let caller = std::thread::spawn(move || {
+        let host = Arc::new(st3::fanout::AtomicHost::new(1, || 0));
+        let future = core::future::poll_fn(move |cx| {
+            if input.load(Ordering::Acquire) {
+                return Poll::Ready(42);
+            }
+            send_waker.send(cx.waker().clone()).unwrap();
+            Poll::Pending
+        });
+        send_result
+            .send(nagoya::block_on_with_host(future, host, 0))
+            .unwrap();
+    });
+    let waker = receive_waker
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    ready.store(true, Ordering::Release);
+    waker.wake_by_ref();
+    assert_eq!(
+        receive_result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap(),
+        42
+    );
+    caller.join().unwrap();
+    // A retained waker can safely signal after completion; it owns its host.
+    waker.wake();
+}

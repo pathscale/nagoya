@@ -119,7 +119,8 @@ submitted closure.
 `block_on(future)` drives that future on the calling thread. It does not
 create a pool, install a socket reactor, or turn blocking code
 asynchronous. With `std` it parks on a waker; without `std` the
-host-side polling loop spins. Await child tasks inside a worker instead
+fallback polling loop spins. Use `block_on_with_host(future, host, waiter)`
+for a blocking caller without Rust std. Await child tasks inside a worker instead
 of blocking a worker waiting for work that needs the same exhausted
 pool.
 
@@ -387,6 +388,41 @@ pool's ID can route work to the wrong lane. No\_std hosts provide
 scheduling, allocation and the timer-driving contract; disabling `std`
 does not supply these services.
 
+=== Blocking without Rust std
+
+A host may use libc and OS wait primitives without linking Rust std. Enable
+`ps-st3`'s `atomic-host` feature with default features off and construct
+`AtomicHost::new(workers, clock)`. Its clock is a `fn() -> u64` returning
+monotonic nanoseconds. Workers block through atomic-wait platform calls and
+wake permits; there is no periodic timeout. `spurious()` counts platform
+returns without a signal. This host does not create threads or drive timers.
+
+A blocking caller also needs a wait mechanism. `block_on_with_host` accepts
+an `Arc<dyn Host>` and a dedicated waiter slot, available with or without
+Rust std. Reserve that slot for this caller; do not reuse a worker's slot or
+share it between simultaneous or nested blocking calls. Cloned wakers keep the
+host alive and may signal after completion, so the slot must remain valid.
+
+```rust
+use nagoya::block_on_with_host;
+use st3::fanout::AtomicHost;
+use std::sync::Arc;
+// This example uses no timers, so its clock is unused.
+let caller = Arc::new(AtomicHost::new(1, || 0));
+let answer = block_on_with_host(async {
+    nagoya::yield_now().await;
+    42
+}, caller, 0);
+assert_eq!(answer, 42);
+```
+
+For a portable embedding, replace the example's std Arc import with
+`alloc::sync::Arc`, supply its monotonic clock, and arrange worker lifecycle.
+The suite's `portable-runtime` example provides a no_std Unix clock and
+pthread TLS implementation of `WorkerContext`. Without worker identity,
+self-wakes use the shared injector and can cost more CPU. Identity is a host
+service; it does not require Rust's thread-local macro.
+
 == Tuning and measurement
 <tuning-and-measurement>
 `Runtime::with_tuning(workers, tuning, label)` names worker threads
@@ -395,6 +431,15 @@ ps-st3. Use `Tuning::default()` or its named presets and change one
 public field at a time. Worker count, queue batching, local wake
 routing, private-task sharing, and idle spin/backoff policy trade
 throughput, tail latency and CPU use.
+
+The Rust setters are `with_rounds_before_park`, `with_backoff_spins`,
+`with_injector_batch`, `with_lifo_run_limit`, `with_local_wakes`,
+`with_promote_every`, `with_share_displaced` and `with_stealable_inbox`.
+The last exposes displaced jobs through a stealable FIFO inbox, while retaining
+a private warm LIFO slot. It takes precedence over `share_displaced`; it has no
+effect when local wake routing is disabled. Smaller LIFO quotas offer other
+work more frequent opportunities. A quota boundary with a ready local job does
+not count as idle work.
 
 WorkTable's six named flavors are WorkTable registry policy, not six
 different Nagoya executors. Distinct flavor pools can interfere through
