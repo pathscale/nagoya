@@ -11,25 +11,42 @@ on:
   push:
     branches: [master]
     paths: ['Cargo.toml']
+  # A release that was merged before this gate was fixed has no Cargo.toml
+  # change left to make, so it cannot be triggered by the push rule alone.
+  workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
 
+      # The registry is the only authority on what is already released.
+      #
+      # This compared HEAD against HEAD^, which is only correct when the
+      # version bump is the last commit of the push. A rebased or squashed
+      # merge lands many commits at once and the bump is rarely the last of
+      # them, so the gate read "unchanged", the job went green, and nothing
+      # was published. That is exactly how 0.6.1 and nagoya 0.1.1 came to be
+      # merged, tagged green, and absent from crates.io.
       - id: version
         run: |
-          new=$(sed -nE '0,/^version = "(.*)"/s//\1/p' Cargo.toml)
-          old=$(git show HEAD^:Cargo.toml | sed -nE '0,/^version = "(.*)"/s//\1/p')
-          if [ "$new" = "$old" ]; then
-            echo "version unchanged at $new, nothing to publish"
+          name=$(grep -m1 '^name = ' Cargo.toml | cut -d'"' -f2)
+          new=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          case ${#name} in
+            1) path="1/$name" ;;
+            2) path="2/$name" ;;
+            3) path="3/${name:0:1}/$name" ;;
+            *) path="${name:0:2}/${name:2:2}/$name" ;;
+          esac
+          # A crate with no releases yet 404s, which is a reason to publish and
+          # not an error, so the failure is confined to the `if` condition.
+          if curl -sf "https://index.crates.io/$path" | grep -q "\"vers\":\"$new\""; then
+            echo "$name $new is already on crates.io, nothing to publish"
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "version $old -> $new"
+            echo "$name $new is not on crates.io, publishing"
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
