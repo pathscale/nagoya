@@ -242,4 +242,40 @@ impl Executor {
             task: Some(task::spawn(future, self.pool.clone(), self.context.clone()).fallible()),
         }
     }
+
+    /// Hand the pool a closure, with no task and no waker.
+    ///
+    /// [`Self::spawn`] builds a task: it allocates, it carries a waker so the
+    /// future can be re-polled, and it hands back a [`JoinHandle`] you can await
+    /// or cancel. All of that is the price of a thing that suspends.
+    ///
+    /// Plenty of work does not suspend. A tick that reads a book and writes a
+    /// number, a checkpoint of one partition, a fan-out over a range — these run
+    /// start to finish on whichever worker takes them, and paying for a task to
+    /// carry them is paying for nothing.
+    ///
+    /// This is the same submit path `spawn` eventually reaches, minus the task.
+    /// There is no handle, so there is nothing to await and nothing to cancel:
+    /// the closure runs once, somewhere, and that is all you are told.
+    ///
+    /// It exists so that choosing not to allocate does not mean reaching past
+    /// this type to the pool underneath. A caller who writes
+    /// `executor.pool().submit_fn(..)` has gone around the interface, and then
+    /// half the fleet's concurrency is written against one API and half against
+    /// another.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # fn example(executor: &nagoya::Executor) {
+    /// executor.submit(|| {
+    ///     // runs on a pool worker, start to finish
+    /// });
+    /// # }
+    /// ```
+    pub fn submit<F>(&self, work: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.pool.submit_fn(work);
+    }
 }
