@@ -62,31 +62,39 @@ system on the same machine.
 
 #pagebreak()
 #text(size: 10pt, weight: "bold", fill: rgb("#176a7a"))[WHY NAGOYA / MEASURED BEHAVIOR]
-== Low queue latency, with the cost visible
+== Keep useful work moving
 
-In the suite's paced-arrival experiment, each job performs the same calibrated
-CPU work. The runtime comparison measures submission-to-start latency, before
-that work runs. At 25% of the benchmark's estimated eight-worker capacity:
+The release comparison runs the same generated WorkTable, portable locks and
+cooperative yield on Nagoya and Tokio. With Nagoya's explicit LowLatency tuning,
+the geometric mean throughput ratios across eight and sixteen workers,
+1/4/8/16 clients and two independent sweeps were:
 
 #table(
-  columns: (1.5fr, 1fr, 1fr, 1fr), inset: 8pt,
-  stroke: rgb("#d1dcdf"),
-  table.header([*Runtime / call*], [*Median*], [*p99*], [*CPU cores*]),
-  [Nagoya `submit`], [1.25 µs], [3.88 µs], [8.89],
-  [Nagoya `spawn`], [1.33 µs], [4.79 µs], [8.66],
-  [Tokio], [1.38 µs], [19.63 µs], [3.55],
-  [Rayon], [0.75 µs], [14.88 µs], [7.90],
+  columns: (2fr, 1fr), inset: 8pt, stroke: rgb("#d1dcdf"),
+  table.header([*Workload*], [*Nagoya / Tokio*]),
+  [50% reads, 50% updates], [*1.65×*],
+  [Read, then modify in place], [*2.12×*],
+  [Read only], [0.95×],
 )
 
-Nagoya's closure path had about *five times lower p99 queue latency than Tokio*
-in this configuration. Rayon had the lower median. Nagoya's latency-oriented
-tuning consumed substantially more CPU than Tokio; the CPU column includes the
-producer and runtime workers. These are useful tradeoffs, not a universal ranking.
+The benefit appears where work hands data and synchronization to its successor.
+Across all 48 cells, this tuning recorded 1.49× throughput and 2.01× throughput
+per CPU core, using geometric means. It was within 10% of the best Nagoya policy
+in 46 cells. Tokio retained a material advantage in four-client reads; this is
+a workload comparison, not a claim that one executor always wins.
 
-At the 50% point, Nagoya `submit` recorded 5.92 µs p99, versus 68.38 µs for
-Tokio and 17.13 µs for Rayon. At 75%, its p99 rose to 57.58 µs while Nagoya
-`spawn` recorded 12.29 µs. API choice and offered load both matter. The suite
-keeps both call paths so the favorable case does not stand in for the whole curve.
+== Quiet when there is nothing to do
+
+A runtime should expose what low latency costs. The OS parker can block workers
+without Rust std and without periodic timeout wakeups. A portable host can use
+libc for its clock and thread identity, then share the same wake-permit protocol
+as an ordinary Rust application.
+
+Short gaps between bursts deserve their own measurement. In the portable-host
+probe, aggressive spinning used several CPU cores between sparse jobs; immediate
+parking used a small fraction of one core with a comparable median in one tested
+case. Choose and measure the tradeoff your application needs. A fully quiet
+pool and an intermittently busy pool are different tests.
 
 == A common foundation for mixed workloads
 
@@ -110,11 +118,12 @@ choosing a tuning profile.
 
 #v(0.35cm)
 #text(size: 8pt, fill: rgb("#526873"))[
-  *Measurement note.* Apple M4 Max, macOS arm64, 11 September 2026.
-  `orderbook-arrival`: eight workers; 20,000 jobs per point; median of three
-  interleaved rounds; calibrated job cost 1,592 ns. Percentages use estimated
-  capacity, not measured CPU utilization. This is one local full-suite run,
-  not a cross-machine guarantee or end-to-end request benchmark.
-  #link("https://github.com/pathscale/perf-benchmarks/blob/fix/two-ps-st3-in-one-graph/data/apple-m4-max-darwin-arm64/2026-09-11-210249-full.md")[Report and provenance].
-  #link("https://github.com/pathscale/perf-benchmarks/blob/fix/two-ps-st3-in-one-graph/benchmarks/orderbook-arrival.rs")[Benchmark and tuning].
+  *Measurement note.* Apple M4 Max, macOS arm64, Rust 1.98.0, 12 September 2026.
+  Table comparison: 20,000 rows, 60,000 operations per client, fifteen samples
+  after warmup in each cell. Six isolated Nagoya policies plus Tokio, two sweeps.
+  LowLatency is the explicitly selected comparison policy. Ratios use the same
+  workload, client and worker counts, not unrelated peak scores. Results apply
+  to this machine and do not establish a cross-platform or end-to-end guarantee.
+  #link("https://github.com/pathscale/perf-benchmarks/blob/fix/two-ps-st3-in-one-graph/data/apple-m4-max-darwin-arm64/2026-09-12-ready-work-runtime-baseline.md")[Table report and provenance].
+  #link("https://github.com/pathscale/perf-benchmarks/blob/fix/two-ps-st3-in-one-graph/data/apple-m4-max-darwin-arm64/2026-09-12-runtime-diagnostics.md")[Portable-host and placement diagnostics].
 ]

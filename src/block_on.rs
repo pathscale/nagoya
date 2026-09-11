@@ -102,3 +102,42 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
         signal.wait();
     }
 }
+
+/// Run a future on this caller using a host-provided blocking wait.
+///
+/// Available without Rust std. The host must retain an unpark permit delivered
+/// before park, as required by [`st3::fanout::Host`]. `waiter` selects a host
+/// slot dedicated to this caller: do not share it with a pool worker or another
+/// concurrent/nested block_on call. The host and slot must remain valid for
+/// outstanding cloned wakers even after the future completes.
+///
+/// This does not start workers or drive timers. The embedding still supplies
+/// those services; blocking a worker on its own exhausted pool can deadlock.
+pub fn block_on_with_host<F: Future>(
+    future: F,
+    host: Arc<dyn st3::fanout::Host>,
+    waiter: usize,
+) -> F::Output {
+    struct HostWake {
+        host: Arc<dyn st3::fanout::Host>,
+        waiter: usize,
+    }
+    impl alloc::task::Wake for HostWake {
+        fn wake(self: Arc<Self>) {
+            self.host.unpark(self.waiter);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.host.unpark(self.waiter);
+        }
+    }
+    let signal = Arc::new(HostWake { host, waiter });
+    let waker = Waker::from(signal.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        signal.host.park(waiter);
+    }
+}

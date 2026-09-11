@@ -64,7 +64,7 @@ mod task;
 mod time;
 mod yield_now;
 
-pub use block_on::block_on;
+pub use block_on::{block_on, block_on_with_host};
 pub use par::{par_for, Cancel, ParFor};
 /// The idle policy a pool runs with, from the queues underneath.
 ///
