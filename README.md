@@ -20,6 +20,62 @@ reactor is exactly the part that needs an operating system, and running without
 one is the only interesting thing about this. A caller that wants sockets brings
 its own reactor.
 
+
+### What that means for `reqwest` and friends
+
+The rule above is easy to agree with and easy to trip over, because the failure
+arrives at runtime rather than at compile time:
+
+```
+thread 'nagoya-0' panicked:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+```
+
+`reqwest`, and most async HTTP clients, do not merely *use* a reactor — they look
+for **tokio's**, through a thread-local runtime handle. So there is nothing
+nagoya can provide that would satisfy them. Adding an I/O driver here would not
+fix it, and neither does spawning a thread.
+
+There are three honest ways out, in the order worth trying them.
+
+**1. Use a blocking client.** Async HTTP exists to multiplex thousands of
+connections onto a few threads. A worker that makes one request at a time and is
+already on its own thread wants a blocking call, and gets it for less. `ureq`,
+`attohttpc` and `minreq` all do this with no runtime at all.
+
+This is what WorkTable did in September 2026. Its S3 support made four calls — a
+PUT and three GETs against presigned URLs, no streaming, no multipart, no auth
+headers, because the signature is in the URL. Swapping `reqwest` for `ureq`:
+
+| | before | after |
+|---|---:|---:|
+| crates in the build | 198 | 170 |
+| what the feature cost | 91 crates | 63 |
+| tokio present | yes | **no** |
+| the panicking test | panicked | passes |
+
+The `async fn` signatures stayed, so no call site changed; the blocking happens
+inside them. That is not a hack, it is the same thing WorkTable's filesystem
+layer already does deliberately — neither `tokio::fs` nor `async-fs` performs
+asynchronous file I/O either, both hand a blocking `std::fs` call to a thread
+pool, and WorkTable measured 12,316 rows/sec through `tokio::fs` against 74,728
+blocking. Pretending to be async cost 6x.
+
+**2. Run tokio beside nagoya, deliberately.** If a blocking client genuinely will
+not do — you need HTTP/2 multiplexing, or streaming bodies, or a vendor SDK with
+no blocking variant — then own a tokio runtime explicitly for that work and hand
+requests to it over a channel. Do it because you decided to, not because a
+dependency decided for you, and keep it off the path nagoya schedules.
+
+**3. Require tokio for that feature.** If a Cargo feature cannot work without a
+tokio reactor, make it say so and refuse otherwise. A build that fails is better
+than a worker that panics in production, and a silent incompatibility between a
+feature flag and a runtime choice is the worst of the three.
+
+**What not to do:** add an I/O driver to nagoya to satisfy a client that is
+looking for tokio's. It will not find it, and the reason there is no reactor here
+is the reason this runtime exists.
+
 ## Two shapes, one runtime
 
 A task is a thing that can suspend. A parallel loop is a thing that cannot, and
