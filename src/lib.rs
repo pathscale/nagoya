@@ -47,6 +47,10 @@ use st3::fanout::Pool;
 
 mod block_on;
 pub mod io;
+/// Tutorial and callsite reference, with compiled examples.
+#[cfg(feature = "std")]
+#[doc = include_str!("../docs/user-guide.md")]
+pub mod guide {}
 mod par;
 // Owns threads, so it needs `std`. See its module comment for why a crate built
 // not to own threads carries one that does.

@@ -1,5 +1,9 @@
 # nagoya
 
+The [user guide](docs/user-guide.md) covers task and worker lifetimes, submit,
+parallel loops, cancellation, timers, synchronization, files, custom hosts,
+tuning and interoperability. Its Rust examples are compiled as rustdoc tests.
+
 An async runtime that does not need an operating system.
 
 `spawn`, `JoinHandle`, `block_on` and a parallel `par_for`, over
@@ -19,6 +23,22 @@ There is no I/O driver and there will not be one here: an epoll or io_uring
 reactor is exactly the part that needs an operating system, and running without
 one is the only interesting thing about this. A caller that wants sockets brings
 its own reactor.
+
+### Clients that require Tokio
+
+A Tokio-based HTTP client can compile and then panic when polled on a worker
+without Tokio's reactor context. Starting another ordinary thread does not
+install that context. There are three integration choices:
+
+- Use a blocking HTTP client on a thread dedicated to blocking work.
+- Own a Tokio runtime for the networking component and communicate explicitly
+  across the boundary, including errors, cancellation and shutdown.
+- Require Tokio for a feature that cannot operate without its reactor.
+
+WorkTable's S3 adapter uses blocking `ureq` calls behind its async interface.
+Those calls occupy the polling thread. That choice removes the reactor
+requirement; it does not make network I/O nonblocking or establish a universal
+performance advantage. See the [interoperability guide](docs/user-guide.md#interoperability-and-limitations).
 
 ## Two shapes, one runtime
 
