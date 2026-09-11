@@ -1,16 +1,9 @@
-//! A future turned into something the pool can run.
+//! Task ownership and scoped worker routing.
 //!
-//! # Why this is thirty lines and not three hundred
-//!
-//! It was three hundred: a state machine over `IDLE`/`RUNNING`/`NOTIFIED`/
-//! `DONE`, a waker vtable, an output slot, a join waiter, and the `unsafe` to
-//! hold it together. All of that is what `async-task` is, and `async-task` is
-//! what `forte` uses to beat this crate. Keeping our own version of it was
-//! carrying a liability to no measured end.
-//!
-//! What is left here is the seam: turning an `async_task::Runnable` into a
-//! [`Job`] the pool can hold, which is one pointer and one function and no
-//! allocation, because the `Runnable` *is* the allocation.
+//! async-task owns each future, state machine and waker. A runnable becomes
+//! a pool Job without another allocation. Worker wakes borrow the scope's
+//! live pool; external wakes upgrade a weak reference so queued tasks do not
+//! keep their containing pool alive in a cycle.
 
 use alloc::sync::Arc;
 use core::future::Future;
@@ -21,55 +14,58 @@ use st3::fanout::{Act, Job, Pool};
 
 use crate::WorkerContext;
 
-// Which pool worker this thread is, while it is running one.
-//
-// A raw pointer rather than an id, so a process with two pools cannot hand one
-// pool's job to the other's worker. It is compared and never dereferenced.
+// The worker scope owns one pool lease. Wakes borrow it without modifying
+// the pool-wide Arc counter. Queued tasks still hold only Weak<Pool>.
 #[cfg(feature = "std")]
 std::thread_local! {
-    static CURRENT: core::cell::Cell<Option<(*const Pool, usize)>> =
-        const { core::cell::Cell::new(None) };
+    static CURRENT: core::cell::RefCell<Option<(Arc<Pool>, usize)>> =
+        const { core::cell::RefCell::new(None) };
 }
 
-/// Mark this thread as `worker` of `pool` until the guard drops.
-///
-/// Used by the owned runtime and Executor::run_worker. A custom/no_std host
-/// can instead supply WorkerContext to its executor.
 #[cfg(feature = "std")]
 pub(crate) fn mark_current(pool: &Arc<Pool>, worker: usize) -> CurrentGuard {
-    let previous = CURRENT.with(|current| current.replace(Some((Arc::as_ptr(pool), worker))));
+    let previous = CURRENT.with(|current| current.replace(Some((pool.clone(), worker))));
     CurrentGuard {
         previous,
         _thread_bound: core::marker::PhantomData,
     }
 }
 
-/// Restores a nested marker on drop, including on unwind. Must not cross threads.
 #[cfg(feature = "std")]
 pub(crate) struct CurrentGuard {
-    previous: Option<(*const Pool, usize)>,
+    previous: Option<(Arc<Pool>, usize)>,
     _thread_bound: core::marker::PhantomData<alloc::rc::Rc<()>>,
 }
 
 #[cfg(feature = "std")]
 impl Drop for CurrentGuard {
     fn drop(&mut self) {
-        CURRENT.with(|current| current.set(self.previous));
+        CURRENT.with(|current| {
+            current.replace(self.previous.take());
+        });
     }
 }
 
-/// This thread's worker id, if it is running `pool`.
 #[cfg(feature = "std")]
-pub(crate) fn current_worker(pool: &Arc<Pool>) -> Option<usize> {
-    CURRENT.with(|current| match current.get() {
-        Some((owner, worker)) if core::ptr::eq(owner, Arc::as_ptr(pool)) => Some(worker),
-        _ => None,
-    })
+fn with_current_worker(mut visit: impl FnMut(&Pool, usize)) {
+    let _ = CURRENT.try_with(|current| {
+        if let Some((pool, worker)) = current.borrow().as_ref() {
+            visit(pool, *worker);
+        }
+    });
 }
 
 #[cfg(not(feature = "std"))]
-fn current_worker(_pool: &Arc<Pool>) -> Option<usize> {
-    None
+fn with_current_worker(_visit: impl FnMut(&Pool, usize)) {}
+
+pub(crate) fn current_worker(pool: &Arc<Pool>) -> Option<usize> {
+    let mut found = None;
+    with_current_worker(|owner, worker| {
+        if core::ptr::eq(owner, pool.as_ref()) {
+            found = Some(worker);
+        }
+    });
+    found
 }
 
 /// Put `future` on `pool` and hand back the handle to its result.
@@ -87,19 +83,28 @@ where
     // turning it into a job is `into_raw`: no box, no closure, nothing new.
     let weak_pool = Arc::downgrade(&pool);
     let schedule = move |runnable: Runnable| {
+        let mut runnable = Some(runnable);
+        let mut local = |owner: &Pool, worker: usize| {
+            if core::ptr::eq(owner, weak_pool.as_ptr()) && worker < owner.workers() {
+                if let Some(runnable) = runnable.take() {
+                    owner.submit_local(worker, into_job(runnable));
+                }
+            }
+        };
+        match context.as_deref() {
+            Some(context) => context.with_current_worker(&mut local),
+            None => with_current_worker(&mut local),
+        }
+        let Some(runnable) = runnable else {
+            return;
+        };
+        // External wakes and hosts without a scoped borrow still use a weak
+        // upgrade. Pool destruction cancels an unrun task without a cycle.
         let Some(pool) = weak_pool.upgrade() else {
-            // The executor/host owns pool lifetime, not a queued task.
             drop(runnable);
             return;
         };
-        let pointer = runnable.into_raw();
-        // SAFETY: `Job::from_raw` asks for a pointer that stays valid until the
-        // job runs, work that is `Send`, an `execute` correct for the pointer,
-        // and one job per pointer. `Runnable::into_raw` gives up ownership of
-        // an allocation that lives until `from_raw` takes it back, which
-        // `poll_once` does exactly once because running consumes the job;
-        // `F` and `F::Output` are `Send`.
-        let job = unsafe { Job::from_raw(pointer, poll_once) };
+        let job = into_job(runnable);
         // A wake that happens *on* a worker goes straight to that worker.
         //
         // Every wake used to take the injector every worker contends on, plus a
@@ -129,6 +134,12 @@ where
     let (runnable, task) = async_task::spawn(future, schedule);
     runnable.schedule();
     task
+}
+
+fn into_job(runnable: Runnable) -> Job {
+    // SAFETY: Runnable owns a Send task allocation. Job consumes it exactly
+    // once, and poll_once reconstructs the same Runnable for run or drop.
+    unsafe { Job::from_raw(runnable.into_raw(), poll_once) }
 }
 
 fn worker_for(pool: &Arc<Pool>, context: Option<&dyn WorkerContext>) -> Option<usize> {
@@ -189,6 +200,24 @@ mod tests {
             assert_eq!(worker_for(&a, None), Some(1));
         }
         assert_eq!(worker_for(&a, None), None);
+    }
+
+    #[test]
+    fn worker_scope_owns_a_lease_without_queued_task_ownership() {
+        let owner = pool();
+        let weak = Arc::downgrade(&owner);
+        let guard = mark_current(&owner, 1);
+        drop(owner);
+        assert!(weak.upgrade().is_some());
+        let mut visits = 0;
+        with_current_worker(|borrowed, worker| {
+            assert!(core::ptr::eq(borrowed, weak.as_ptr()));
+            assert_eq!(worker, 1);
+            visits += 1;
+        });
+        assert_eq!(visits, 1);
+        drop(guard);
+        assert!(weak.upgrade().is_none());
     }
 
     struct HostContext {
