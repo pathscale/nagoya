@@ -32,21 +32,14 @@ jobs:
       # merged, tagged green, and absent from crates.io.
       - id: version
         run: |
-          name=$(grep -m1 '^name = ' Cargo.toml | cut -d'"' -f2)
-          new=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          case ${#name} in
-            1) path="1/$name" ;;
-            2) path="2/$name" ;;
-            3) path="3/${name:0:1}/$name" ;;
-            *) path="${name:0:2}/${name:2:2}/$name" ;;
-          esac
-          # A crate with no releases yet 404s, which is a reason to publish and
-          # not an error, so the failure is confined to the `if` condition.
-          if curl -sf "https://index.crates.io/$path" | grep -q "\"vers\":\"$new\""; then
-            echo "$name $new is already on crates.io, nothing to publish"
+          set -eu
+          name=$(cargo read-manifest | jq -er '.name')
+          version=$(cargo read-manifest | jq -er '.version')
+          if cargo info --registry crates-io "$name@$version" >/dev/null 2>&1; then
+            echo "$name $version is already on crates.io, nothing to publish"
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "$name $new is not on crates.io, publishing"
+            echo "$name $version is not on crates.io, publishing"
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
