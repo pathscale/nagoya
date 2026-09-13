@@ -13,15 +13,14 @@
 #show link: set text(fill: rgb("#1a4f8a"))
 = Nagoya user guide
 <nagoya-user-guide>
-This guide describes the release checkout, including `Executor::submit`.
-That method is new in 0.1.2; 0.1.1 does not provide it. Until 0.1.2 is
-published, applications trying the new API must use this checkout.
+This guide describes Nagoya 0.1.2, including `Executor::submit`.
+That method is not available in 0.1.1.
 Examples below are compiled as rustdoc tests, and examples that do not
 require an external host also run as tests.
 
 == Install and choose ownership
 <install-and-choose-ownership>
-Use `nagoya = "0.1.2"` after publication, or
+Use `nagoya = "^0.1"` from crates.io, or
 `nagoya = { path = "../nagoya" }` during local integration. Defaults
 include `std`. `default-features = false` provides the executor, task
 handles, parallel loops, synchronization, timers and portable I/O traits
@@ -449,6 +448,10 @@ a warm LIFO slot that becomes stealable at its fairness quota. It takes preceden
 effect when local wake routing is disabled. Smaller LIFO quotas offer other
 work more frequent opportunities. A quota boundary with a ready local job does
 not count as idle work.
+
+Start with `Tuning::default()`. It is the strongest measured generic policy in
+the release grids and keeps its locality advantage without the long-read weakness
+of the immediate-parking policy.
 
 The opt-in Rust preset `Tuning::almost_tokio()` combines a three-poll warm
 slot with a stealable FIFO inbox and parks after an unsuccessful work search,
