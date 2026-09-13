@@ -65,23 +65,22 @@ system on the same machine.
 == Keep useful work moving
 
 The release comparison runs the same generated WorkTable, portable locks and
-cooperative yield on Nagoya and Tokio. With Nagoya's explicit LowLatency tuning,
-the geometric mean throughput ratios across eight and sixteen workers,
-1/4/8/16 clients and two independent sweeps were:
+cooperative yield on Nagoya and Tokio. The default locality policy was measured
+across eight and sixteen workers, 1/4/8/16 clients, and read, mixed-update and
+read-modify-write workloads:
 
 #table(
   columns: (2fr, 1fr), inset: 8pt, stroke: rgb("#d1dcdf"),
-  table.header([*Workload*], [*Nagoya / Tokio*]),
-  [50% reads, 50% updates], [*1.65×*],
-  [Read, then modify in place], [*2.12×*],
-  [Read only], [0.95×],
+  table.header([*24-cell geometric mean*], [*Nagoya / Tokio*]),
+  [Throughput], [*1.574×*],
+  [Operations per CPU-second], [*2.267×*],
 )
 
+The twelve-worker repeat points in the same direction: across 18 paired cells,
+the default recorded 1.536× Tokio throughput and 2.223× operations per CPU-second.
 The benefit appears where work hands data and synchronization to its successor.
-Across all 48 cells, this tuning recorded 1.49× throughput and 2.01× throughput
-per CPU core, using geometric means. It was within 10% of the best Nagoya policy
-in 46 cells. Tokio retained a material advantage in four-client reads; this is
-a workload comparison, not a claim that one executor always wins.
+Tokio retained a material advantage in some four-client reads; this is a workload
+comparison, not a claim that one executor always wins.
 
 == Quiet when there is nothing to do
 
@@ -112,18 +111,18 @@ budget, completion contracts and shutdown sequence explicitly.
 
 Use the #link("user-guide.pdf")[Nagoya user guide] for task lifetime, cancellation,
 timers, synchronization, portable I/O and custom hosts, with executable examples.
-Version 0.1.2 introduces `Executor::submit`; use the release checkout until that
-version is published. Compare your own latency distribution and CPU use before
+Version 0.1.2 introduces `Executor::submit`. Start with the default locality
+policy, then compare your own latency distribution and CPU use before
 choosing a tuning profile.
 
 #v(0.35cm)
 #text(size: 8pt, fill: rgb("#526873"))[
   *Measurement note.* Apple M4 Max, macOS arm64, Rust 1.98.0, 12 September 2026.
-  Table comparison: 20,000 rows, 60,000 operations per client, fifteen samples
-  after warmup in each cell. Six isolated Nagoya policies plus Tokio, two sweeps.
-  LowLatency is the explicitly selected comparison policy. Ratios use the same
+  Candidate comparison: 20,000 rows, 60,000 operations per client, seven samples
+  after two warmups in each cell. Five isolated Nagoya policies plus Tokio.
+  Locality is Nagoya's default comparison policy. Ratios use the same
   workload, client and worker counts, not unrelated peak scores. Results apply
   to this machine and do not establish a cross-platform or end-to-end guarantee.
-  #link("https://github.com/pathscale/perf-benchmarks/blob/fix/two-ps-st3-in-one-graph/data/apple-m4-max-darwin-arm64/2026-09-12-ready-work-runtime-baseline.md")[Table report and provenance].
-  #link("https://github.com/pathscale/perf-benchmarks/blob/fix/two-ps-st3-in-one-graph/data/apple-m4-max-darwin-arm64/2026-09-12-runtime-diagnostics.md")[Portable-host and placement diagnostics].
+  #link("https://github.com/pathscale/perf-benchmarks/blob/master/docs/runtime-default-review.md")[Default review and provenance].
+  #link("https://github.com/pathscale/perf-benchmarks/blob/master/data/apple-m4-max-darwin-arm64/2026-09-12-runtime-diagnostics.md")[Portable-host and placement diagnostics].
 ]
