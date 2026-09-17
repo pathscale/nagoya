@@ -55,7 +55,7 @@ pub mod socket;
 #[cfg(test)]
 mod testing;
 
-pub use driver::{Handle, Reactor, Registration};
+pub use driver::{Handle, Reactor, Registration, Sharded};
 pub use error::{Errno, Result};
 pub use local::{block_on, block_on_with};
 pub use net::{TcpListener, TcpStream};

@@ -253,6 +253,39 @@ impl Drop for Registration {
     }
 }
 
+/// A group of reactors, each on its own thread.
+///
+/// See [`Reactor::sharded`] for why this exists rather than one reactor with
+/// more threads behind it.
+pub struct Sharded {
+    reactors: Vec<Reactor>,
+    next: AtomicU64,
+}
+
+impl Sharded {
+    /// A handle for the next shard, round robin.
+    ///
+    /// Call once per descriptor and keep the handle for that descriptor's
+    /// life: the shard that registers a descriptor is the one that will report
+    /// its readiness, so moving between them mid connection is not something
+    /// to do casually.
+    pub fn handle(&self) -> Handle {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) as usize;
+        self.reactors[index % self.reactors.len()].handle()
+    }
+
+    /// How many reactors this group holds.
+    pub fn shards(&self) -> usize {
+        self.reactors.len()
+    }
+
+    /// The handle for one specific shard, for a caller that wants to place a
+    /// descriptor itself rather than take the next one.
+    pub fn handle_for(&self, shard: usize) -> Handle {
+        self.reactors[shard % self.reactors.len()].handle()
+    }
+}
+
 /// Start a reactor on its own thread.
 ///
 /// The thread runs until [`Reactor::shutdown`] is called or the returned
@@ -395,6 +428,35 @@ impl Reactor {
         })
     }
 
+    /// Several reactors, each on its own thread with its own poller.
+    ///
+    /// One reactor thread is one `kevent`/`epoll_wait` loop, and every wakeup
+    /// it produces crosses to whichever thread runs the task. With many busy
+    /// connections that one loop is both a serialisation point and a thread
+    /// boundary paid per message.
+    ///
+    /// Sharding gives each thread its own poller and its own descriptors, so
+    /// the loops run in parallel and a descriptor's events always come from
+    /// the same thread. [`Sharded::handle`] hands out the shard a new
+    /// descriptor should register with, round robin, so connections spread
+    /// evenly without the caller choosing.
+    ///
+    /// This is not a pool: a shard owns its descriptors for their lifetime and
+    /// nothing is stolen between them. That is deliberate, because a
+    /// descriptor moving between pollers is exactly the case generational
+    /// tokens exist to make safe and there is no reason to invite it.
+    pub fn sharded(shards: usize) -> Result<Sharded> {
+        let shards = shards.max(1);
+        let mut reactors = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            reactors.push(Self::start()?);
+        }
+        Ok(Sharded {
+            reactors,
+            next: AtomicU64::new(0),
+        })
+    }
+
     /// A cloneable handle for registering descriptors.
     pub fn handle(&self) -> Handle {
         Handle {
@@ -526,6 +588,55 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Descriptors spread across shards and each one still works.
+    ///
+    /// The failure this guards against is a descriptor registered with one
+    /// shard and waited on through another: it would simply never wake, and
+    /// the test would hang rather than fail, so the channel has a timeout.
+    #[test]
+    fn a_sharded_reactor_serves_every_shard() {
+        use std::sync::mpsc;
+
+        let sharded = Reactor::sharded(4).expect("sharded");
+        assert_eq!(sharded.shards(), 4);
+
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..8 {
+            let handle = sharded.handle();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let (a, b) = crate::reactor::testing::socket_pair();
+                let registration = handle
+                    .register(b.as_raw_fd(), Interest::READABLE)
+                    .expect("register");
+                let flag = Arc::new(AtomicBool::new(false));
+                let waker = {
+                    let flag = Arc::clone(&flag);
+                    waker_fn(move || flag.store(true, Ordering::Release))
+                };
+                registration.poll_readable(&waker);
+                write_byte(&a);
+                // Spin briefly rather than park: this is about whether the
+                // shard delivers at all, not how fast.
+                for _ in 0..10_000 {
+                    if flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                tx.send(flag.load(Ordering::Acquire)).expect("signal");
+            });
+        }
+        drop(tx);
+
+        for _ in 0..8 {
+            let woke = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a shard never reported");
+            assert!(woke, "a descriptor on one shard never woke");
+        }
+    }
 
     /// A waker that calls back into `poll_once` must not deadlock.
     ///
