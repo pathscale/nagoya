@@ -252,9 +252,11 @@ impl Error {
 /// with: `AsyncRead` lives in `tokio`, so the glue drags the whole runtime
 /// along.
 ///
-/// This crate is already the common dependency and already has no I/O driver
-/// of its own, which makes it the right place for a trait that describes one
-/// without providing it.
+/// This crate is already the common dependency, which makes it the right place
+/// for the definition. It was written here while there was no I/O driver to
+/// implement it; [`reactor::TcpStream`](crate::reactor::TcpStream) implements
+/// it now, and the trait is the better for having been designed before there
+/// was a socket to shape it around.
 #[allow(async_fn_in_trait)]
 pub trait Stream {
     /// Read into `buffer`, returning how many bytes arrived.

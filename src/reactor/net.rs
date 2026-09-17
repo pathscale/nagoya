@@ -466,8 +466,79 @@ impl core::future::Future for Accept<'_> {
     }
 }
 
+/// The byte stream trait this crate declared, with something behind it at last.
+///
+/// [`io::Stream`](crate::io::Stream) was written here because two crates always
+/// need it and neither should depend on the other: a TLS session implements it
+/// so a protocol can run over one, a protocol consumes it so it need not know
+/// whether TLS is underneath. Until now nothing in this crate implemented it,
+/// which left the trait describing an I/O driver that lived somewhere else.
+///
+/// A socket is the obvious implementation and it is here now, so a protocol
+/// written against the trait can be handed a `TcpStream`, a TLS session over
+/// one, or an in-memory pipe, and cannot tell which. The methods forward: the
+/// inherent ones already have these signatures.
+impl crate::io::Stream for TcpStream {
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        Self::read(self, buffer).await
+    }
+
+    async fn write_all(&mut self, buffer: &[u8]) -> Result<()> {
+        Self::write_all(self, buffer).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A socket is usable through the trait, not just beside it.
+    ///
+    /// This is written as a generic function on purpose: it compiles only if
+    /// `TcpStream` really satisfies `io::Stream`, and it runs only if the
+    /// forwarding is right. An inherent method with the same name would
+    /// satisfy neither.
+    #[test]
+    fn a_socket_reads_and_writes_through_the_stream_trait() {
+        async fn echo_once<S: crate::io::Stream>(stream: &mut S) -> usize {
+            let mut buffer = [0u8; 8];
+            let read = stream.read(&mut buffer).await.expect("read");
+            stream.write_all(&buffer[..read]).await.expect("write");
+            read
+        }
+
+        let reactor = Reactor::start().expect("reactor");
+        let handle = reactor.handle();
+        let listener = TcpListener::bind(Addr::localhost(0), &handle).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let client_handle = handle.clone();
+        let client = std::thread::spawn(move || {
+            crate::block_on(async move {
+                let mut stream = TcpStream::connect(addr, &client_handle)
+                    .await
+                    .expect("connect");
+                // Named through the trait on this side, so both directions
+                // are the trait's methods rather than the inherent ones that
+                // happen to share their names.
+                crate::io::Stream::write_all(&mut stream, b"trait")
+                    .await
+                    .expect("write");
+                let mut buffer = [0u8; 8];
+                let read = crate::io::Stream::read(&mut stream, &mut buffer)
+                    .await
+                    .expect("read");
+                buffer[..read].to_vec()
+            })
+        });
+
+        let served = crate::block_on(async {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            echo_once(&mut stream).await
+        });
+
+        assert_eq!(served, 5);
+        assert_eq!(client.join().expect("client"), b"trait");
+    }
     use super::*;
     use crate::reactor::Reactor;
     /// Port zero: the kernel picks a free one, which `local_addr` reports.
