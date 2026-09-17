@@ -9,10 +9,24 @@
 //!
 //! # What this is not
 //!
-//! Not Tokio. There is no I/O driver, and there will not be one in this crate:
-//! an epoll or io_uring reactor is precisely the part that needs an operating
-//! system, and being able to run without one is the only interesting thing
-//! here. A caller that wants sockets brings its own reactor.
+//! Not Tokio. The scheduler, `sync` and `time` above reach nothing further than
+//! park, unpark and a clock, and that is the part which runs without an
+//! operating system.
+//!
+//! There *is* an I/O driver now, in [`reactor`], and it is off unless asked
+//! for. This used to say there would never be one, on the grounds that an
+//! epoll or kqueue reactor is exactly the part that needs an OS. That reason
+//! was right and the conclusion drawn from it was not: [`runtime`] owns OS
+//! threads for the same reason and resolves it the same way, by living behind
+//! the `std` feature and being honestly absent otherwise.
+//!
+//! Telling every caller to bring its own reactor did not avoid the dependency,
+//! it duplicated it. Generational tokens, edge-triggered registration and
+//! integrating a timer wheel without polling it are the same problem each time,
+//! and getting them subtly wrong is silent: a dropped registration wakes an
+//! unrelated task, or a busy socket takes the timer lock on every event. A
+//! `no_std` build still has no reactor and still compiles, which is the
+//! property that mattered.
 //!
 //! # The surface worth having, measured rather than guessed
 //!
@@ -54,6 +68,8 @@ pub mod guide {}
 mod par;
 // Owns threads, so it needs `std`. See its module comment for why a crate built
 // not to own threads carries one that does.
+#[cfg(feature = "reactor")]
+pub mod reactor;
 #[cfg(feature = "std")]
 pub mod runtime;
 // The four async primitives a consumer was otherwise taking from `tokio::sync`.

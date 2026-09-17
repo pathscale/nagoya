@@ -15,6 +15,11 @@ default = ["std"]
 # Off, this crate does not link `std`. What it costs: `Runtime`, which owns
 # threads, and the parker `block_on` uses when there is one to park.
 std = ["ps-st3/host", "async-task/std", "dep:futures-io", "futures-io/std", "dep:futures-util", "futures-util/std", "futures-util/io"]
+# The I/O driver. Needs an operating system, so it needs `std`, and it is off
+# by default for the same reason `runtime` is honest about owning threads: a
+# build that does not ask for sockets must not acquire a reactor thread as a
+# side effect of depending on this crate.
+reactor = ["std", "dep:libc", "dep:bytes"]
 
 
 [dependencies]
@@ -26,6 +31,15 @@ spin = { version = "0.9", default-features = false, features = ["mutex", "spin_m
 # design done by people who have been at it for years, it is what `forte` uses,
 # and with default features off it links no `std` and pulls in nothing.
 async-task = { version = "4.7", default-features = false }
+# The platform, for the reactor only. A crate wrapping libc is still a crate
+# depending on an operating system; what matters is that no `no_std` build
+# reaches it, which the optional dependency and the `reactor` feature enforce.
+# Same version the house uses in ekostd.
+libc = { version = "^0.2.189", default-features = false, optional = true }
+# For the reactor's zero-copy receive: reading into a `BytesMut`'s
+# uninitialised tail is what keeps a socket from copying every byte it
+# receives. `no_std`-capable itself, and gated behind `reactor` regardless.
+bytes = { version = "^1", default-features = false, optional = true }
 # The file traits `io` builds on. They belong to no runtime and link no `std`
 # with their own feature off, which is why the abstraction can exist here at
 # all rather than in whatever crate happens to own the storage engine.
