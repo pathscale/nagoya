@@ -95,6 +95,10 @@ name = "counter_floor"
 required-features = ["std"]
 
 [[example]]
+name = "worker_scaling"
+required-features = ["std"]
+
+[[example]]
 name = "three_pools"
 required-features = ["std"]
 
