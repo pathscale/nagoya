@@ -26,47 +26,52 @@
 //! cargo run --release --example worker_scaling
 //! ```
 //!
-//! # What it found
+//! # What it found, and why the first reading of it was wrong
 //!
-//! Yes, and the pool is where it happens. Peak is four workers and the
-//! default, one per core, is roughly a third slower than that:
+//! On first run this looked like a clean reproduction of nago-wss's result:
+//! peak at four workers, the default sixteen a third slower, and a `sample`
+//! profile putting seventy per cent of a sixteen worker pool in `__ulock_wait`
+//! against fourteen per cent at four. That is the table this comment used to
+//! carry, and it does not survive repetition.
 //!
-//! ```text
-//!  workers       bounces/s
-//!        1     4.7-6.3M
-//!        2     6.0-8.9M
-//!        4     9.4-11.0M
-//!        8     7.6-8.6M
-//!       12     6.7-7.8M
-//!       16     6.6-6.8M
-//! ```
-//!
-//! `WORKER_SCALING_PIN=<n>` holds one setting so a sampling profiler has a
-//! steady target. `sample` on both, counting stacks under `Pool::run`:
+//! Three runs of this probe at sixteen workers, unchanged code:
 //!
 //! ```text
-//!  workers   Pool::run   __ulock_wait   parked   ready_or_register   steal
-//!        4       25440           3450      14%               10079       7
-//!       16       89292          62382      70%               12619    1115
+//!   run 1   6.6M     run 2   9.4M     run 3  10.9M
 //! ```
 //!
-//! So it is not the injector: `SegQueue` and `submit_job` are a rounding error
-//! at both sizes, which is what the obvious guess would have been given that
-//! every spawn goes through one queue. It is park and unpark. Twelve extra
-//! workers raise the useful work by a quarter and spend seventy per cent of
-//! their time asleep in a futex, with stealing up a hundred and sixtyfold as
-//! they scan for work that is not there.
+//! A sixty five per cent spread, which is wider than every difference the
+//! sweep is trying to measure. Run 2 has sixteen workers *beating* four. The
+//! retry budget sweep below is worse: the default (4, 128) came first in one
+//! run at 9.3M and (0, 0) came last at 8.0M, and on the next run (0, 0) came
+//! first at 10.1M and the default dropped to 7.0M. Those are opposite
+//! conclusions from the same binary.
 //!
-//! That is a scheduler question rather than a tuning one, and nothing here
-//! changes a default on the strength of it: what a fix looks like depends on
-//! whether the answer is fewer workers, a sleep that backs off, or a steal
-//! that gives up sooner.
+//! So this probe does not resolve what it was built to resolve, and the
+//! profile above rested on a single `sample` of a quantity this variable.
+//! Neither is evidence. What does reproduce is the measurement that started
+//! this, in nago-wss, where four consecutive runs put two to four workers at
+//! 286-343k messages a second and the default sixteen at 129-139k, monotonic
+//! above four every time. The effect is real on that workload; this is simply
+//! not the instrument that isolates it.
+//!
+//! Kept rather than deleted because the negative result is worth having: a
+//! `Notify` ping-pong is not a usable proxy for the socket workload, and the
+//! next attempt should either amortise far harder or measure the pool through
+//! the thing that actually shows the effect.
+//!
+//! One thing the sweep did settle: the spin-before-park this was going to add
+//! already exists. `Tuning::locality` is nagoya's default and it already
+//! spins four rounds of 128 hints before parking, so there was no missing
+//! backoff to write, and widening that budget over a 256x range moves nothing
+//! outside noise.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nagoya::runtime::Runtime;
 use nagoya::sync::Notify;
+use st3::fanout::Tuning;
 
 /// Concurrent pairs. Eight matches the connection count nago-wss found worst.
 const PAIRS: usize = 8;
@@ -76,6 +81,10 @@ const ROUNDS: usize = 2_000;
 const SAMPLES: usize = 3;
 /// Worker counts to sweep. Sixteen is `available_parallelism` on this machine.
 const WORKERS: [usize; 6] = [1, 2, 4, 8, 12, 16];
+
+/// The worker count the retry-budget sweep runs at: the default, which is the
+/// setting the profile found spending seventy per cent of its time parked.
+const DEFAULT_WORKERS: usize = 16;
 
 /// Run one setting in a loop instead of sweeping, so a sampling profiler has
 /// a steady target. `WORKER_SCALING_PIN=16` pins the worker count.
@@ -87,6 +96,29 @@ fn pinned() -> Option<usize> {
 
 fn round(workers: usize) -> Duration {
     round_on(&Arc::new(Runtime::new(workers)))
+}
+
+/// Retry budgets to sweep: empty search rounds before a worker announces
+/// sleep, and spin hints between those rounds. The default is four and 128.
+const BUDGETS: [(u32, u32); 6] = [
+    (0, 0),
+    (4, 128),
+    (8, 128),
+    (16, 256),
+    (64, 512),
+    (256, 1024),
+];
+
+/// The same load at a fixed worker count, varying only the retry budget.
+///
+/// `Tuning::locality` already spins before parking and nagoya already uses it,
+/// so the question the profile raises is not whether to add a backoff but
+/// whether the default one is long enough. This answers that directly.
+fn budget_round(workers: usize, rounds: u32, spins: u32) -> Duration {
+    let tuning = Tuning::locality()
+        .with_rounds_before_park(rounds)
+        .with_backoff_spins(spins);
+    round_on(&Arc::new(Runtime::with_tuning(workers, tuning, "sweep")))
 }
 
 /// One round on an existing runtime.
@@ -162,6 +194,17 @@ fn main() {
         samples.sort_unstable();
         let rate = total as f64 / samples[0].as_secs_f64();
         println!("  {workers:>8}  {rate:>12.0} b/s");
+    }
+
+    println!("\nretry budget at {DEFAULT_WORKERS} workers, best of {SAMPLES}\n");
+    println!("  {:>8}  {:>7}  {:>16}", "rounds", "spins", "bounces/s");
+    for (rounds, spins) in BUDGETS {
+        let mut samples: Vec<Duration> = (0..SAMPLES)
+            .map(|_| budget_round(DEFAULT_WORKERS, rounds, spins))
+            .collect();
+        samples.sort_unstable();
+        let rate = total as f64 / samples[0].as_secs_f64();
+        println!("  {rounds:>8}  {spins:>7}  {rate:>12.0} b/s");
     }
     println!();
 }
