@@ -12,10 +12,15 @@ Typst is the canonical documentation source. Run `sh scripts/build-guide.sh`
 to create both PDFs in `docs/`; Rust examples are extracted and checked by
 `cargo test --doc`.
 
-Version 0.1.2 adds `Executor::submit` and `block_on_with_host`. It accepts
-ps-st3 through `^0.6`; this release was validated with 0.6.2. Use `cargo update
--p ps-st3` in an existing checkout to pick up the scheduler fixes. Until Nagoya
-0.1.2 is published, use the release checkout with one consistent Cargo patch graph.
+Version 0.1.3 adds `io::Stream`, a byte stream trait for consumers whose
+futures must not be `Send` and whose errors have to be able to say "not ready
+yet". It sits beside `io::Read` and `io::Write`, which describe a file and
+cannot express either. Nothing gains an I/O driver: the trait has no
+implementations here.
+
+Version 0.1.2 added `Executor::submit` and `block_on_with_host`. It accepts
+ps-st3 through `^0.6`; that release was validated with 0.6.2. Use `cargo update
+-p ps-st3` in an existing checkout to pick up the scheduler fixes.
 
 `block_on` uses a spinning fallback without std. Use `block_on_with_host`
 with a dedicated host wait slot when the caller should block. See the guide
