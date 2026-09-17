@@ -201,7 +201,7 @@ fn sysctl_usize(name: &core::ffi::CStr) -> Option<usize> {
             0,
         )
     };
-    (status == 0 && value > 0).then(|| value as usize)
+    (status == 0 && value > 0).then_some(value as usize)
 }
 
 #[cfg(target_vendor = "apple")]
