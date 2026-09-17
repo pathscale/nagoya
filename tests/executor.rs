@@ -248,14 +248,28 @@ fn dropping_a_loop_cancels_it() {
 }
 
 /// A yielding task finishes, and lets others run while it does.
+///
+/// One worker, so the second task can only run if the first genuinely hands
+/// the worker back. With two there is a spare thread and the test passes
+/// whether `yield_now` releases anything or not.
+///
+/// It yields until it observes the other task rather than a fixed number of
+/// times. A fixed count is a bet that the other worker gets scheduled inside
+/// it, which held on a developer machine and did not on a two core runner:
+/// the release that should have published 0.1.3 failed here. The bound that
+/// remains is a failure rather than a hang, so a `yield_now` that stopped
+/// yielding ends this test instead of wedging it.
 #[test]
 fn a_task_can_yield_its_worker() {
-    let running = Running::new(2);
+    let running = Running::new(1);
     let order = Arc::new(AtomicUsize::new(0));
-    let (first, second) = (order.clone(), order.clone());
+    let (first, second, watched) = (order.clone(), order.clone(), order.clone());
 
     let long = running.executor.spawn(async move {
-        for _ in 0..8 {
+        for _ in 0..100_000 {
+            if watched.load(Ordering::Acquire) > 0 {
+                break;
+            }
             nagoya::yield_now().await;
         }
         first.fetch_add(1, Ordering::AcqRel)
