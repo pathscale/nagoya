@@ -158,7 +158,11 @@ impl Runtime {
 fn shared_threads() -> usize {
     supported_default_threads(
         performance_cores()
-            .or_else(|| std::thread::available_parallelism().ok().map(NonZeroUsize::get))
+            .or_else(|| {
+                std::thread::available_parallelism()
+                    .ok()
+                    .map(NonZeroUsize::get)
+            })
             .unwrap_or(2),
     )
 }
@@ -286,8 +290,7 @@ mod tests {
     /// where the fast class is the whole machine and the two are equal.
     #[test]
     fn the_default_pool_prefers_the_fast_cores() {
-        let total = std::thread::available_parallelism()
-            .map_or(2, core::num::NonZeroUsize::get);
+        let total = std::thread::available_parallelism().map_or(2, core::num::NonZeroUsize::get);
         let chosen = shared_threads();
 
         assert!(chosen >= 1, "a pool needs a worker");
