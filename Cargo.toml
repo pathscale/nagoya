@@ -98,6 +98,18 @@ required-features = ["std"]
 name = "reactor_net"
 required-features = ["reactor"]
 
+# The reactor is not a default feature, so a test that names it has to say so.
+# Without this, `cargo test` with the feature off still tries to build these
+# and fails on the import rather than skipping them, which is how the publish
+# job broke: it runs `cargo test --release` with no `--all-features`.
+[[test]]
+name = "reactor_local"
+required-features = ["reactor"]
+
+[[test]]
+name = "reactor_driver"
+required-features = ["reactor"]
+
 [[example]]
 name = "core_detect"
 required-features = ["std"]
