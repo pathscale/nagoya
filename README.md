@@ -12,11 +12,18 @@ Typst is the canonical documentation source. Run `sh scripts/build-guide.sh`
 to create both PDFs in `docs/`; Rust examples are extracted and checked by
 `cargo test --doc`.
 
-Version 0.1.3 adds `io::Stream`, a byte stream trait for consumers whose
+Version 0.1.4 adds `reactor`, an off-by-default readiness driver, and with it
+the first implementation of `io::Stream`. It is epoll or kqueue behind a
+feature that implies `std`, on the same terms as `runtime`: a `no_std` build
+does not compile it and has no sockets, and a default build does not acquire a
+reactor thread by depending on this crate. Nothing here polls a set of sources
+to ask which is ready; a descriptor owns its waker slot and readiness wakes the
+task parked on it.
+
+Version 0.1.3 added `io::Stream`, a byte stream trait for consumers whose
 futures must not be `Send` and whose errors have to be able to say "not ready
 yet". It sits beside `io::Read` and `io::Write`, which describe a file and
-cannot express either. Nothing gains an I/O driver: the trait has no
-implementations here.
+cannot express either.
 
 Version 0.1.2 added `Executor::submit` and `block_on_with_host`. It accepts
 ps-st3 through `^0.6`; that release was validated with 0.6.2. Use `cargo update
