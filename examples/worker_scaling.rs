@@ -128,7 +128,6 @@ fn budget_round(workers: usize, rounds: u32, spins: u32) -> Duration {
 /// process out of threads, which is how the first attempt at profiling this
 /// died rather than anything about the pool.
 fn round_on(runtime: &Arc<Runtime>) -> Duration {
-
     let start = Instant::now();
     let mut handles = Vec::with_capacity(PAIRS);
     for _ in 0..PAIRS {

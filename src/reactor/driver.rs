@@ -619,6 +619,8 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
         // and two and a half times slower at ten thousand. The index is
         // already unique per registration, so it distributes without needing
         // a hash.
+        // `None` when no shared pool is running, in which case there is
+        // nothing to route onto and starting one here would be wrong.
         #[cfg(feature = "std")]
         let _routed = crate::runtime::route_reactor_wake(index);
         waker.wake();

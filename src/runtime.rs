@@ -36,6 +36,14 @@ use crate::{Executor, JoinHandle};
 /// under a running sweep is worse than letting them run. A caller that wants
 /// them stopped stops the work, not the runtime.
 pub struct Runtime {
+    /// The parking host, kept so its spurious-wake count can be read back.
+    ///
+    /// A worker that parks and wakes with no work to show for it is pure
+    /// overhead, and this is the one number that says how often that happens.
+    /// It is exact rather than sampled, which matters here: a profiler cannot
+    /// see this workload at all, because the echo is short enough that every
+    /// worker is parked in almost every wall-clock sample at any pool size.
+    parking: Arc<StdHost>,
     executor: Executor,
 }
 
@@ -71,6 +79,7 @@ impl Runtime {
             "worker count exceeds the pool bitmap capacity"
         );
         let host = Arc::new(StdHost::new(workers));
+        let parking = host.clone();
         let pool = Pool::with_tuning(workers, 1024, host, tuning);
         for id in 0..workers {
             let pool = pool.clone();
@@ -87,6 +96,7 @@ impl Runtime {
                 .expect("a runtime thread");
         }
         Self {
+            parking,
             executor: Executor::new(pool),
         }
     }
@@ -98,6 +108,16 @@ impl Runtime {
         F::Output: Send + 'static,
     {
         self.executor.spawn(future)
+    }
+
+    /// Parks that woke with no signal to consume, since this runtime started.
+    ///
+    /// Spurious in the pool's sense: the worker slept, something woke it, and
+    /// there was nothing for it. Rising much faster than the work does is what
+    /// an oversized pool looks like from the inside.
+    #[must_use]
+    pub fn spurious_wakes(&self) -> u64 {
+        self.parking.spurious()
     }
 
     /// The executor underneath, for a caller that wants to hand it on.
@@ -152,18 +172,33 @@ fn supported_default_threads(available: usize) -> usize {
 /// Spreads descriptors over the pool by index while keeping each one on a
 /// stable worker, so a task finds its own cache lines without every
 /// connection sharing a queue.
-pub(crate) fn route_reactor_wake(index: u64) -> crate::task::RouteGuard {
-    let pool = background().pool();
+pub(crate) fn route_reactor_wake(index: u64) -> Option<crate::task::RouteGuard> {
+    // Only route onto a pool that is already running. Asking `background()`
+    // for its width *starts* it, one thread per core, and the reactor is not
+    // a caller that should be making that decision: a consumer with its own
+    // `Runtime` was silently getting a second pool it never asked for, and
+    // the modulus came from that pool's width rather than its own, so wakes
+    // were routed to worker indices its runtime did not have.
+    //
+    // With no shared pool running there is nothing to route onto and the wake
+    // goes wherever the waker sends it, which is the right answer rather than
+    // a fallback.
+    let pool = SHARED.get()?.pool();
     let worker = (index as usize) % pool.workers().max(1);
-    crate::task::route_wakes(worker)
+    Some(crate::task::route_wakes(worker))
 }
 
 /// A caller that wants its own threads, its own count, or a pool it can stop
 /// still builds a [`Runtime`] directly. This is the convenience, not the API.
 pub fn background() -> &'static Runtime {
-    static SHARED: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
     SHARED.get_or_init(|| Runtime::new(shared_threads()))
 }
+
+/// The shared pool, once something has asked for it.
+///
+/// Named rather than function-local so that [`route_reactor_wake`] can ask
+/// whether it exists without bringing it into existence.
+static SHARED: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 mod tests {
