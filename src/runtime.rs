@@ -25,6 +25,7 @@
 use alloc::sync::Arc;
 use core::future::Future;
 
+use core::num::NonZeroUsize;
 use st3::fanout::{Pool, StdHost, Tuning};
 
 use crate::{Executor, JoinHandle};
@@ -138,11 +139,76 @@ impl Runtime {
 
 /// Threads for the shared pool.
 ///
-/// Use the machine's parallelism up to the pool's supported bitmap capacity.
+/// The machine's parallelism, except that on a machine with more than one
+/// class of core it is the fast class's count rather than the total.
+///
+/// # Why not `available_parallelism`
+///
+/// On a heterogeneous CPU that number counts every core the scheduler will
+/// hand out, and those are not interchangeable. This laptop reports sixteen:
+/// twelve performance cores and four efficiency cores that run at a fraction
+/// of the speed. A pool sized at sixteen therefore puts a quarter of its
+/// workers somewhere a task takes several times longer, and work-stealing
+/// does not rescue a task already running on a slow core, it only moves what
+/// has not started.
+///
+/// So prefer the fast class where the platform names one. It is a floor on
+/// nothing: a caller who wants every core still asks for it by building a
+/// `Runtime` with the count it wants.
 fn shared_threads() -> usize {
     supported_default_threads(
-        std::thread::available_parallelism().map_or(2, core::num::NonZeroUsize::get),
+        performance_cores()
+            .or_else(|| std::thread::available_parallelism().ok().map(NonZeroUsize::get))
+            .unwrap_or(2),
     )
+}
+
+/// Cores in the fastest class, where the platform distinguishes classes.
+///
+/// `None` when it does not, or when the answer is not usable, in which case
+/// the caller falls back to total parallelism.
+#[cfg(target_vendor = "apple")]
+fn performance_cores() -> Option<usize> {
+    // `hw.perflevel0` is the fast class on Apple silicon, `perflevel1` the
+    // efficiency one. Absent on Intel Macs, which are homogeneous, and the
+    // failure there is the right one: fall back to the total.
+    sysctl_usize(c"hw.perflevel0.logicalcpu").filter(|count| *count > 0)
+}
+
+/// The same query, on a platform that does not classify cores.
+#[cfg(not(target_vendor = "apple"))]
+fn performance_cores() -> Option<usize> {
+    None
+}
+
+/// One integer `sysctl`, by name.
+#[cfg(target_vendor = "apple")]
+fn sysctl_usize(name: &core::ffi::CStr) -> Option<usize> {
+    let mut value: core::ffi::c_int = 0;
+    let mut size = core::mem::size_of::<core::ffi::c_int>();
+    // SAFETY: `name` is a nul-terminated C string, and the out pointer and
+    // its length describe the same `c_int` for the duration of the call.
+    let status = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            core::ptr::from_mut(&mut value).cast(),
+            &mut size,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && value > 0).then(|| value as usize)
+}
+
+#[cfg(target_vendor = "apple")]
+extern "C" {
+    fn sysctlbyname(
+        name: *const core::ffi::c_char,
+        oldp: *mut core::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut core::ffi::c_void,
+        newlen: usize,
+    ) -> core::ffi::c_int;
 }
 
 fn supported_default_threads(available: usize) -> usize {
@@ -211,6 +277,32 @@ mod tests {
         assert_eq!(supported_default_threads(0), 1);
         assert_eq!(supported_default_threads(2), 2);
         assert_eq!(supported_default_threads(usize::MAX), usize::BITS as usize);
+    }
+
+    /// The default pool does not size itself onto the slow cores.
+    ///
+    /// Only asserts the relationship, not a count: the numbers are this
+    /// machine's, and the property has to hold on a homogeneous one too,
+    /// where the fast class is the whole machine and the two are equal.
+    #[test]
+    fn the_default_pool_prefers_the_fast_cores() {
+        let total = std::thread::available_parallelism()
+            .map_or(2, core::num::NonZeroUsize::get);
+        let chosen = shared_threads();
+
+        assert!(chosen >= 1, "a pool needs a worker");
+        assert!(
+            chosen <= supported_default_threads(total),
+            "chose {chosen} workers, more than the {total} cores the machine has"
+        );
+
+        if let Some(fast) = performance_cores() {
+            assert_eq!(
+                chosen,
+                supported_default_threads(fast),
+                "a machine reporting {fast} fast cores of {total} should size to the fast ones"
+            );
+        }
     }
 
     #[test]
