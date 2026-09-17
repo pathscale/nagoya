@@ -1,6 +1,6 @@
 [package]
 name = "nagoya"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -93,6 +93,10 @@ required-features = ["std"]
 [[example]]
 name = "counter_floor"
 required-features = ["std"]
+
+[[test]]
+name = "reactor_net"
+required-features = ["reactor"]
 
 [[example]]
 name = "core_detect"
