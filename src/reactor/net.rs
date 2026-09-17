@@ -121,6 +121,9 @@ impl TcpStream {
         let spare_ptr = spare.as_mut_ptr();
         let filled = buffer.len();
 
+        if !self.registration.take_readable_or_park(cx.waker()) {
+            return Poll::Pending;
+        }
         loop {
             // SAFETY: `spare_ptr` points at `spare_len` bytes of allocated
             // capacity owned by `buffer`, which outlives this call, and `recv`
@@ -133,6 +136,9 @@ impl TcpStream {
                     // SAFETY: `recv` reported writing `read` bytes into the
                     // spare capacity, so that many past `filled` are live.
                     unsafe { buffer.set_len(filled + read) };
+                    if read == spare_len {
+                        self.registration.mark_readable();
+                    }
                     return Poll::Ready(Ok(read));
                 }
                 Err(error) if error.would_block() => {
@@ -147,12 +153,25 @@ impl TcpStream {
 
     /// Read into `buffer`, parking `cx`'s waker if the socket would block.
     pub fn poll_read(&mut self, cx: &mut Context<'_>, buffer: &mut [u8]) -> Poll<Result<usize>> {
+        // Nothing has arrived since the last read drained this socket, so the
+        // `recv` below would return `EWOULDBLOCK`. The waker is parked by the
+        // same call that answered, so an edge cannot slip in between.
+        if !self.registration.take_readable_or_park(cx.waker()) {
+            return Poll::Pending;
+        }
         loop {
             // SAFETY: `buffer` is a live initialised slice, so writing up to
             // its length into it is in bounds.
             let result = unsafe { self.inner.recv(buffer.as_mut_ptr(), buffer.len()) };
             match result {
-                Ok(n) => return Poll::Ready(Ok(n)),
+                Ok(n) => {
+                    // A read that filled the buffer has not proved the socket
+                    // empty, so readiness is put back rather than consumed.
+                    if n == buffer.len() {
+                        self.registration.mark_readable();
+                    }
+                    return Poll::Ready(Ok(n));
+                }
                 Err(error) if error.would_block() => {
                     // Drained: now it is safe to wait for the next edge.
                     self.registration.poll_readable(cx.waker());
