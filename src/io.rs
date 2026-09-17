@@ -225,6 +225,106 @@ impl Error {
     }
 }
 
+/// A byte stream: somewhere to read bytes from and write them to.
+///
+/// # Why this sits beside [`Read`] and [`Write`] rather than reusing them
+///
+/// Those describe a file, and two of their properties are wrong for a socket.
+///
+/// Their futures are `Send`, because a file handed to a worker pool has to
+/// cross threads. A socket driven by a reactor often must not be: a consumer
+/// holding non-`Send` state across an await needs the future to stay on one
+/// thread, and requiring `Send` forbids that outright. That is not a niche
+/// case, it is how a `spawn_local` dispatch model works.
+///
+/// And [`ErrorKind`] has nowhere to say "not ready yet". For a file that is
+/// not a state that exists; for a non-blocking socket it is the ordinary one,
+/// and it is the signal a reactor turns on. [`StreamError`] carries the
+/// platform's own code, so it can.
+///
+/// # Why this belongs here rather than in whatever crate needs it
+///
+/// Because two crates always need it and neither should depend on the other.
+/// A TLS session implements this so a protocol can run over it; a protocol
+/// consumes it so it need not care whether TLS is underneath. Whichever of
+/// them owns the definition, the other depends on it for a reason unrelated
+/// to what it does, and that is the shape of mistake `tokio-rustls` is stuck
+/// with: `AsyncRead` lives in `tokio`, so the glue drags the whole runtime
+/// along.
+///
+/// This crate is already the common dependency and already has no I/O driver
+/// of its own, which makes it the right place for a trait that describes one
+/// without providing it.
+#[allow(async_fn_in_trait)]
+pub trait Stream {
+    /// Read into `buffer`, returning how many bytes arrived.
+    ///
+    /// A return of zero means the end of the stream, and is not an error.
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, StreamError>;
+
+    /// Write the whole of `buffer`.
+    ///
+    /// All of it, rather than reporting a count: a partial write is a property
+    /// of the transport rather than something a protocol wants to reason
+    /// about, and every caller would otherwise write the same loop.
+    async fn write_all(&mut self, buffer: &[u8]) -> Result<(), StreamError>;
+}
+
+/// What went wrong on a [`Stream`].
+///
+/// The platform's own code rather than a mapped enum. A socket consumer asks
+/// questions about specific numbers that a coarse set cannot answer, and the
+/// two it always asks have methods here so the common path is not a
+/// comparison against a literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamError(pub i32);
+
+impl StreamError {
+    /// `EAGAIN` on this target.
+    ///
+    /// Spelled out per platform because this crate links no libc to ask, and
+    /// the number differs: 11 on Linux, 35 on the BSDs and macOS. A consumer
+    /// that does have libc should build the value from its own constant; this
+    /// exists for one that does not.
+    pub const WOULD_BLOCK: Self = Self(if cfg!(target_os = "linux") { 11 } else { 35 });
+
+    /// `EINTR`, which is 4 on every target this supports.
+    pub const INTERRUPTED: Self = Self(4);
+
+    /// Whether this means "nothing to do yet" rather than a failure.
+    ///
+    /// The one question a reactor asks of every read and every write. Both
+    /// numberings are checked rather than only this platform's: POSIX allows
+    /// `EAGAIN` and `EWOULDBLOCK` to differ and does not say which a given
+    /// call returns.
+    #[must_use]
+    pub const fn would_block(self) -> bool {
+        self.0 == 11 || self.0 == 35
+    }
+
+    /// Whether a signal cut the call short and it can be retried as-is.
+    #[must_use]
+    pub const fn interrupted(self) -> bool {
+        self.0 == Self::INTERRUPTED.0
+    }
+}
+
+impl core::fmt::Display for StreamError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "errno {}", self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for StreamError {}
+
+#[cfg(feature = "std")]
+impl From<StreamError> for std::io::Error {
+    fn from(value: StreamError) -> Self {
+        Self::from_raw_os_error(value.0)
+    }
+}
+
 /// The failures a file operation can report.
 ///
 /// Coarse on purpose. A caller either retries, gives up, or creates what was
@@ -531,6 +631,64 @@ mod host {
 /// `std` would stop compiling here.
 #[cfg(test)]
 mod portable {
+    use super::{Stream, StreamError};
+
+    /// A stream over two buffers, to show the trait is implementable with no
+    /// platform underneath it and no `Send` bound to satisfy.
+    struct Pair<'a> {
+        incoming: &'a [u8],
+        outgoing: alloc::vec::Vec<u8>,
+    }
+
+    impl Stream for Pair<'_> {
+        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, StreamError> {
+            let take = self.incoming.len().min(buffer.len());
+            buffer[..take].copy_from_slice(&self.incoming[..take]);
+            self.incoming = &self.incoming[take..];
+            Ok(take)
+        }
+
+        async fn write_all(&mut self, buffer: &[u8]) -> Result<(), StreamError> {
+            self.outgoing.extend_from_slice(buffer);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stream_needs_no_platform() {
+        let mut pair = Pair {
+            incoming: b"hello",
+            outgoing: alloc::vec::Vec::new(),
+        };
+        let read = crate::block_on(async {
+            let mut buffer = [0u8; 5];
+            let read = pair.read(&mut buffer).await.expect("read");
+            pair.write_all(&buffer[..read]).await.expect("write");
+            read
+        });
+        assert_eq!(read, 5);
+        assert_eq!(pair.outgoing, b"hello");
+
+        // The end of a stream is zero rather than an error.
+        let rest = crate::block_on(async {
+            let mut buffer = [0u8; 4];
+            pair.read(&mut buffer).await.expect("read")
+        });
+        assert_eq!(rest, 0);
+    }
+
+    #[test]
+    fn would_block_is_recognised_from_either_numbering() {
+        // POSIX allows EAGAIN and EWOULDBLOCK to differ and does not say which
+        // a call returns, so both are accepted.
+        assert!(StreamError(11).would_block());
+        assert!(StreamError(35).would_block());
+        assert!(StreamError::WOULD_BLOCK.would_block());
+        assert!(!StreamError(5).would_block());
+        assert!(StreamError::INTERRUPTED.interrupted());
+        assert!(!StreamError::WOULD_BLOCK.interrupted());
+    }
+
     use super::{Error, ErrorKind, File, Read, Seek, SeekFrom, Write};
     use core::future::Future;
 
