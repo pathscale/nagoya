@@ -39,9 +39,16 @@
 //! writability. [`TcpStream`] and [`TcpListener`] are the ordinary sockets
 //! built on that, and [`TcpStream`] implements [`crate::io::Stream`], which
 //! this crate declared without providing an implementation.
+//!
+//! [`block_on`] is the other arrangement: no reactor thread at all, one thread
+//! that waits for readiness and then polls the future itself. The handoff a
+//! reactor thread costs is real, about ten microseconds a message, and a
+//! server built as a thread per core with its own poller and its own
+//! connections never needs to pay it.
 
 pub mod driver;
 pub mod error;
+pub mod local;
 pub mod net;
 pub mod poller;
 pub mod socket;
@@ -50,6 +57,7 @@ mod testing;
 
 pub use driver::{Handle, Reactor, Registration};
 pub use error::{Errno, Result};
+pub use local::{block_on, block_on_with};
 pub use net::{TcpListener, TcpStream};
 pub use poller::{Event, Interest, Poller};
 pub use socket::Addr;
