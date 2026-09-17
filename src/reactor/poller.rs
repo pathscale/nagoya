@@ -109,6 +109,8 @@ impl Poller {
     /// normal: it means the timeout expired, or the wait was interrupted by a
     /// signal, or the poller was woken by [`Self::wake`].
     pub fn wait(&self, out: &mut Vec<Event>, timeout_ns: Option<u64>) -> Result<()> {
+        #[cfg(feature = "syscall-counters")]
+        crate::reactor::counters::WAIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.0.wait(out, timeout_ns)
     }
 
