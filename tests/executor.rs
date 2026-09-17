@@ -392,37 +392,42 @@ fn host_block_on_retains_a_wake_delivered_during_poll() {
 
 #[test]
 fn host_block_on_resumes_after_a_delayed_external_wake() {
-    use std::sync::mpsc;
-    let (send_waker, receive_waker) = mpsc::channel();
-    let (send_result, receive_result) = mpsc::channel();
+    // The waker is shared, not sent: an Arc<Mutex<Option<Waker>>> the future
+    // fills in and this thread takes out. The result comes back the way a
+    // thread's result should, as the value join gives you, rather than through
+    // a second channel pointing the other way.
+    let parked: Arc<std::sync::Mutex<Option<core::task::Waker>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let ready = Arc::new(core::sync::atomic::AtomicBool::new(false));
+
     let input = ready.clone();
+    let registry = parked.clone();
     let caller = std::thread::spawn(move || {
         let host = Arc::new(st3::fanout::AtomicHost::new(1, || 0));
         let future = core::future::poll_fn(move |cx| {
             if input.load(Ordering::Acquire) {
                 return Poll::Ready(42);
             }
-            send_waker.send(cx.waker().clone()).unwrap();
+            *registry.lock().expect("waker registry poisoned") = Some(cx.waker().clone());
             Poll::Pending
         });
-        send_result
-            .send(nagoya::block_on_with_host(future, host, 0))
-            .unwrap();
+        nagoya::block_on_with_host(future, host, 0)
     });
-    let waker = receive_waker
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+
+    // The future parks before it can be woken, and the only way to know it has
+    // is to see the waker it left behind.
+    let waker = loop {
+        if let Some(waker) = parked.lock().expect("waker registry poisoned").take() {
+            break waker;
+        }
+        std::thread::yield_now();
+    };
+
     std::thread::sleep(std::time::Duration::from_millis(10));
     ready.store(true, Ordering::Release);
     waker.wake_by_ref();
-    assert_eq!(
-        receive_result
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap(),
-        42
-    );
-    caller.join().unwrap();
+
+    assert_eq!(caller.join().unwrap(), 42);
     // A retained waker can safely signal after completion; it owns its host.
     waker.wake();
 }

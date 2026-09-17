@@ -22,6 +22,11 @@ jobs:
   hosted:
     name: Hosted tests and guide examples
     runs-on: ubicloud-standard-2
+    # a_closed_peer_reads_zero waited forever on a wake that never came and
+    # held this job until it was killed. That test now bounds itself; this
+    # bounds everything else. The suite runs in about nine seconds, so two
+    # minutes is headroom rather than patience.
+    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
