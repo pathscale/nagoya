@@ -260,6 +260,21 @@ impl Drop for Registration {
 pub struct Reactor {
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Scratch for [`Self::poll_once`], so the local arrangement allocates per
+    /// reactor rather than per wakeup.
+    ///
+    /// The threaded loop keeps the same two buffers on its stack and reuses
+    /// them across wakeups, for the reason its comment gives: this runs on
+    /// every readiness event, so allocating here is allocating once per
+    /// message. `poll_once` takes `&self` and had nowhere to keep them, so it
+    /// allocated both every call and the local reactor paid what the threaded
+    /// one was careful not to.
+    ///
+    /// A mutex rather than a cell because `Reactor` is `Sync`, and it is
+    /// uncontended by construction: only the thread calling `poll_once`
+    /// touches it, and `poll_once` is the local arrangement, which is one
+    /// thread by definition.
+    scratch: Mutex<(Vec<Event>, Vec<Waker>)>,
 }
 
 impl Reactor {
@@ -279,6 +294,8 @@ impl Reactor {
                 next_deadline: AtomicU64::new(NO_DEADLINE),
             }),
             thread: None,
+            // Same capacity the threaded loop reserves.
+            scratch: Mutex::new((Vec::with_capacity(64), Vec::with_capacity(64))),
         })
     }
 
@@ -288,10 +305,12 @@ impl Reactor {
     /// woken any task whose descriptor became ready, so the caller can poll.
     pub fn poll_once(&self) -> Result<()> {
         let timeout = service_timers(&self.shared);
-        let mut events = Vec::new();
-        self.shared.poller.wait(&mut events, timeout)?;
-        let mut pending = Vec::new();
-        dispatch(&self.shared, &events, &mut pending);
+        let mut scratch = self.scratch.lock().expect("reactor scratch poisoned");
+        let (events, pending) = &mut *scratch;
+
+        events.clear();
+        self.shared.poller.wait(events, timeout)?;
+        dispatch(&self.shared, events, pending);
         Ok(())
     }
 
@@ -318,6 +337,9 @@ impl Reactor {
         Ok(Self {
             shared,
             thread: Some(thread),
+            // The threaded reactor keeps its scratch on the worker's stack and
+            // never calls `poll_once`, so this stays empty.
+            scratch: Mutex::new((Vec::new(), Vec::new())),
         })
     }
 
