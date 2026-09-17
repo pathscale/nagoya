@@ -147,6 +147,17 @@ fn supported_default_threads(available: usize) -> usize {
 /// a `--no-default-features` build cannot reach it and cannot silently acquire
 /// threads. That gate is exactly the one `tokio::spawn` did not have.
 ///
+/// Route one reactor wake to the worker its descriptor belongs to.
+///
+/// Spreads descriptors over the pool by index while keeping each one on a
+/// stable worker, so a task finds its own cache lines without every
+/// connection sharing a queue.
+pub(crate) fn route_reactor_wake(index: u64) -> crate::task::RouteGuard {
+    let pool = background().pool();
+    let worker = (index as usize) % pool.workers().max(1);
+    crate::task::route_wakes(worker)
+}
+
 /// A caller that wants its own threads, its own count, or a pool it can stop
 /// still builds a [`Runtime`] directly. This is the convenience, not the API.
 pub fn background() -> &'static Runtime {

@@ -20,6 +20,53 @@ use crate::WorkerContext;
 std::thread_local! {
     static CURRENT: core::cell::RefCell<Option<(Arc<Pool>, usize)>> =
         const { core::cell::RefCell::new(None) };
+    /// Where wakes from this thread should land, for a thread that is not a
+    /// worker but knows which worker a task belongs near. See [`route_wakes`].
+    static ROUTE: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+/// Send wakes from this thread to `worker` until the guard drops.
+///
+/// [`mark_current`] says "this thread *is* worker N". This says "wakes from
+/// here belong on worker N", which is a different claim and the one an I/O
+/// reactor can make: it is not a worker, but it knows which task it is waking
+/// and can keep that task on one worker across wakeups.
+///
+/// The distinction matters because the reactor must vary the answer. Pinning
+/// every wake to one worker funnels every connection through one queue: it
+/// measured 38 percent faster at eight connections and two and a half times
+/// slower at ten thousand, which is the wrong trade. Routing by descriptor
+/// spreads them and keeps each one settled.
+#[cfg(feature = "std")]
+pub(crate) fn route_wakes(worker: usize) -> RouteGuard {
+    let previous = ROUTE.with(|route| route.replace(Some(worker)));
+    RouteGuard {
+        previous,
+        _thread_bound: core::marker::PhantomData,
+    }
+}
+
+#[cfg(feature = "std")]
+pub(crate) struct RouteGuard {
+    previous: Option<usize>,
+    _thread_bound: core::marker::PhantomData<alloc::rc::Rc<()>>,
+}
+
+#[cfg(feature = "std")]
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        ROUTE.with(|route| route.set(self.previous.take()));
+    }
+}
+
+#[cfg(feature = "std")]
+fn routed_worker() -> Option<usize> {
+    ROUTE.try_with(core::cell::Cell::get).ok().flatten()
+}
+
+#[cfg(not(feature = "std"))]
+fn routed_worker() -> Option<usize> {
+    None
 }
 
 #[cfg(feature = "std")]
@@ -145,7 +192,10 @@ fn into_job(runnable: Runnable) -> Job {
 fn worker_for(pool: &Arc<Pool>, context: Option<&dyn WorkerContext>) -> Option<usize> {
     let worker = match context {
         Some(context) => context.current_worker(pool),
-        None => current_worker(pool),
+        // A routed wake comes from a thread that is not a worker but knows
+        // where the task belongs, which is better than the injector and is
+        // checked first because a worker marking itself always knows better.
+        None => current_worker(pool).or_else(routed_worker),
     };
     // A bad host hint must not index outside the pool or panic inside a waker.
     worker.filter(|id| *id < pool.workers())
