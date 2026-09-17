@@ -46,6 +46,8 @@
 //! server built as a thread per core with its own poller and its own
 //! connections never needs to pay it.
 
+#[cfg(feature = "syscall-counters")]
+pub mod counters;
 pub mod driver;
 pub mod error;
 pub mod local;

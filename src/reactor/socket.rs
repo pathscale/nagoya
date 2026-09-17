@@ -371,9 +371,17 @@ impl TcpSocket {
     ///
     /// `pointer` must be valid for writes of `len` bytes.
     pub unsafe fn recv(&self, pointer: *mut u8, len: usize) -> Result<usize> {
+        #[cfg(feature = "syscall-counters")]
+        crate::reactor::counters::RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let read = libc::recv(self.raw(), pointer.cast(), len, 0);
         if read < 0 {
-            Err(crate::reactor::error::last())
+            let error = crate::reactor::error::last();
+            #[cfg(feature = "syscall-counters")]
+            if error.would_block() {
+                crate::reactor::counters::RECV_WOULD_BLOCK
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Err(error)
         } else {
             Ok(read as usize)
         }
