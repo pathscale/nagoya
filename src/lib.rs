@@ -66,10 +66,12 @@ pub mod io;
 #[doc = include_str!(concat!(env!("OUT_DIR"), "/guide-examples.md"))]
 pub mod guide {}
 mod par;
-// Owns threads, so it needs `std`. See its module comment for why a crate built
-// not to own threads carries one that does.
+// Needs an operating system, so it needs `std`. See its module comment for why
+// a crate whose point is running without one carries a driver that cannot.
 #[cfg(feature = "reactor")]
 pub mod reactor;
+// Owns threads, so it needs `std`. See its module comment for why a crate built
+// not to own threads carries one that does.
 #[cfg(feature = "std")]
 pub mod runtime;
 // The four async primitives a consumer was otherwise taking from `tokio::sync`.
