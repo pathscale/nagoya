@@ -3,3 +3,4 @@
 /Cargo.lock
 *.pdf
 .DS_Store
+HANDOVER-*.md
