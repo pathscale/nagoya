@@ -270,10 +270,10 @@ pub struct Reactor {
     /// allocated both every call and the local reactor paid what the threaded
     /// one was careful not to.
     ///
-    /// A mutex rather than a cell because `Reactor` is `Sync`, and it is
-    /// uncontended by construction: only the thread calling `poll_once`
-    /// touches it, and `poll_once` is the local arrangement, which is one
-    /// thread by definition.
+    /// A mutex rather than a cell because `Reactor` is `Sync`. It is held only
+    /// to take the buffers out and to put them back, never across the wakers,
+    /// because a waker can re-enter `poll_once` on this thread and a
+    /// non reentrant lock held across that deadlocks against itself.
     scratch: Mutex<(Vec<Event>, Vec<Waker>)>,
 }
 
@@ -304,14 +304,66 @@ impl Reactor {
     /// For a reactor from [`Self::local`]. Returns after one wait, having
     /// woken any task whose descriptor became ready, so the caller can poll.
     pub fn poll_once(&self) -> Result<()> {
-        let timeout = service_timers(&self.shared);
-        let mut scratch = self.scratch.lock().expect("reactor scratch poisoned");
-        let (events, pending) = &mut *scratch;
+        self.poll_once_timeout(None)
+    }
+
+    /// Wait for readiness once, blocking for at most `cap` milliseconds.
+    ///
+    /// `None` defers to whatever the timer wheel says. `Some(0)` returns
+    /// immediately with whatever is already pending, which is what a waker
+    /// re-entering the reactor wants: it is asking whether anything else is
+    /// ready, not to sleep until something is.
+    pub fn poll_once_timeout(&self, cap: Option<u64>) -> Result<()> {
+        let timeout = match cap {
+            Some(0) => Some(0),
+            other => {
+                let due = service_timers(&self.shared);
+                match (other, due) {
+                    (Some(c), Some(d)) => Some(c.min(d)),
+                    (Some(c), None) => Some(c),
+                    (None, d) => d,
+                }
+            }
+        };
+
+        // Taken out of the reactor for the duration rather than borrowed under
+        // a held lock. `dispatch` invokes wakers, a waker may run arbitrary
+        // code, and arbitrary code on this thread may call `poll_once` again:
+        // holding a non reentrant lock across that is a deadlock against
+        // itself. `dispatch` already releases the slots lock before waking for
+        // exactly this reason and it applies here too.
+        //
+        // The take leaves empty vectors behind, so a reentrant call allocates
+        // rather than deadlocking, and the put back below restores the
+        // capacity for the common case where nothing reentered.
+        let (mut events, mut pending) = {
+            let mut scratch = self.scratch.lock().expect("reactor scratch poisoned");
+            (
+                core::mem::take(&mut scratch.0),
+                core::mem::take(&mut scratch.1),
+            )
+        };
 
         events.clear();
-        self.shared.poller.wait(events, timeout)?;
-        dispatch(&self.shared, events, pending);
-        Ok(())
+        let waited = self.shared.poller.wait(&mut events, timeout);
+        if waited.is_ok() {
+            dispatch(&self.shared, &events, &mut pending);
+        }
+
+        // Keep whichever buffers have the larger capacity: a reentrant call
+        // may have left its own here, and dropping the bigger pair would undo
+        // the point of keeping any.
+        {
+            let mut scratch = self.scratch.lock().expect("reactor scratch poisoned");
+            if events.capacity() >= scratch.0.capacity() {
+                scratch.0 = events;
+            }
+            if pending.capacity() >= scratch.1.capacity() {
+                scratch.1 = pending;
+            }
+        }
+
+        waited
     }
 
     /// Start the reactor on its own thread.
@@ -457,6 +509,71 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<Waker>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A waker that calls back into `poll_once` must not deadlock.
+    ///
+    /// `dispatch` invokes wakers with no reactor lock held, precisely because
+    /// a waker runs arbitrary code. `poll_once` holds scratch across
+    /// `dispatch`, so a waker that re-enters it locks a non reentrant mutex
+    /// this thread already owns and blocks forever.
+    ///
+    /// The whole test runs on a spawned thread so a regression fails the run
+    /// rather than hanging it: the deadlock is on one thread, so the main
+    /// thread stays alive to time it out and say what happened.
+    #[test]
+    fn a_waker_may_reenter_poll_once() {
+        use std::sync::mpsc;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reactor = Reactor::local().expect("reactor");
+            let handle = reactor.handle();
+            let (a, b) = crate::reactor::testing::socket_pair();
+
+            let registration = handle
+                .register(b.as_raw_fd(), Interest::READABLE)
+                .expect("register");
+
+            // The waker re-enters the reactor, which is what a future doing
+            // any further I/O from its own poll would cause.
+            let reactor = Arc::new(reactor);
+            let inner = Arc::clone(&reactor);
+            let waker = waker_fn(move || {
+                // One nested call is enough: if scratch is held across
+                // dispatch this never returns.
+                //
+                // `poll_once_timeout(0)` rather than `poll_once`: the nested
+                // call has no event waiting for it, and a blocking wait would
+                // park in the kernel forever for reasons that have nothing to
+                // do with the lock this test is about.
+                let _ = inner.poll_once_timeout(Some(0));
+            });
+            registration.poll_readable(&waker);
+
+            write_byte(&a);
+            reactor.poll_once().expect("poll");
+            done_tx.send(()).expect("signal");
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("poll_once deadlocked when a waker re-entered it");
+    }
+
+    /// A `Waker` from a closure, without pulling in a dependency for it.
+    fn waker_fn<F: Fn() + Send + Sync + 'static>(f: F) -> Waker {
+        struct Fun<F>(F);
+        impl<F: Fn() + Send + Sync + 'static> alloc::task::Wake for Fun<F> {
+            fn wake(self: Arc<Self>) {
+                (self.0)();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                (self.0)();
+            }
+        }
+        Waker::from(Arc::new(Fun(f)))
+    }
+
     use crate::reactor::testing::{socket_pair, write_byte};
     use std::os::fd::AsRawFd;
     use std::sync::mpsc;
