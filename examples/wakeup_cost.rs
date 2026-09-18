@@ -1,14 +1,28 @@
 //! Where a wakeup's time goes, for the part that is not the kernel.
 //!
-//! The UDS benchmark leaves nagoya about 900ns behind tokio's current_thread
-//! runtime at p90 while matching it at the median, and the syscall counters say
-//! the work is already minimal: one `recv` and one poller wait per round trip
-//! per end. So the gap is per wakeup cost rather than extra work, and this
-//! times the pieces of `poll_once` that are not the `kevent` itself.
+//! # Read the zeroing number with the correction below
 //!
-//! Timed with nothing else running, so these are floors rather than what the
-//! benchmark sees under contention.
-
+//! This reports that zeroing the 1024 entry event buffer costs 219 to 249ns a
+//! wait, and that was used to argue for `MaybeUninit` in the poller. **That
+//! conclusion was wrong and the change was reverted.** End to end on a quiet
+//! machine it cost about 2.4us at p50, with the blocking floor unchanged.
+//!
+//! The measurement is right and the inference was not. Here the array stays hot
+//! in cache across iterations, so `memset` is the whole cost. In the reactor the
+//! wait blocks in the kernel in between, the stack goes cold, and that `memset`
+//! was pre-touching pages the kernel is about to write. Removing it did not
+//! delete the cost, it moved it inside `kevent` and turned sequential writes
+//! into faults.
+//!
+//! The lesson is kept rather than the file deleted: a tight loop cannot price
+//! anything whose real cost is a cold cache or a page fault.
+//!
+//! # What still stands
+//!
+//! Everything nagoya does outside the kernel per wait is about 35ns: the clock
+//! read 21, the scratch handoff 9, the slots lookup 7. That is the budget any
+//! proposed reactor micro-optimisation should be checked against, and it is why
+//! the p90 gap to tokio is not in the bookkeeping.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
