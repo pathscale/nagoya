@@ -51,11 +51,22 @@ const MESSAGES: usize = 4_000;
 /// wakeups and scheduling rather than memory bandwidth.
 const SMALL: usize = 64;
 
-/// Total bytes each direction in the throughput arm.
-const VOLUME: usize = 256 * 1024 * 1024;
+/// Total bytes each direction in the throughput arm, per chunk size.
+const VOLUME: usize = 128 * 1024 * 1024;
 
-/// Chunk size for the throughput arm.
-const CHUNK: usize = 64 * 1024;
+/// Chunk sizes swept by the throughput arm.
+///
+/// The socket send buffer is what makes this a sweep rather than a constant.
+/// On this machine `net.local.stream.sendspace` is 8 KiB, so a chunk at or
+/// under that goes out in one `send` and the arm measures moving bytes. A
+/// chunk above it cannot: `write_all` partially sends, gets `EWOULDBLOCK`,
+/// parks, waits for the socket to become writable and resumes, once per 8 KiB.
+/// At 64 KiB that is seven re-arms per chunk, and the number stops being
+/// bandwidth and starts being the cost of the writable path.
+///
+/// Both are worth knowing. Quoting only the second one as "throughput", which
+/// is what this benchmark used to do, is not.
+const CHUNKS: [usize; 5] = [4 * 1024, 8 * 1024, 16 * 1024, 64 * 1024, 256 * 1024];
 
 /// How many times each configuration is repeated.
 const ROUNDS: usize = 3;
@@ -80,7 +91,10 @@ fn main() {
     // worse answer besides, since the counts are most useful read next to the
     // throughput they are supposed to explain.
     #[cfg(feature = "syscall-counters")]
-    count_nagoya();
+    {
+        count_nagoya();
+        count_throughput();
+    }
     concurrency_sweep();
     throughput();
 }
@@ -119,18 +133,31 @@ fn concurrency_sweep() {
 
 fn throughput() {
     println!(
-        "== throughput: {} MiB one way in {CHUNK} byte chunks ==",
+        "== throughput: {} MiB one way, by chunk size ==",
         VOLUME / (1024 * 1024)
     );
-    println!("MiB per second, higher is better\n");
-    println!("{:<26} {:>12}", "arm", "MiB/s");
+    println!("MiB per second, higher is better");
+    println!("the send buffer is 8 KiB, so anything above it pays a re-arm per 8 KiB\n");
+
+    print!("{:<26}", "arm");
+    for chunk in CHUNKS {
+        print!("{:>11}", format!("{} KiB", chunk / 1024));
+    }
+    println!();
+
+    type Arm = (&'static str, fn(usize) -> f64);
+    let arms: [Arm; 3] = [
+        ("nagoya", nagoya_throughput),
+        ("tokio current+LocalSet", tokio_throughput),
+        ("blocking std (floor)", blocking_throughput),
+    ];
     for round in 0..ROUNDS {
-        for (label, rate) in [
-            ("nagoya", nagoya_throughput()),
-            ("tokio current+LocalSet", tokio_throughput()),
-            ("blocking std (floor)", blocking_throughput()),
-        ] {
-            println!("{:<26} {rate:>12.0}", format!("{label} [r{}]", round + 1));
+        for (label, arm) in arms {
+            let mut cells = String::new();
+            for chunk in CHUNKS {
+                cells.push_str(&format!("{:>11.0}", arm(chunk)));
+            }
+            println!("{:<26}{cells}", format!("{label} [r{}]", round + 1));
         }
         println!();
     }
@@ -250,7 +277,7 @@ fn nagoya_echo(connections: usize) -> f64 {
 }
 
 /// nagoya streaming `VOLUME` bytes and counting them in.
-fn nagoya_throughput() -> f64 {
+fn nagoya_throughput(chunk_size: usize) -> f64 {
     use nagoya::reactor::{block_on_with, Addr, Reactor, TcpStream};
 
     let path = SocketPath::new("nagoya-sink");
@@ -269,11 +296,11 @@ fn nagoya_throughput() -> f64 {
     let start = Instant::now();
     block_on_with(&reactor, async {
         let mut stream = TcpStream::from_socket(socket, &handle).expect("register");
-        let chunk = vec![0xABu8; CHUNK];
+        let chunk = vec![0xABu8; chunk_size];
         let mut sent = 0;
         while sent < VOLUME {
             stream.write_all(&chunk).await.expect("write");
-            sent += CHUNK;
+            sent += chunk_size;
         }
     });
     let elapsed = start.elapsed();
@@ -372,7 +399,7 @@ async fn echo_client_tokio(mut stream: tokio::net::UnixStream) {
     }
 }
 
-fn tokio_throughput() -> f64 {
+fn tokio_throughput(chunk_size: usize) -> f64 {
     use tokio::io::AsyncWriteExt as _;
 
     let path = SocketPath::new("tokio-sink");
@@ -390,11 +417,11 @@ fn tokio_throughput() -> f64 {
     let start = Instant::now();
     runtime.block_on(async move {
         let mut stream = tokio::net::UnixStream::from_std(std_stream).expect("adopt");
-        let chunk = vec![0xABu8; CHUNK];
+        let chunk = vec![0xABu8; chunk_size];
         let mut sent = 0;
         while sent < VOLUME {
             stream.write_all(&chunk).await.expect("write");
-            sent += CHUNK;
+            sent += chunk_size;
         }
     });
     let elapsed = start.elapsed();
@@ -435,17 +462,17 @@ fn blocking_echo(connections: usize) -> f64 {
     (connections * MESSAGES) as f64 / elapsed.as_secs_f64()
 }
 
-fn blocking_throughput() -> f64 {
+fn blocking_throughput(chunk_size: usize) -> f64 {
     let path = SocketPath::new("blocking-sink");
     let mut child = start_child(path.as_path(), "sink", 1);
     let mut stream = connect_all(path.as_path(), 1).pop().expect("stream");
 
     let start = Instant::now();
-    let chunk = vec![0xABu8; CHUNK];
+    let chunk = vec![0xABu8; chunk_size];
     let mut sent = 0;
     while sent < VOLUME {
         stream.write_all(&chunk).expect("write");
-        sent += CHUNK;
+        sent += chunk_size;
     }
     drop(stream);
     let elapsed = start.elapsed();
@@ -488,7 +515,9 @@ fn child_echo(path: &str, connections: usize) {
 fn child_sink(path: &str) {
     let listener = std::os::unix::net::UnixListener::bind(path).expect("bind");
     let (mut stream, _) = listener.accept().expect("accept");
-    let mut buffer = vec![0u8; CHUNK];
+    // Sized to the largest chunk swept, and the same for every arm and every
+    // chunk size: the reader is not what is being varied.
+    let mut buffer = vec![0u8; CHUNKS[CHUNKS.len() - 1]];
     loop {
         match stream.read(&mut buffer) {
             Ok(0) | Err(_) => return,
@@ -523,4 +552,39 @@ pub fn count_nagoya() {
             wakes as f64 / messages
         );
     }
+}
+
+/// Syscalls per MiB written, for the one way stream, at each chunk size.
+///
+/// The question this answers is whether the throughput gap is syscall count
+/// or syscall cost. The send buffer is 8 KiB, so the writer cannot get more
+/// than that ahead of the reader whatever the chunk size, and the floor is
+/// therefore one `sendmsg` per 8 KiB no matter how large a chunk is handed
+/// down. A `sendmsg` count above `chunk / 8 KiB` per chunk is work that is
+/// not required; so is a wait count above the number of times the buffer
+/// actually filled.
+#[cfg(feature = "syscall-counters")]
+pub fn count_throughput() {
+    println!("== syscalls per MiB written, nagoya ==");
+    println!("send buffer is 8 KiB, so the floor is 128 sendmsg per MiB\n");
+    println!(
+        "{:<12} {:>10} {:>14} {:>10} {:>12}",
+        "chunk", "MiB/s", "sendmsg/MiB", "wblock/MiB", "waits/MiB"
+    );
+    for chunk in CHUNKS {
+        let _ = nagoya::reactor::counters::take();
+        let _ = nagoya::reactor::counters::take_writes();
+        let rate = nagoya_throughput(chunk);
+        let (_, _, waits) = nagoya::reactor::counters::take();
+        let (sends, would_block) = nagoya::reactor::counters::take_writes();
+        let mib = (VOLUME / (1024 * 1024)) as f64;
+        println!(
+            "{:<12} {rate:>10.0} {:>14.1} {:>10.1} {:>12.1}",
+            format!("{} KiB", chunk / 1024),
+            sends as f64 / mib,
+            would_block as f64 / mib,
+            waits as f64 / mib,
+        );
+    }
+    println!();
 }

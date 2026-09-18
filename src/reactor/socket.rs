@@ -703,6 +703,37 @@ impl TcpSocket {
         }
     }
 
+    /// The configured send buffer size, as the kernel reports it.
+    ///
+    /// Read once when a stream is registered and then kept. Asking per write
+    /// would cost exactly the syscall this is meant to save, and the answer
+    /// does not change underneath a connection.
+    ///
+    /// The write side has no equivalent of [`Self::pending`] to lean on:
+    /// `FIONWRITE` is a TCP facility and returns nothing for a Unix socket,
+    /// which is measured, not assumed. The capacity alone is still enough for
+    /// the case that matters, because a write of at least this many bytes that
+    /// the kernel took whole has necessarily filled the buffer.
+    pub fn send_buffer(&self) -> Option<usize> {
+        let mut size: libc::c_int = 0;
+        let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `size` and `len` are live, and `len` describes `size`.
+        let result = unsafe {
+            libc::getsockopt(
+                self.raw(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                core::ptr::addr_of_mut!(size).cast(),
+                core::ptr::addr_of_mut!(len),
+            )
+        };
+        if result < 0 || size < 0 {
+            None
+        } else {
+            Some(size as usize)
+        }
+    }
+
     /// Receive into `buffer`, which need not be initialised.
     ///
     /// This is the call `std::io::Read` cannot express. It takes a pointer and
@@ -735,6 +766,8 @@ impl TcpSocket {
     /// Concatenating them to get one `send` copies the payload for the sake of
     /// at most fourteen leading bytes; this hands the kernel both addresses.
     pub fn send_vectored(&self, first: &[u8], second: &[u8]) -> Result<usize> {
+        #[cfg(feature = "syscall-counters")]
+        crate::reactor::counters::SEND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let iovecs = [
             libc::iovec {
                 iov_base: first.as_ptr() as *mut libc::c_void,
@@ -770,7 +803,13 @@ impl TcpSocket {
         // `count` entries starting at `start`, all within it.
         let sent = unsafe { libc::sendmsg(self.raw(), core::ptr::addr_of!(message), flags) };
         if sent < 0 {
-            Err(crate::reactor::error::last())
+            let error = crate::reactor::error::last();
+            #[cfg(feature = "syscall-counters")]
+            if error.would_block() {
+                crate::reactor::counters::SEND_WOULD_BLOCK
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Err(error)
         } else {
             Ok(sent as usize)
         }

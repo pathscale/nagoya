@@ -61,6 +61,14 @@ struct Wakers {
     /// the read then parks a waker nobody will ever wake. Under one lock the
     /// clear and the park are one step against the poller's set and take.
     readable: bool,
+    /// Whether an edge has been seen since the last write filled the socket.
+    ///
+    /// The write side's twin of `readable`, and in the same lock for the same
+    /// reason. Without it every write had to learn the buffer was full by
+    /// being told so: one `sendmsg` that succeeds, then a second that returns
+    /// `EWOULDBLOCK` purely to establish what a short write already proved.
+    /// Measured at 256 `sendmsg` per MiB against a floor of 128.
+    writable: bool,
     /// Whether the peer has hung up. Latched, and never cleared.
     ///
     /// `readable` is a question about right now and a read answers it. This is
@@ -156,8 +164,14 @@ impl Handle {
             // Starting at `true` costs one speculative `recv` per
             // registration. If data is there it is read, and if it is not the
             // `EWOULDBLOCK` path parks correctly with the edge still ahead.
+            //
+            // `writable` starts there too, and for a stronger reason than
+            // symmetry: a fresh socket has room by definition, so waiting for
+            // an edge to be told so would be waiting for one that has already
+            // gone by. That is a hang on the first write, not a slow one.
             wakers: Mutex::new(Wakers {
                 readable: true,
+                writable: true,
                 ..Wakers::default()
             }),
         });
@@ -289,6 +303,30 @@ impl Registration {
             Some(existing) if existing.will_wake(waker) => {}
             _ => wakers.reader = Some(waker.clone()),
         }
+    }
+
+    /// Take writable readiness, or park `waker` for the next edge.
+    ///
+    /// The write side's twin of [`Self::take_readable_or_park`], and the thing
+    /// that lets a write skip the syscall whose only job was to be rejected.
+    pub fn take_writable_or_park(&self, waker: &Waker) -> bool {
+        let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+        if wakers.writable {
+            wakers.writable = false;
+            return true;
+        }
+        match &wakers.writer {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => wakers.writer = Some(waker.clone()),
+        }
+        false
+    }
+
+    /// Note that this descriptor may still have room, for a caller whose write
+    /// was accepted whole and so never proved the buffer full.
+    pub fn mark_writable(&self) {
+        let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+        wakers.writable = true;
     }
 
     /// Park `waker` until the descriptor is writable. See [`Self::poll_readable`].
@@ -648,6 +686,7 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
                 pending.extend(wakers.reader.take().map(|waker| (index, waker)));
             }
             if event.writable {
+                wakers.writable = true;
                 pending.extend(wakers.writer.take().map(|waker| (index, waker)));
             }
         }

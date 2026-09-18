@@ -47,6 +47,14 @@ pub struct TcpStream {
     /// failing with `ENOTCONN` the moment the peer closes, and the writable
     /// edge it then waits for went by before the descriptor was registered.
     connecting: bool,
+    /// The send buffer's capacity, or zero where the kernel would not say.
+    ///
+    /// Read once here rather than per write. It answers one question that the
+    /// return value of a write cannot: a write the kernel took whole usually
+    /// means there is room left, but not when the caller handed down exactly
+    /// as much as the buffer holds, and a stream copier sized to the buffer
+    /// does that on every single write.
+    send_capacity: usize,
 }
 
 impl TcpStream {
@@ -56,10 +64,12 @@ impl TcpStream {
     /// only has to register it.
     pub fn from_socket(socket: TcpSocket, handle: &Handle) -> Result<Self> {
         let registration = handle.register(socket.raw(), Interest::BOTH)?;
+        let send_capacity = socket.send_buffer().unwrap_or(0);
         Ok(Self {
             inner: socket,
             registration,
             connecting: false,
+            send_capacity,
         })
     }
 
@@ -229,10 +239,37 @@ impl TcpStream {
         first: &[u8],
         second: &[u8],
     ) -> Poll<Result<usize>> {
+        // The socket has had no room since the last write filled it, so the
+        // `sendmsg` below would return `EWOULDBLOCK`. The waker is parked by
+        // the same call that answered, so an edge cannot slip in between.
+        if !self.registration.take_writable_or_park(cx.waker()) {
+            return Poll::Pending;
+        }
+        let wanted = first.len() + second.len();
         loop {
             match self.inner.send_vectored(first, second) {
-                Ok(n) => return Poll::Ready(Ok(n)),
+                Ok(n) => {
+                    // A write the kernel took whole has not proved the buffer
+                    // full, so readiness is put back rather than consumed. A
+                    // short write has proved it, and that is the one case
+                    // where the next write must wait for an edge.
+                    //
+                    // Learning this from the return value rather than from a
+                    // second `sendmsg` written only to be rejected is worth
+                    // half of every write on a saturated socket: the count was
+                    // 256 `sendmsg` per MiB against a floor of 128.
+                    // A write at least as large as the buffer that the kernel
+                    // took whole has filled it, whatever the return value
+                    // suggests, and saying otherwise costs a `sendmsg` written
+                    // only to be rejected. A copier chunked to the buffer size
+                    // hits this on every write.
+                    if n == wanted && (self.send_capacity == 0 || wanted < self.send_capacity) {
+                        self.registration.mark_writable();
+                    }
+                    return Poll::Ready(Ok(n));
+                }
                 Err(error) if error.would_block() => {
+                    // Full: now it is safe to wait for the next edge.
                     self.registration.poll_writable(cx.waker());
                     return Poll::Pending;
                 }
