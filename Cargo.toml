@@ -52,7 +52,7 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 [dev-dependencies]
 ps-st3 = { version = "^0.6", features = ["fanout", "host"] }
 # The comparison arm. Only the scheduler is used; nothing here needs its I/O.
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 # The other comparison arm. Not an async runtime: a data-parallel pool, so it
 # only appears in the arms that submit a closure rather than a future.
 rayon = "1"
@@ -130,3 +130,10 @@ required-features = ["std"]
 # addresses, and an unreadable profile is not a finding.
 [profile.release]
 debug = 1
+
+# The Unix socket comparison. Needs the reactor, and tokio's `net` and
+# `io-util`, which is why those are dev-dependency features: the comparison arm
+# has to be the thing people actually use.
+[[example]]
+name = "uds_vs_tokio"
+required-features = ["reactor"]
