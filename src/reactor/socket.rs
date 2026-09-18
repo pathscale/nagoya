@@ -680,6 +680,29 @@ impl TcpSocket {
         addr_of(self.raw(), true)
     }
 
+    /// How many bytes are waiting to be read, if the kernel will say.
+    ///
+    /// `None` means it would not, and the caller should assume there may be
+    /// more rather than fewer. That bias is the whole safety property here: a
+    /// wrong "nothing left" loses a wakeup and hangs a connection, while a
+    /// wrong "something left" costs one `recv` that returns `EWOULDBLOCK`,
+    /// which is exactly what this call exists to avoid and no worse than not
+    /// having made it.
+    ///
+    /// `FIONREAD` is on both targets and is measurably cheaper than the `recv`
+    /// it replaces, 123ns against 176ns on this machine.
+    pub fn pending(&self) -> Option<usize> {
+        let mut waiting: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one `c_int`, which is what is passed.
+        let result =
+            unsafe { libc::ioctl(self.raw(), libc::FIONREAD, core::ptr::addr_of_mut!(waiting)) };
+        if result < 0 || waiting < 0 {
+            None
+        } else {
+            Some(waiting as usize)
+        }
+    }
+
     /// Receive into `buffer`, which need not be initialised.
     ///
     /// This is the call `std::io::Read` cannot express. It takes a pointer and

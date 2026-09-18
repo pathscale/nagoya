@@ -153,7 +153,9 @@ impl TcpStream {
                     // SAFETY: `recv` reported writing `read` bytes into the
                     // spare capacity, so that many past `filled` are live.
                     unsafe { buffer.set_len(filled + read) };
-                    if read == spare_len {
+                    // As in `poll_read`: a filled buffer is not evidence of
+                    // more, so ask instead of assuming.
+                    if read == spare_len && self.inner.pending().is_none_or(|left| left > 0) {
                         self.registration.mark_readable();
                     }
                     return Poll::Ready(Ok(read));
@@ -184,7 +186,16 @@ impl TcpStream {
                 Ok(n) => {
                     // A read that filled the buffer has not proved the socket
                     // empty, so readiness is put back rather than consumed.
-                    if n == buffer.len() {
+                    //
+                    // Asking the kernel what is actually left, rather than
+                    // assuming a full buffer means more: a framed reader calls
+                    // `read_exact`, so every one of its reads fills its buffer
+                    // exactly and the assumption is wrong every time. That cost
+                    // one `recv` returning `EWOULDBLOCK` per read, measured, on
+                    // the path a WebSocket server takes several times a frame.
+                    // `FIONREAD` is 123ns against that call's 176ns here, and
+                    // unlike it this one is only made on the exact-fill path.
+                    if n == buffer.len() && self.inner.pending().is_none_or(|left| left > 0) {
                         self.registration.mark_readable();
                     }
                     return Poll::Ready(Ok(n));
