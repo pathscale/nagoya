@@ -29,7 +29,7 @@ use alloc::sync::Arc;
 use alloc::task::Wake;
 use core::future::Future;
 use core::pin::pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use super::driver::{Handle, Reactor};
@@ -43,6 +43,30 @@ use super::error::Result;
 struct LocalWaker {
     ready: AtomicBool,
     handle: Handle,
+    /// Which thread is currently inside the wait, if any.
+    ///
+    /// Zero means nobody. Otherwise it is the id of the thread blocked in
+    /// `poll_once`, and a wake raised *by that same thread* needs no syscall:
+    /// it is `dispatch` waking a task while the poller has already returned,
+    /// and the loop is about to poll regardless.
+    ///
+    /// That case is the common one under `block_on`, not the rare one. Every
+    /// readable event dispatches a wake on this thread, so the unconditional
+    /// `handle.wake()` was a `kevent` per ready connection per batch, issued
+    /// to interrupt a wait that was no longer running.
+    waiting: AtomicU64,
+}
+
+/// This thread's id as a non-zero `u64`, for comparing against `waiting`.
+///
+/// `ThreadId::as_u64` is unstable, so the address of a thread local is used
+/// instead: it is unique per thread, stable for the thread's life, and never
+/// zero, which is what the sentinel needs.
+fn thread_key() -> u64 {
+    thread_local! {
+        static KEY: u8 = const { 0 };
+    }
+    KEY.with(|key| core::ptr::from_ref(key) as u64)
 }
 
 impl Wake for LocalWaker {
@@ -52,10 +76,15 @@ impl Wake for LocalWaker {
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.ready.store(true, Ordering::Release);
-        // If the wake came from the poller's thread, the loop is not waiting
-        // and this is redundant but harmless. If it came from elsewhere, the
-        // loop may be blocked in `kevent` with no event coming, and this is
-        // what gets it out.
+        // Raised from inside this thread's own wait: the poller has already
+        // returned, the loop will poll next, and interrupting a `kevent` that
+        // is not running would be a syscall for nothing.
+        if self.waiting.load(Ordering::Acquire) == thread_key() {
+            return;
+        }
+        // From another thread, or from outside the wait entirely: the loop may
+        // be blocked in `kevent` with no event coming, and this is what gets
+        // it out.
         let _ = self.handle.wake();
     }
 }
@@ -95,7 +124,9 @@ pub fn block_on_with<F: Future>(reactor: &Reactor, future: F) -> F::Output {
         // event that may already have happened.
         ready: AtomicBool::new(true),
         handle: reactor.handle(),
+        waiting: AtomicU64::new(0),
     });
+    let key = thread_key();
     let raw = Waker::from(Arc::clone(&waker));
     let mut context = Context::from_waker(&raw);
 
@@ -109,7 +140,15 @@ pub fn block_on_with<F: Future>(reactor: &Reactor, future: F) -> F::Output {
         // Nothing to poll: wait for the kernel. This is the same wait the
         // reactor thread would have done, done here instead, which is the
         // point of the whole module.
-        if reactor.poll_once().is_err() {
+        //
+        // Claimed across the whole call rather than only the blocking part,
+        // because `poll_once` dispatches the wakes it collected before it
+        // returns, and those are exactly the ones that must not pay a syscall
+        // to interrupt a wait this thread has already left.
+        waker.waiting.store(key, Ordering::Release);
+        let outcome = reactor.poll_once();
+        waker.waiting.store(0, Ordering::Release);
+        if outcome.is_err() {
             // The poller failed. Polling again would spin, so give the future
             // one more chance to finish on what it already has and then stop.
             if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
