@@ -79,7 +79,7 @@ fn main() {
         let connections: usize = args[3].parse().expect("connections");
         match args[2].as_str() {
             "echo" => child_echo(path, connections),
-            "sink" => child_sink(path),
+            "sink" => child_sink(path, connections),
             other => panic!("unknown child mode {other}"),
         }
         return;
@@ -145,7 +145,7 @@ fn throughput() {
     }
     println!();
 
-    type Arm = (&'static str, fn(usize) -> f64);
+    type Arm = (&'static str, fn(usize, usize) -> f64);
     let arms: [Arm; 3] = [
         ("nagoya", nagoya_throughput),
         ("tokio current+LocalSet", tokio_throughput),
@@ -155,7 +155,32 @@ fn throughput() {
         for (label, arm) in arms {
             let mut cells = String::new();
             for chunk in CHUNKS {
-                cells.push_str(&format!("{:>11.0}", arm(chunk)));
+                cells.push_str(&format!("{:>11.0}", arm(chunk, 1)));
+            }
+            println!("{:<26}{cells}", format!("{label} [r{}]", round + 1));
+        }
+        println!();
+    }
+
+    // The same bytes over many connections at once. One connection cannot
+    // contend for anything, so it is the shape least able to show whether the
+    // write path holds up when several tasks are waiting on writability
+    // through one reactor.
+    println!(
+        "== throughput: {} MiB total, 64 KiB chunks, by connections ==",
+        VOLUME / (1024 * 1024)
+    );
+    println!("MiB per second, higher is better\n");
+    print!("{:<26}", "arm");
+    for connections in CONNECTIONS {
+        print!("{:>11}", format!("{connections} conn"));
+    }
+    println!();
+    for round in 0..ROUNDS {
+        for (label, arm) in arms {
+            let mut cells = String::new();
+            for connections in CONNECTIONS {
+                cells.push_str(&format!("{:>11.0}", arm(64 * 1024, connections)));
             }
             println!("{:<26}{cells}", format!("{label} [r{}]", round + 1));
         }
@@ -277,36 +302,43 @@ fn nagoya_echo(connections: usize) -> f64 {
 }
 
 /// nagoya streaming `VOLUME` bytes and counting them in.
-fn nagoya_throughput(chunk_size: usize) -> f64 {
-    use nagoya::reactor::{block_on_with, Addr, Reactor, TcpStream};
+fn nagoya_throughput(chunk_size: usize, connections: usize) -> f64 {
+    use nagoya::reactor::{block_on_with, Addr, Reactor, TaskSet, TcpStream};
 
     let path = SocketPath::new("nagoya-sink");
-    let mut child = start_child(path.as_path(), "sink", 1);
+    let mut child = start_child(path.as_path(), "sink", connections);
     let addr = Addr::path(path.as_path().as_os_str().as_bytes()).expect("path fits");
 
-    let socket = loop {
-        match nagoya::reactor::socket::TcpSocket::connect(addr) {
-            Ok(socket) => break socket,
-            Err(_) => std::thread::yield_now(),
-        }
-    };
+    let sockets: Vec<_> = (0..connections)
+        .map(|_| loop {
+            match nagoya::reactor::socket::TcpSocket::connect(addr) {
+                Ok(socket) => break socket,
+                Err(_) => std::thread::yield_now(),
+            }
+        })
+        .collect();
 
     let reactor = Reactor::local().expect("reactor");
     let handle = reactor.handle();
+    let each = VOLUME / connections;
     let start = Instant::now();
-    block_on_with(&reactor, async {
+    let mut tasks = TaskSet::new();
+    for socket in sockets {
         let mut stream = TcpStream::from_socket(socket, &handle).expect("register");
         let chunk = vec![0xABu8; chunk_size];
-        let mut sent = 0;
-        while sent < VOLUME {
-            stream.write_all(&chunk).await.expect("write");
-            sent += chunk_size;
-        }
-    });
+        tasks.push(async move {
+            let mut sent = 0;
+            while sent < each {
+                stream.write_all(&chunk).await.expect("write");
+                sent += chunk_size;
+            }
+        });
+    }
+    block_on_with(&reactor, tasks);
     let elapsed = start.elapsed();
 
     child.wait().expect("child");
-    VOLUME as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+    (each * connections) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
 }
 
 // --- tokio ----------------------------------------------------------------
@@ -389,6 +421,16 @@ fn tokio_echo_multi(connections: usize) -> f64 {
     (connections * MESSAGES) as f64 / elapsed.as_secs_f64()
 }
 
+async fn sink_client_tokio(mut stream: tokio::net::UnixStream, chunk_size: usize, each: usize) {
+    use tokio::io::AsyncWriteExt as _;
+    let chunk = vec![0xABu8; chunk_size];
+    let mut sent = 0;
+    while sent < each {
+        stream.write_all(&chunk).await.expect("write");
+        sent += chunk_size;
+    }
+}
+
 async fn echo_client_tokio(mut stream: tokio::net::UnixStream) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let outgoing = [0xABu8; SMALL];
@@ -399,11 +441,9 @@ async fn echo_client_tokio(mut stream: tokio::net::UnixStream) {
     }
 }
 
-fn tokio_throughput(chunk_size: usize) -> f64 {
-    use tokio::io::AsyncWriteExt as _;
-
+fn tokio_throughput(chunk_size: usize, connections: usize) -> f64 {
     let path = SocketPath::new("tokio-sink");
-    let mut child = start_child(path.as_path(), "sink", 1);
+    let mut child = start_child(path.as_path(), "sink", connections);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -411,23 +451,30 @@ fn tokio_throughput(chunk_size: usize) -> f64 {
         .build()
         .expect("runtime");
 
-    let std_stream = connect_all(path.as_path(), 1).pop().expect("stream");
-    std_stream.set_nonblocking(true).expect("nonblocking");
+    let std_streams = connect_all(path.as_path(), connections);
+    for stream in &std_streams {
+        stream.set_nonblocking(true).expect("nonblocking");
+    }
+    let each = VOLUME / connections;
 
+    let local = tokio::task::LocalSet::new();
     let start = Instant::now();
-    runtime.block_on(async move {
-        let mut stream = tokio::net::UnixStream::from_std(std_stream).expect("adopt");
-        let chunk = vec![0xABu8; chunk_size];
-        let mut sent = 0;
-        while sent < VOLUME {
-            stream.write_all(&chunk).await.expect("write");
-            sent += chunk_size;
+    runtime.block_on(local.run_until(async move {
+        let mut handles = Vec::with_capacity(connections);
+        for stream in std_streams {
+            let stream = tokio::net::UnixStream::from_std(stream).expect("adopt");
+            handles.push(tokio::task::spawn_local(sink_client_tokio(
+                stream, chunk_size, each,
+            )));
         }
-    });
+        for handle in handles {
+            handle.await.expect("client task");
+        }
+    }));
     let elapsed = start.elapsed();
 
     child.wait().expect("child");
-    VOLUME as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+    (each * connections) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
 }
 
 // --- blocking floor -------------------------------------------------------
@@ -462,23 +509,33 @@ fn blocking_echo(connections: usize) -> f64 {
     (connections * MESSAGES) as f64 / elapsed.as_secs_f64()
 }
 
-fn blocking_throughput(chunk_size: usize) -> f64 {
+fn blocking_throughput(chunk_size: usize, connections: usize) -> f64 {
     let path = SocketPath::new("blocking-sink");
-    let mut child = start_child(path.as_path(), "sink", 1);
-    let mut stream = connect_all(path.as_path(), 1).pop().expect("stream");
+    let mut child = start_child(path.as_path(), "sink", connections);
+    let streams = connect_all(path.as_path(), connections);
+    let each = VOLUME / connections;
 
     let start = Instant::now();
-    let chunk = vec![0xABu8; chunk_size];
-    let mut sent = 0;
-    while sent < VOLUME {
-        stream.write_all(&chunk).expect("write");
-        sent += chunk_size;
+    let writers: Vec<_> = streams
+        .into_iter()
+        .map(|mut stream| {
+            std::thread::spawn(move || {
+                let chunk = vec![0xABu8; chunk_size];
+                let mut sent = 0;
+                while sent < each {
+                    stream.write_all(&chunk).expect("write");
+                    sent += chunk_size;
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().expect("writer");
     }
-    drop(stream);
     let elapsed = start.elapsed();
 
     child.wait().expect("child");
-    VOLUME as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+    (each * connections) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
 }
 
 // --- the child process ----------------------------------------------------
@@ -512,17 +569,25 @@ fn child_echo(path: &str, connections: usize) {
 }
 
 /// Sink: read until the peer stops, counting nothing.
-fn child_sink(path: &str) {
+fn child_sink(path: &str, connections: usize) {
     let listener = std::os::unix::net::UnixListener::bind(path).expect("bind");
-    let (mut stream, _) = listener.accept().expect("accept");
-    // Sized to the largest chunk swept, and the same for every arm and every
-    // chunk size: the reader is not what is being varied.
-    let mut buffer = vec![0u8; CHUNKS[CHUNKS.len() - 1]];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
+    let mut readers = Vec::new();
+    for _ in 0..connections {
+        let (mut stream, _) = listener.accept().expect("accept");
+        readers.push(std::thread::spawn(move || {
+            // Sized to the largest chunk swept, and the same for every arm and
+            // every chunk size: the reader is not what is being varied.
+            let mut buffer = vec![0u8; CHUNKS[CHUNKS.len() - 1]];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        }));
+    }
+    for reader in readers {
+        let _ = reader.join();
     }
 }
 
@@ -574,7 +639,7 @@ pub fn count_throughput() {
     for chunk in CHUNKS {
         let _ = nagoya::reactor::counters::take();
         let _ = nagoya::reactor::counters::take_writes();
-        let rate = nagoya_throughput(chunk);
+        let rate = nagoya_throughput(chunk, 1);
         let (_, _, waits) = nagoya::reactor::counters::take();
         let (sends, would_block) = nagoya::reactor::counters::take_writes();
         let mib = (VOLUME / (1024 * 1024)) as f64;

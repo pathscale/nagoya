@@ -93,6 +93,18 @@ fn main() {
 /// Zeroed on the stack each time. At 1024 entries that is 32 KiB of memset and
 /// eight pages touched per wakeup, which is the kind of cost that shows up in a
 /// tail rather than a median because it evicts whatever else was warm.
+///
+/// Kept even though the conclusion it supported was wrong. The numbers below
+/// are real and the change built on them, skipping the zeroing with
+/// `MaybeUninit`, measured 2.4us *slower* end to end and was reverted. That is
+/// the point worth keeping: a tight loop cannot price a cold cache or a page
+/// fault, so a microbenchmark is where an optimisation starts and never where
+/// it is decided.
+///
+/// `kevent` is a BSD type, so this is the one thing here that cannot run
+/// everywhere. Reported as absent rather than skipped silently, and above all
+/// not left to fail the build on Linux, which is what it did.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 fn event_buffer_cost() {
     const CAPACITY: usize = 1024;
     let start = Instant::now();
@@ -115,4 +127,10 @@ fn event_buffer_cost() {
         "  zero 64 kevents            {:>7.1} ns",
         start.elapsed().as_nanos() as f64 / ROUNDS as f64
     );
+}
+
+/// Where there is no `kevent` there is no event buffer to price.
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+fn event_buffer_cost() {
+    println!("  zero kevents                   n/a (kqueue only)");
 }
