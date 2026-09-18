@@ -66,6 +66,16 @@ pub struct Event {
     pub readable: bool,
     /// The descriptor may be writable. Treat as a hint: write until it blocks.
     pub writable: bool,
+    /// The peer hung up, or the descriptor failed.
+    ///
+    /// Reported beside `readable` rather than folded into it, because the two
+    /// have different lifetimes. Readability is consumed by a read; a hang-up
+    /// is permanent. Both pollers can deliver a hang-up on the *same* edge as
+    /// the last of the data, so a reader that takes a short read and consumes
+    /// the readable bit swallows the hang-up with it, then parks for an edge
+    /// that has already happened: a task that never finishes and a connection
+    /// that is never closed.
+    pub hangup: bool,
 }
 
 /// A readiness poller over a set of file descriptors.
@@ -299,11 +309,15 @@ mod sys {
                 // EV_EOF means the peer hung up. It is surfaced as readiness in
                 // whichever direction was registered so the caller's next read
                 // returns 0 and the connection closes through the normal path
-                // rather than through a special case here.
+                // rather than through a special case here. It is *also*
+                // reported on its own, because kqueue sets it on the same
+                // event that carries the last of the data, and readiness alone
+                // does not survive the read that consumes it.
                 out.push(Event {
                     token,
                     readable,
                     writable,
+                    hangup: event.flags & libc::EV_EOF != 0,
                 });
             }
             Ok(())
@@ -375,7 +389,10 @@ mod sys {
         fn mask(interest: Interest) -> u32 {
             let mut mask = libc::EPOLLET as u32;
             if interest.readable {
-                mask |= libc::EPOLLIN as u32;
+                // EPOLLRDHUP has to be asked for; EPOLLHUP and EPOLLERR arrive
+                // whether or not they are in the mask. Without it a peer's
+                // ordinary half-close is indistinguishable from data.
+                mask |= libc::EPOLLIN as u32 | libc::EPOLLRDHUP as u32;
             }
             if interest.writable {
                 mask |= libc::EPOLLOUT as u32;
@@ -465,13 +482,18 @@ mod sys {
                 }
                 // EPOLLHUP and EPOLLERR are reported as readiness in both
                 // directions so the caller's next read or write surfaces the
-                // real error through its normal path.
+                // real error through its normal path. EPOLLRDHUP joins them
+                // for the hang-up flag but not for readiness: it is the
+                // ordinary half-close, which epoll delivers on the same
+                // edge-triggered event as the last of the data, and the flag
+                // is what survives the read that consumes that readiness.
                 let flags = event.events;
-                let hangup = flags & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0;
+                let failed = flags & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0;
                 out.push(Event {
                     token: event.u64,
-                    readable: hangup || flags & libc::EPOLLIN as u32 != 0,
-                    writable: hangup || flags & libc::EPOLLOUT as u32 != 0,
+                    readable: failed || flags & libc::EPOLLIN as u32 != 0,
+                    writable: failed || flags & libc::EPOLLOUT as u32 != 0,
+                    hangup: failed || flags & libc::EPOLLRDHUP as u32 != 0,
                 });
             }
             Ok(())
