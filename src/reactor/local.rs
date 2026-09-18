@@ -279,7 +279,9 @@ impl Wake for Slot {
         // Won the right to queue this slot, so nothing else is writing `next`.
         let mut head = self.shared.head.load(Ordering::Relaxed);
         loop {
-            self.next.store(head, Ordering::Relaxed);
+            // `Release` for the same reason as in `push`: the walk reads this
+            // link, and a retry rewrites it after the load that justified it.
+            self.next.store(head, Ordering::Release);
             match self.shared.head.compare_exchange_weak(
                 head,
                 self.index,
@@ -321,9 +323,29 @@ impl TaskSet {
             // straight onto the chain rather than waiting to be discovered.
             queued: AtomicBool::new(true),
         });
+        // Into the vector before onto the chain, and not the other way round.
+        // Linking first leaves a window where an index is reachable from
+        // `head` and absent from `tasks`, and a `poll` landing in it finds no
+        // entry to read the link out of. There is then nothing to follow, so
+        // everything queued behind it is dropped, and those tasks have already
+        // had `queued` set, which only a walk clears: they are not merely
+        // unpolled, they can never be queued again. A hang, from two
+        // statements in the wrong order.
+        self.tasks.push(Task {
+            future: Some(alloc::boxed::Box::pin(future)),
+            waker: Waker::from(Arc::clone(&slot)),
+            slot: Arc::clone(&slot),
+        });
+        self.left += 1;
+
         let mut head = shared.head.load(Ordering::Relaxed);
         loop {
-            slot.next.store(head, Ordering::Relaxed);
+            // `Release`, so that a thread taking the chain and following this
+            // link sees the entry the link points at. The `head` CAS publishes
+            // the slot this iteration links, but on a retry the link is
+            // rewritten, and the successful CAS of some *other* slot does not
+            // order that rewrite.
+            slot.next.store(head, Ordering::Release);
             match shared.head.compare_exchange_weak(
                 head,
                 index,
@@ -334,12 +356,6 @@ impl TaskSet {
                 Err(current) => head = current,
             }
         }
-        self.tasks.push(Task {
-            future: Some(alloc::boxed::Box::pin(future)),
-            waker: Waker::from(Arc::clone(&slot)),
-            slot,
-        });
-        self.left += 1;
     }
 
     /// How many futures have not finished.
@@ -378,13 +394,21 @@ impl Future for TaskSet {
         let mut cursor = shared.head.swap(END, Ordering::AcqRel);
         while cursor != END {
             let Some(task) = this.tasks.get_mut(cursor as usize) else {
-                // Not an index this set ever handed out, so there is no link
-                // to follow and nothing further can be recovered.
+                // Unreachable: indices come from `tasks.len()` at push time,
+                // entries are never removed, and a slot is linked only after
+                // its entry exists. Kept as a stop rather than an unwrap
+                // because the alternative to being wrong here is a panic in a
+                // reactor, and there is genuinely no link to follow: the entry
+                // that holds it is the thing that is missing.
+                debug_assert!(
+                    false,
+                    "ready chain named index {cursor}, which has no entry"
+                );
                 break;
             };
             // Read before the poll: the task owns `next` again the moment it
             // is unqueued, and may overwrite it from inside its own wake.
-            let following = task.slot.next.load(Ordering::Relaxed);
+            let following = task.slot.next.load(Ordering::Acquire);
             // Cleared before the poll, not after: a wake that happens during
             // the poll has to be able to queue the task again.
             task.slot.queued.store(false, Ordering::Release);
