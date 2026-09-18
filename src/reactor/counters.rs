@@ -23,3 +23,10 @@ pub fn take() -> (u64, u64, u64) {
         WAIT.swap(0, Relaxed),
     )
 }
+
+/// Every `kevent`/`epoll_wait` interrupt issued to wake a waiting poller.
+///
+/// Separate from `WAIT` because it is the opposite thing: not a thread going
+/// to sleep, but a syscall spent telling one to stop. Under `block_on` most of
+/// these were being issued by the very thread that had just left the wait.
+pub static WAKE: AtomicU64 = AtomicU64::new(0);

@@ -187,6 +187,8 @@ impl Handle {
 
     /// Wake the reactor thread if it is blocked.
     pub fn wake(&self) -> Result<()> {
+        #[cfg(feature = "syscall-counters")]
+        crate::reactor::counters::WAKE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.shared.poller.wake()
     }
 
