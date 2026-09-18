@@ -14,7 +14,12 @@ pub static RECV_WOULD_BLOCK: AtomicU64 = AtomicU64::new(0);
 /// Every `kevent`/`epoll_wait` the reactor waited in.
 pub static WAIT: AtomicU64 = AtomicU64::new(0);
 
-/// Read and clear all three.
+/// Every `sendmsg` the reactor issued.
+pub static SEND: AtomicU64 = AtomicU64::new(0);
+/// Those that returned `EWOULDBLOCK`, so the write had to wait for room.
+pub static SEND_WOULD_BLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// Read and clear the read side and the wait.
 pub fn take() -> (u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (
@@ -22,6 +27,17 @@ pub fn take() -> (u64, u64, u64) {
         RECV_WOULD_BLOCK.swap(0, Relaxed),
         WAIT.swap(0, Relaxed),
     )
+}
+
+/// Read and clear the write side.
+///
+/// Separate from [`take`] because the two are read by different benchmarks:
+/// an echo is a read side question and a one way stream is a write side one,
+/// and a caller that asked for one should not have the other silently zeroed
+/// underneath it.
+pub fn take_writes() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (SEND.swap(0, Relaxed), SEND_WOULD_BLOCK.swap(0, Relaxed))
 }
 
 /// Every `kevent`/`epoll_wait` interrupt issued to wake a waiting poller.
