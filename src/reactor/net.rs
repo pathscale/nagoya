@@ -33,11 +33,20 @@ use super::error::Result;
 use super::poller::Interest;
 use super::socket::{Addr, TcpListener as Listener, TcpSocket};
 
-/// A TCP connection that yields to the executor instead of blocking.
+/// A connection that yields to the executor instead of blocking.
 #[derive(Debug)]
 pub struct TcpStream {
     inner: TcpSocket,
     registration: Registration,
+    /// Whether a connect is still in flight and [`Connected`] has work to do.
+    ///
+    /// False for an adopted socket, which is connected by definition, and for
+    /// a Unix-domain connect, which finishes inside the `connect` call rather
+    /// than by making the socket writable later. Asking anyway is not merely
+    /// wasteful there, it hangs: the test is `getpeername`, which starts
+    /// failing with `ENOTCONN` the moment the peer closes, and the writable
+    /// edge it then waits for went by before the descriptor was registered.
+    connecting: bool,
 }
 
 impl TcpStream {
@@ -50,6 +59,7 @@ impl TcpStream {
         Ok(Self {
             inner: socket,
             registration,
+            connecting: false,
         })
     }
 
@@ -62,8 +72,7 @@ impl TcpStream {
     /// because the first write appears to succeed into the socket buffer and
     /// the failure surfaces somewhere unrelated.
     pub async fn connect(addr: Addr, handle: &Handle) -> Result<Self> {
-        let socket = TcpSocket::connect(addr)?;
-        let mut stream = Self::from_socket(socket, handle)?;
+        let mut stream = Self::connect_started(addr, handle)?;
         Connected {
             stream: &mut stream,
         }
@@ -75,9 +84,17 @@ impl TcpStream {
     ///
     /// For a caller that wants to overlap the wait with other work. It must
     /// await [`Self::connected`] before treating the stream as usable.
+    ///
+    /// For a Unix-domain address there is nothing to overlap: the connect has
+    /// already succeeded or already failed by the time this returns, and
+    /// [`Self::connected`] resolves immediately.
     pub fn connect_started(addr: Addr, handle: &Handle) -> Result<Self> {
         let socket = TcpSocket::connect(addr)?;
-        Self::from_socket(socket, handle)
+        let mut stream = Self::from_socket(socket, handle)?;
+        // A Unix-domain connect does not go in flight, so there is no later
+        // answer to wait for and waiting would never end.
+        stream.connecting = !matches!(addr, Addr::Path(_));
+        Ok(stream)
     }
 
     /// Wait for an in-flight connect to finish.
@@ -282,6 +299,14 @@ impl core::future::Future for Connected<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
+        // Nothing was ever in flight: an adopted socket, or a Unix-domain
+        // connect that finished inside the `connect` call. The checks below
+        // would not merely be redundant, they would be wrong, because
+        // `getpeername` fails once a peer that was there has gone away.
+        if !this.stream.connecting {
+            return Poll::Ready(Ok(()));
+        }
+
         // `SO_ERROR` is the authority on whether the handshake finished, but
         // it reads zero both for "succeeded" and for "still going", so it
         // cannot be the test on its own. `getpeername` distinguishes them: it
@@ -289,7 +314,12 @@ impl core::future::Future for Connected<'_> {
         // being waited for.
         match this.stream.inner.connect_error() {
             Err(error) => return Poll::Ready(Err(error)),
-            Ok(()) if this.stream.inner.peer_addr().is_ok() => return Poll::Ready(Ok(())),
+            Ok(()) if this.stream.inner.peer_addr().is_ok() => {
+                // Settled, so a second await of this is free rather than two
+                // more syscalls.
+                this.stream.connecting = false;
+                return Poll::Ready(Ok(()));
+            }
             Ok(()) => {}
         }
 
