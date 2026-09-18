@@ -237,3 +237,62 @@ fn tcp_sees_eof_after_a_short_read() {
     peer.join().expect("peer");
     assert_eq!(outcome, b"abcdef");
 }
+
+/// A write of exactly `SO_SNDBUF` really does fill the send buffer.
+///
+/// The write path skips re-arming readiness when a write the kernel took whole
+/// was at least as large as the reported capacity, on the grounds that such a
+/// write must have filled the buffer. If that is ever false the consequence is
+/// not a wasted syscall, it is a hang: the next write parks for an edge, and
+/// no edge is coming, because nothing was ever refused and the poller is edge
+/// triggered.
+///
+/// The assumption holds on macOS, measured. Linux is reported to return twice
+/// the value that was set from `getsockopt(SO_SNDBUF)` and to charge socket
+/// overhead against it, which would make the reported capacity larger than the
+/// usable one and the assumption wrong in the dangerous direction. CI is Linux,
+/// so this is where that gets answered rather than reasoned about.
+#[test]
+fn a_write_of_the_whole_send_buffer_fills_it() {
+    use nagoya::reactor::socket::TcpSocket;
+    use nagoya::reactor::Addr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::env::temp_dir().join(format!("nagoya-fill-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+    let addr = Addr::path(path.as_os_str().as_bytes()).expect("path fits");
+    let socket = TcpSocket::connect(addr).expect("connect");
+    let (_peer, _) = listener.accept().expect("accept");
+
+    let Some(capacity) = socket.send_buffer() else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+
+    let payload = vec![0xABu8; capacity];
+    let written = socket.send_vectored(&[], &payload).expect("write");
+    if written < capacity {
+        // A short write proves the buffer full on its own, which is the case
+        // the fix already handles. Nothing to check.
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+
+    // Taken whole. The fix concludes from that alone that there is no room
+    // left, so a further byte must be refused. If it is accepted, the
+    // conclusion is wrong on this platform and a writer would park forever.
+    let follow_up = socket.send_vectored(&[], &[0u8; 1]);
+    let _ = std::fs::remove_file(&path);
+
+    match follow_up {
+        Err(error) if error.would_block() => {}
+        Ok(n) => panic!(
+            "a write of the full {capacity} byte buffer was taken whole and \
+             {n} more bytes were still accepted, so the send buffer was not \
+             full; poll_write_vectored would skip re-arming and the next write \
+             would park for an edge that never comes"
+        ),
+        Err(_) => panic!("follow-up write failed for an unrelated reason"),
+    }
+}
