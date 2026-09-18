@@ -195,3 +195,45 @@ fn a_closed_peer_reads_zero() {
     client.join().expect("client thread");
     assert_eq!(read, 0, "a hung up peer should read zero");
 }
+
+/// A peer that writes a last short frame and closes is seen to close.
+///
+/// The TCP half of the hang-up latch. The Unix-domain version of this in
+/// `reactor_unix.rs` is the one that caught the bug, because there the data and
+/// the close reliably coalesce into one edge; over TCP the FIN usually arrives
+/// as its own packet and so as its own edge. Usually is not always, and the
+/// readiness bookkeeping is shared, so the case is pinned on both families
+/// rather than on the one that happened to expose it.
+#[test]
+fn tcp_sees_eof_after_a_short_read() {
+    use std::io::Write as _;
+    let reactor = Reactor::local().expect("reactor");
+    let handle = reactor.handle();
+    let listener = TcpListener::bind(Addr::localhost(0), &handle).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let peer = std::thread::spawn(move || {
+        let mut stream =
+            std::net::TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())))
+                .expect("connect");
+        stream.write_all(b"abcdef").expect("write");
+        stream.flush().expect("flush");
+        // Closes here, so the data and the FIN are one edge.
+    });
+
+    let outcome = nagoya::reactor::block_on_with(&reactor, async {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut seen = Vec::new();
+        loop {
+            let mut buffer = [0u8; 64];
+            let read = stream.read(&mut buffer).await.expect("read");
+            if read == 0 {
+                return seen;
+            }
+            seen.extend_from_slice(&buffer[..read]);
+        }
+    });
+
+    peer.join().expect("peer");
+    assert_eq!(outcome, b"abcdef");
+}

@@ -61,6 +61,14 @@ struct Wakers {
     /// the read then parks a waker nobody will ever wake. Under one lock the
     /// clear and the park are one step against the poller's set and take.
     readable: bool,
+    /// Whether the peer has hung up. Latched, and never cleared.
+    ///
+    /// `readable` is a question about right now and a read answers it. This is
+    /// a question about the rest of the descriptor's life, and once the answer
+    /// is yes it stays yes: every subsequent `recv` returns 0. Keeping it
+    /// separate is what lets a short read consume readiness without swallowing
+    /// the hang-up that arrived on the same edge.
+    hangup: bool,
 }
 
 /// One descriptor's registration state.
@@ -244,7 +252,11 @@ impl Registration {
     /// across eight connections, 38 percent of all reads.
     pub fn take_readable_or_park(&self, waker: &Waker) -> bool {
         let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
-        if wakers.readable {
+        // A hung-up descriptor is permanently worth reading: `recv` answers 0
+        // rather than `EWOULDBLOCK`, so this neither spins nor costs a wasted
+        // syscall. It is checked because the hang-up may have arrived on the
+        // same edge as the last of the data, and that read cleared `readable`.
+        if wakers.readable || wakers.hangup {
             wakers.readable = false;
             return true;
         }
@@ -624,7 +636,12 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
                 continue;
             }
             let mut wakers = slot.wakers.lock().expect("reactor slot poisoned");
-            if event.readable {
+            // Latched before readiness is, so a reader waking on this edge
+            // cannot observe the data without also observing the hang-up.
+            if event.hangup {
+                wakers.hangup = true;
+            }
+            if event.readable || event.hangup {
                 wakers.readable = true;
                 pending.extend(wakers.reader.take().map(|waker| (index, waker)));
             }
