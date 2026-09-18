@@ -98,6 +98,61 @@ fn main() {
     }
 
     report(&results);
+    report_syscalls();
+}
+
+/// What the latency table cannot answer: whether a gap is syscall count or
+/// syscall cost.
+///
+/// Only nagoya can be counted here, because the counters are this crate's. That
+/// is still the useful half: if nagoya is already at the theoretical minimum of
+/// one `recv` and one wait per round trip, the tail is cost or scheduling and
+/// not work, and looking for a redundant syscall would be looking for something
+/// that is not there.
+#[cfg(feature = "syscall-counters")]
+fn report_syscalls() {
+    let timed = (ITERATIONS - WARMUP) as f64;
+
+    // Cleared, then one more sample, so the numbers belong to that sample
+    // alone rather than to every arm run above it.
+    let _ = nagoya::reactor::counters::take();
+    nagoya_unix();
+    let (recv, would_block, wait) = nagoya::reactor::counters::take();
+    println!("\nnagoya uds syscalls, both ends, over {timed} timed round trips:");
+    println!(
+        "  recv        {recv:>9}  ({:.2} per round trip)",
+        recv as f64 / timed
+    );
+    println!(
+        "  EWOULDBLOCK {would_block:>9}  ({:.2} per round trip)",
+        would_block as f64 / timed
+    );
+    println!(
+        "  poller wait {wait:>9}  ({:.2} per round trip)",
+        wait as f64 / timed
+    );
+
+    let _ = nagoya::reactor::counters::take();
+    nagoya_tcp();
+    let (recv, would_block, wait) = nagoya::reactor::counters::take();
+    println!("\nnagoya tcp loopback syscalls, same basis:");
+    println!(
+        "  recv        {recv:>9}  ({:.2} per round trip)",
+        recv as f64 / timed
+    );
+    println!(
+        "  EWOULDBLOCK {would_block:>9}  ({:.2} per round trip)",
+        would_block as f64 / timed
+    );
+    println!(
+        "  poller wait {wait:>9}  ({:.2} per round trip)",
+        wait as f64 / timed
+    );
+}
+
+#[cfg(not(feature = "syscall-counters"))]
+fn report_syscalls() {
+    println!("\n(build with --features syscall-counters for the syscall breakdown)");
 }
 
 /// Print every sample, then the per arm summary across rounds.

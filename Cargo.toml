@@ -137,3 +137,14 @@ debug = 1
 [[example]]
 name = "uds_vs_tokio"
 required-features = ["reactor"]
+
+# Why a framed reader costs more than one `recv` per message. Needs the
+# counters, which is the whole point of it.
+[[example]]
+name = "read_shape"
+required-features = ["syscall-counters"]
+
+# Which syscall is cheaper, measured before the re-arm rule is changed.
+[[example]]
+name = "rearm_cost"
+required-features = ["reactor"]
