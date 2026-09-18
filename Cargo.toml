@@ -154,3 +154,18 @@ required-features = ["reactor"]
 name = "wakeup_cost"
 required-features = ["reactor"]
 
+# Concurrency and throughput, against tokio configured the way a tokio user
+# tuning for this shape would configure it.
+[[example]]
+name = "uds_scale"
+required-features = ["reactor"]
+
+# The nagoya arm alone, long enough to profile without catching another arm.
+[[example]]
+name = "nagoya_only"
+required-features = ["reactor"]
+
+# Per call syscall costs, because sample counts measure frequency not cost.
+[[example]]
+name = "syscall_cost"
+required-features = ["reactor"]
