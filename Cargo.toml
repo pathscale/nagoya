@@ -148,3 +148,8 @@ required-features = ["syscall-counters"]
 [[example]]
 name = "rearm_cost"
 required-features = ["reactor"]
+
+# Where a wakeup's non-kernel time goes.
+[[example]]
+name = "wakeup_cost"
+required-features = ["reactor"]
