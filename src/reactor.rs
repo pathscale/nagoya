@@ -59,7 +59,7 @@ mod testing;
 
 pub use driver::{Handle, Reactor, Registration, Sharded};
 pub use error::{Errno, Result};
-pub use local::{block_on, block_on_with};
+pub use local::{block_on, block_on_with, TaskSet};
 pub use net::{TcpListener, TcpStream};
 pub use poller::{Event, Interest, Poller};
 pub use socket::{Addr, UnixPath, UNIX_PATH_CAPACITY};
