@@ -78,17 +78,222 @@ impl Drop for Fd {
     }
 }
 
-/// An IPv4 or IPv6 socket address.
+/// Where `sun_path` starts inside a `sockaddr_un`.
+///
+/// Two on both targets, for different reasons: Linux has a single `u16`
+/// `sun_family`, the BSDs have a `u8` `sun_len` and a `u8` `sun_family`. Asked
+/// of the real layout rather than written down, because the one number that
+/// matters here is the one the running kernel agrees with.
+const SUN_PATH_OFFSET: usize = mem::offset_of!(libc::sockaddr_un, sun_path);
+
+/// How many bytes of `sun_path` there are: 104 on macOS, 108 on Linux.
+///
+/// Public because it is the limit a caller has to respect, and a caller that
+/// cannot name the limit finds out by having [`UnixPath::new`] refuse.
+pub const UNIX_PATH_CAPACITY: usize = mem::size_of::<libc::sockaddr_un>() - SUN_PATH_OFFSET;
+
+/// The name of a Unix-domain socket, or the absence of one.
+///
+/// Three things live in here, because `sun_path` is one field that means three
+/// things and splitting them into three `Addr` variants would put the weight of
+/// that on every match over an address that is usually TCP:
+///
+/// - **A filesystem path**, the ordinary case, stored without its terminator.
+/// - **Unnamed**, a length of zero. Not an edge case: a client that never
+///   called `bind` has no address at all, which is every ordinary Unix client,
+///   so this is what almost every [`accept`](TcpListener::accept) reports.
+/// - **A Linux abstract name**, a leading NUL and then bytes that are not a
+///   filesystem path and may contain NULs of their own.
+///
+/// The bytes are inline rather than behind a pointer so that [`Addr`] stays
+/// `Copy` and this module keeps allocating nothing at all.
+#[derive(Clone, Copy)]
+pub struct UnixPath {
+    /// The `sun_path` bytes exactly as the kernel wants them, zero padded.
+    bytes: [u8; UNIX_PATH_CAPACITY],
+    /// How many of them are meaningful. A `u8` holds 108 comfortably.
+    len: u8,
+}
+
+impl UnixPath {
+    /// A socket with no name, which is what an unbound peer has.
+    #[must_use]
+    pub const fn unnamed() -> Self {
+        Self {
+            bytes: [0; UNIX_PATH_CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// A filesystem path.
+    ///
+    /// Refused rather than truncated when it does not fit: a truncated path
+    /// binds a socket somewhere nobody is looking, and the failure surfaces
+    /// much later as a connect that finds nothing. An interior NUL is refused
+    /// for the same reason, since the kernel would stop at it.
+    ///
+    /// With `std`, the bytes of a `Path` come from
+    /// `std::os::unix::ffi::OsStrExt::as_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` for an empty path or one containing a NUL, `ENAMETOOLONG` for
+    /// one that does not fit in `sun_path` alongside its terminator.
+    pub fn new(path: &[u8]) -> Result<Self> {
+        if path.is_empty() || path.contains(&0) {
+            return Err(Errno(libc::EINVAL));
+        }
+        // One byte is kept back for the NUL the kernel reads the path up to.
+        if path.len() > UNIX_PATH_CAPACITY - 1 {
+            return Err(Errno(libc::ENAMETOOLONG));
+        }
+        let mut bytes = [0; UNIX_PATH_CAPACITY];
+        bytes[..path.len()].copy_from_slice(path);
+        Ok(Self {
+            bytes,
+            len: path.len() as u8,
+        })
+    }
+
+    /// A Linux abstract socket name, which lives in no filesystem.
+    ///
+    /// Linux only, and deliberately not offered elsewhere: no other target has
+    /// abstract sockets, so a portable-looking constructor would compile
+    /// everywhere and fail to bind on macOS. The name is not NUL terminated
+    /// and may contain NULs.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` for an empty name, `ENAMETOOLONG` for one that does not fit
+    /// after the leading NUL that marks it as abstract.
+    #[cfg(target_os = "linux")]
+    pub fn abstract_name(name: &[u8]) -> Result<Self> {
+        if name.is_empty() {
+            return Err(Errno(libc::EINVAL));
+        }
+        if name.len() > UNIX_PATH_CAPACITY - 1 {
+            return Err(Errno(libc::ENAMETOOLONG));
+        }
+        let mut bytes = [0; UNIX_PATH_CAPACITY];
+        bytes[1..=name.len()].copy_from_slice(name);
+        Ok(Self {
+            bytes,
+            len: (name.len() + 1) as u8,
+        })
+    }
+
+    /// Whether this is the absence of a name.
+    #[must_use]
+    pub const fn is_unnamed(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether this is a Linux abstract name rather than a filesystem path.
+    #[must_use]
+    pub const fn is_abstract(&self) -> bool {
+        self.len > 0 && self.bytes[0] == 0
+    }
+
+    /// The filesystem path, if that is what this is.
+    ///
+    /// `None` for an unnamed socket and for an abstract one, because neither
+    /// names anything on disk and handing back bytes that look like a path
+    /// would have a caller unlink a file that was never created.
+    #[must_use]
+    pub fn as_path_bytes(&self) -> Option<&[u8]> {
+        if self.is_unnamed() || self.is_abstract() {
+            None
+        } else {
+            Some(&self.bytes[..self.len as usize])
+        }
+    }
+
+    /// The abstract name without its leading NUL, if that is what this is.
+    #[must_use]
+    pub fn as_abstract_name(&self) -> Option<&[u8]> {
+        if self.is_abstract() {
+            Some(&self.bytes[1..self.len as usize])
+        } else {
+            None
+        }
+    }
+
+    /// The `sun_path` bytes as the kernel wants them, terminator excluded.
+    #[must_use]
+    pub fn encoded(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    /// The length to hand `bind` and `connect`.
+    ///
+    /// Not `size_of::<sockaddr_un>()`. Linux accepts the whole-struct size and
+    /// macOS rejects it, so the wrong one passes its own tests on the wrong
+    /// machine. A filesystem path counts its terminator, an abstract name has
+    /// none to count, and an unnamed socket is the family and nothing after it.
+    const fn sockaddr_len(&self) -> libc::socklen_t {
+        let len = self.len as usize;
+        let total = if len == 0 {
+            SUN_PATH_OFFSET
+        } else if self.bytes[0] == 0 {
+            SUN_PATH_OFFSET + len
+        } else {
+            SUN_PATH_OFFSET + len + 1
+        };
+        total as libc::socklen_t
+    }
+}
+
+impl PartialEq for UnixPath {
+    /// Compares the meaningful bytes only.
+    ///
+    /// The padding past `len` is always zero, so a derive would agree today.
+    /// Written out because it would stop agreeing the first time anything
+    /// built one of these without clearing the tail.
+    fn eq(&self, other: &Self) -> bool {
+        self.encoded() == other.encoded()
+    }
+}
+
+impl Eq for UnixPath {}
+
+impl core::fmt::Debug for UnixPath {
+    /// Says which of the three things it is, rather than printing 104 bytes.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_unnamed() {
+            formatter.write_str("UnixPath(unnamed)")
+        } else if let Some(name) = self.as_abstract_name() {
+            write!(formatter, "UnixPath(abstract {:?})", Bytes(name))
+        } else {
+            write!(formatter, "UnixPath({:?})", Bytes(self.encoded()))
+        }
+    }
+}
+
+/// Bytes printed as text where they are text, so a path reads as a path.
+struct Bytes<'a>(&'a [u8]);
+
+impl core::fmt::Debug for Bytes<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match core::str::from_utf8(self.0) {
+            Ok(text) => write!(formatter, "{text:?}"),
+            Err(_) => write!(formatter, "{:?}", self.0),
+        }
+    }
+}
+
+/// A socket address: IPv4, IPv6, or a Unix-domain path.
 ///
 /// Deliberately not `std::net::SocketAddr`. Carrying that type would mean
 /// converting at this boundary in both directions for a value that is a port
-/// and some bytes.
+/// and some bytes, and it has nowhere to put the Unix case at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Addr {
     /// An IPv4 address and port.
     V4([u8; 4], u16),
     /// An IPv6 address and port.
     V6([u8; 16], u16),
+    /// A Unix-domain socket's name, or its lack of one.
+    Path(UnixPath),
 }
 
 impl Addr {
@@ -97,10 +302,25 @@ impl Addr {
         Self::V4([127, 0, 0, 1], port)
     }
 
-    /// The port this address names.
+    /// A Unix-domain address for a filesystem path.
+    ///
+    /// # Errors
+    ///
+    /// As [`UnixPath::new`].
+    pub fn path(path: &[u8]) -> Result<Self> {
+        Ok(Self::Path(UnixPath::new(path)?))
+    }
+
+    /// The port this address names, and zero for a Unix socket.
+    ///
+    /// A Unix socket has no port and never will; zero is the answer rather
+    /// than an `Option` because every caller of this is about to format a
+    /// number and none of them want a second code path for the case where the
+    /// transport is a file.
     pub const fn port(&self) -> u16 {
         match self {
             Self::V4(_, port) | Self::V6(_, port) => *port,
+            Self::Path(_) => 0,
         }
     }
 
@@ -109,6 +329,7 @@ impl Addr {
         match self {
             Self::V4(..) => libc::AF_INET,
             Self::V6(..) => libc::AF_INET6,
+            Self::Path(_) => libc::AF_UNIX,
         }
     }
 
@@ -136,11 +357,33 @@ impl Addr {
                 }
                 mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
             }
+            Self::Path(path) => {
+                let addr = storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_un;
+                let encoded = path.encoded();
+                // SAFETY: `sockaddr_un` is smaller than `sockaddr_storage`, and
+                // `encoded` is at most `UNIX_PATH_CAPACITY` bytes, which is the
+                // length of `sun_path`. `sun_len` on the BSDs is left at zero
+                // like every other caller leaves it: the kernel reads the
+                // length from the `socklen_t` argument, not from the struct.
+                unsafe {
+                    (*addr).sun_family = libc::AF_UNIX as libc::sa_family_t;
+                    core::ptr::copy_nonoverlapping(
+                        encoded.as_ptr(),
+                        core::ptr::addr_of_mut!((*addr).sun_path).cast::<u8>(),
+                        encoded.len(),
+                    );
+                }
+                path.sockaddr_len()
+            }
         }
     }
 
-    /// Read an address back out of a `sockaddr_storage`.
-    fn read_from(storage: &libc::sockaddr_storage) -> Option<Self> {
+    /// Read an address back out of a `sockaddr_storage` the kernel filled.
+    ///
+    /// `len` is what the kernel reported writing, and it is not optional for
+    /// `AF_UNIX`: an unnamed peer and an abstract name both start with a NUL
+    /// byte, and only the length tells them apart.
+    fn read_from(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<Self> {
         match libc::c_int::from(storage.ss_family) {
             libc::AF_INET => {
                 let addr = storage as *const libc::sockaddr_storage as *const libc::sockaddr_in;
@@ -162,6 +405,57 @@ impl Addr {
                     ))
                 }
             }
+            libc::AF_UNIX => {
+                // Only what the kernel says it wrote, clamped because a
+                // reported length may include padding past `sun_path` on some
+                // kernels and this is about to index with it.
+                let reported = (len as usize)
+                    .saturating_sub(SUN_PATH_OFFSET)
+                    .min(UNIX_PATH_CAPACITY);
+                let addr = storage as *const libc::sockaddr_storage as *const libc::sockaddr_un;
+                let mut bytes = [0u8; UNIX_PATH_CAPACITY];
+                // SAFETY: the family field says this is a `sockaddr_un`, and
+                // `reported` is clamped to the length of its `sun_path`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::addr_of!((*addr).sun_path).cast::<u8>(),
+                        bytes.as_mut_ptr(),
+                        reported,
+                    );
+                }
+
+                let len = if reported == 0 {
+                    // The family and nothing after it: an unbound peer, which
+                    // is the ordinary case rather than a failure to decode.
+                    0
+                } else if bytes[0] == 0 {
+                    // A leading NUL is a Linux abstract name, taken exactly as
+                    // reported since it has no terminator and may contain NULs.
+                    // Nowhere else has abstract sockets, so there the same
+                    // bytes are a kernel reporting slack after an unnamed peer,
+                    // and reading them as a name would invent one.
+                    if cfg!(target_os = "linux") {
+                        reported
+                    } else {
+                        0
+                    }
+                } else {
+                    // A filesystem path is NUL terminated inside `sun_path`,
+                    // and the reported length may or may not count that byte.
+                    bytes[..reported]
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(reported)
+                };
+
+                // Whatever was not kept is not part of the name, and leaving it
+                // behind would make two equal addresses compare unequal.
+                bytes[len..].fill(0);
+                Some(Self::Path(UnixPath {
+                    bytes,
+                    len: len as u8,
+                }))
+            }
             // A family this crate does not speak. Reported as absent rather
             // than guessed at.
             _ => None,
@@ -180,11 +474,17 @@ fn check(value: libc::c_int) -> Result<libc::c_int> {
     }
 }
 
-/// Create a non-blocking TCP socket for `addr`'s family.
+/// Create a non-blocking stream socket for `addr`'s family.
 ///
 /// Non-blocking from birth rather than set afterwards: a socket that is
 /// briefly blocking is a socket that can briefly stall the reactor.
-fn tcp_socket(addr: &Addr) -> Result<Fd> {
+///
+/// Named for the family it is given rather than for TCP, because nothing in it
+/// is TCP-specific: `AF_UNIX` wants the same `SOCK_STREAM`, the same
+/// non-blocking-at-birth rule, and `SO_NOSIGPIPE` for the same reason, since
+/// writing to a Unix socket whose peer has gone raises `SIGPIPE` exactly as a
+/// TCP one does.
+fn stream_socket(addr: &Addr) -> Result<Fd> {
     // SOCK_NONBLOCK and SOCK_CLOEXEC are Linux extensions to `socket`; the
     // BSDs need two more calls. Both paths end at the same place.
     #[cfg(target_os = "linux")]
@@ -267,10 +567,14 @@ fn addr_of(fd: i32, peer: bool) -> Result<Addr> {
             core::ptr::addr_of_mut!(len),
         )
     })?;
-    Addr::read_from(&storage).ok_or(Errno(libc::EAFNOSUPPORT))
+    Addr::read_from(&storage, len).ok_or(Errno(libc::EAFNOSUPPORT))
 }
 
-/// A connected TCP socket.
+/// A connected stream socket: TCP, or Unix-domain.
+///
+/// Still named for TCP because that is what almost every one of these is, and
+/// because renaming it would churn every caller in the fleet for a type whose
+/// only family-dependent method is [`set_nodelay`](Self::set_nodelay).
 #[derive(Debug)]
 pub struct TcpSocket(Fd);
 
@@ -281,8 +585,14 @@ impl TcpSocket {
     /// under way rather than when it completes: `connect` reports `EINPROGRESS`
     /// and the socket becomes *writable* once it finishes. The caller waits for
     /// that edge and then checks [`Self::connect_error`].
+    ///
+    /// A Unix-domain connect does not go in flight at all: it succeeds
+    /// outright, or fails immediately with `ENOENT` for a path with no socket
+    /// file or `ECONNREFUSED` for one with nothing listening. Both fall out of
+    /// the same code; a caller written to TCP's shape should not read an
+    /// instant answer as a bug.
     pub fn connect(addr: Addr) -> Result<Self> {
-        let fd = tcp_socket(&addr)?;
+        let fd = stream_socket(&addr)?;
         // SAFETY: zeroed storage, then written by `write_to` for this family.
         let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
         let len = addr.write_to(&mut storage);
@@ -298,7 +608,13 @@ impl TcpSocket {
         }
 
         let socket = Self(fd);
-        socket.set_nodelay(true)?;
+        // `TCP_NODELAY` lives at `IPPROTO_TCP`, and asking for it on an
+        // `AF_UNIX` descriptor fails `ENOPROTOOPT`. Unconditionally, the `?`
+        // would turn a connect that actually worked into an error naming a
+        // socket option, which points nowhere near the cause.
+        if addr.family() != libc::AF_UNIX {
+            socket.set_nodelay(true)?;
+        }
         Ok(socket)
     }
 
@@ -347,6 +663,9 @@ impl TcpSocket {
     ///
     /// A framed protocol and Nagle interact badly: a small frame written on its
     /// own waits for an acknowledgement that is itself waiting for more data.
+    ///
+    /// TCP only. On a Unix-domain socket this fails `ENOPROTOOPT`, which is the
+    /// honest answer: there is no Nagle to turn off.
     pub fn set_nodelay(&self, on: bool) -> Result<()> {
         set_flag(self.raw(), libc::IPPROTO_TCP, libc::TCP_NODELAY, on)
     }
@@ -435,17 +754,32 @@ impl TcpSocket {
     }
 }
 
-/// A listening TCP socket.
+/// A listening stream socket: TCP, or Unix-domain.
 #[derive(Debug)]
-pub struct TcpListener(Fd);
+pub struct TcpListener {
+    fd: Fd,
+    /// The family bound, kept because `accept` has to behave differently for
+    /// `AF_UNIX` and asking the kernel would be a `getsockname` per connection.
+    family: libc::c_int,
+}
 
 impl TcpListener {
     /// Bind to `addr` and start listening.
+    ///
+    /// A Unix-domain bind creates the socket file and fails `EADDRINUSE` if one
+    /// is already there, including one left behind by a process that died. The
+    /// caller unlinks the path first and on clean shutdown; nothing here does
+    /// it, because a bind that quietly removes whatever it finds would remove a
+    /// live server's socket.
     pub fn bind(addr: Addr, backlog: i32) -> Result<Self> {
-        let fd = tcp_socket(&addr)?;
+        let family = addr.family();
+        let fd = stream_socket(&addr)?;
         // Without this, a restart fails to bind while the previous socket's
-        // connections drain through TIME_WAIT.
-        set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_REUSEADDR, true)?;
+        // connections drain through TIME_WAIT. There is no TIME_WAIT on a Unix
+        // socket and no option to ask about, so it is not asked for.
+        if family != libc::AF_UNIX {
+            set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_REUSEADDR, true)?;
+        }
 
         // SAFETY: zeroed storage, then written by `write_to`.
         let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
@@ -454,13 +788,13 @@ impl TcpListener {
         check(unsafe { libc::bind(fd.raw(), core::ptr::addr_of!(storage).cast(), len) })?;
         check(unsafe { libc::listen(fd.raw(), backlog) })?;
 
-        Ok(Self(fd))
+        Ok(Self { fd, family })
     }
 
     /// The descriptor, for registering with the poller.
     #[inline]
     pub fn raw(&self) -> i32 {
-        self.0.raw()
+        self.fd.raw()
     }
 
     /// The address this listener is bound to.
@@ -518,10 +852,22 @@ impl TcpListener {
             raw
         };
 
-        let addr = Addr::read_from(&storage).ok_or(Errno(libc::EAFNOSUPPORT))?;
+        let addr = match Addr::read_from(&storage, len) {
+            Some(addr) => addr,
+            // A Unix client that never called `bind` has no address, and that
+            // is every ordinary Unix client rather than an edge case. Some
+            // kernels do not even set the family on the way out, so failing
+            // here would fail every accept with an errno about address
+            // families, which names nothing that went wrong.
+            None if self.family == libc::AF_UNIX => Addr::Path(UnixPath::unnamed()),
+            None => return Err(Errno(libc::EAFNOSUPPORT)),
+        };
         // SAFETY: `raw` is a fresh, non-blocking, connected descriptor.
         let socket = unsafe { TcpSocket::from_raw(raw) };
-        socket.set_nodelay(true)?;
+        // As in `connect`: TCP's option, and fatal on a Unix socket.
+        if self.family != libc::AF_UNIX {
+            socket.set_nodelay(true)?;
+        }
         Ok((socket, addr))
     }
 }

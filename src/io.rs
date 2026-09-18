@@ -270,6 +270,32 @@ pub trait Stream {
     /// of the transport rather than something a protocol wants to reason
     /// about, and every caller would otherwise write the same loop.
     async fn write_all(&mut self, buffer: &[u8]) -> Result<(), StreamError>;
+
+    /// Fill the whole of `buffer`, or fail.
+    ///
+    /// Provided, in terms of [`read`](Self::read), so an implementor pays
+    /// nothing for it. Here for the reason [`write_all`](Self::write_all)
+    /// already gives on the other side: a short read is a property of the
+    /// transport, and a length-delimited codec wanting exactly four bytes and
+    /// then exactly the body would otherwise write that accumulate loop twice
+    /// per message, in every crate that speaks a framed protocol.
+    ///
+    /// A stream that ends part way through is
+    /// [`UNEXPECTED_EOF`](StreamError::UNEXPECTED_EOF) rather than the ordinary
+    /// zero return: the caller named a count, so running out is a failure to
+    /// meet it. `EINTR` is retried, since it means nothing happened.
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), StreamError> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match self.read(&mut buffer[filled..]).await {
+                Ok(0) => return Err(StreamError::UNEXPECTED_EOF),
+                Ok(read) => filled += read,
+                Err(error) if error.interrupted() => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What went wrong on a [`Stream`].
@@ -292,6 +318,15 @@ impl StreamError {
 
     /// `EINTR`, which is 4 on every target this supports.
     pub const INTERRUPTED: Self = Self(4);
+
+    /// The stream ended part way through a [`Stream::read_exact`].
+    ///
+    /// `EPIPE`, which is 32 everywhere this runs. POSIX has no code for "the
+    /// peer's half closed while a protocol was still expecting bytes", and this
+    /// is the closest thing that is true rather than invented: the other end is
+    /// gone and the exchange cannot continue. A caller that needs to tell this
+    /// apart from a write to a dead peer knows which call it made.
+    pub const UNEXPECTED_EOF: Self = Self(32);
 
     /// Whether this means "nothing to do yet" rather than a failure.
     ///
