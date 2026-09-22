@@ -65,11 +65,23 @@ pub mod io;
 #[cfg(feature = "std")]
 #[doc = include_str!(concat!(env!("OUT_DIR"), "/guide-examples.md"))]
 pub mod guide {}
+// Sockets, unix signals and name resolution sit at the crate root beside
+// `sync`, `io` and `runtime`, which is where tokio puts the same three and so
+// where a caller goes looking. They are driven by the reactor rather than
+// owned by it, and burying them a level down under `reactor` described the
+// implementation rather than the API. `reactor` re-exports all three, because
+// that is the path already-published consumers compiled against.
+#[cfg(feature = "reactor")]
+pub mod net;
 mod par;
 // Needs an operating system, so it needs `std`. See its module comment for why
 // a crate whose point is running without one carries a driver that cannot.
 #[cfg(feature = "reactor")]
 pub mod reactor;
+#[cfg(feature = "reactor")]
+pub mod resolve;
+#[cfg(feature = "reactor")]
+pub mod signal;
 // Owns threads, so it needs `std`. See its module comment for why a crate built
 // not to own threads carries one that does.
 #[cfg(feature = "std")]

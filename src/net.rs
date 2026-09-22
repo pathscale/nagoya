@@ -28,10 +28,10 @@
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use super::driver::{Handle, Registration};
-use super::error::Result;
-use super::poller::Interest;
-use super::socket::{Addr, TcpListener as Listener, TcpSocket};
+use crate::reactor::driver::{Handle, Registration};
+use crate::reactor::error::Result;
+use crate::reactor::poller::Interest;
+use crate::reactor::socket::{Addr, TcpListener as Listener, TcpSocket};
 
 /// A connection that yields to the executor instead of blocking.
 #[derive(Debug)]
@@ -537,7 +537,7 @@ impl TcpListener {
                 // A connection that died between the readiness event and the
                 // accept is not this listener's problem: drop it and look for
                 // the next one rather than failing the accept loop.
-                Err(error) if super::error::transient_accept(error) => continue,
+                Err(error) if crate::reactor::error::transient_accept(error) => continue,
                 Err(error) => return Poll::Ready(Err(error)),
             }
         }

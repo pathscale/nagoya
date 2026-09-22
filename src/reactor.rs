@@ -55,19 +55,31 @@ pub mod counters;
 pub mod driver;
 pub mod error;
 pub mod local;
-pub mod net;
 pub mod poller;
-mod resolve;
-pub mod signal;
 pub mod socket;
 #[cfg(test)]
 mod testing;
 
+// `net`, `signal` and `resolve` are `crate::net`, `crate::signal` and
+// `crate::resolve` now, beside `sync`, `io` and `runtime`, which is where
+// tokio puts the same three and where a caller looks for them. They are
+// re-exported here because the path they had is the path published crates
+// already compiled against: nago-wss 0.2.0 names `nagoya::reactor::TcpStream`
+// and requires `^0.1.6`, so it resolves this version and would stop building
+// if these disappeared. A 0.1.x release may not do that to a consumer.
+pub use crate::net;
+pub use crate::resolve;
+pub use crate::signal;
+
+pub use crate::net::{TcpListener, TcpStream};
+// The module above and the function here share a name and do not collide:
+// a module is in the type namespace and a function in the value namespace.
+// Keeping the function called `resolve` is what makes `nagoya::reactor::
+// resolve(host, port)` still compile for the callers that already wrote it.
+pub use crate::resolve::{connect_any, resolve, ResolveError};
+pub use crate::signal::{Signal, SignalKind};
 pub use driver::{Handle, Reactor, Registration, Sharded};
 pub use error::{Errno, Result};
 pub use local::{block_on, block_on_with, TaskSet};
-pub use net::{TcpListener, TcpStream};
 pub use poller::{Event, Interest, Poller};
-pub use resolve::{connect_any, resolve, ResolveError};
-pub use signal::{Signal, SignalKind};
 pub use socket::{Addr, UnixPath, UNIX_PATH_CAPACITY};
