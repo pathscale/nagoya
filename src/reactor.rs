@@ -38,7 +38,8 @@
 //! with it; [`Registration`] parks a waker for one descriptor's readability or
 //! writability. [`TcpStream`] and [`TcpListener`] are the ordinary sockets
 //! built on that, and [`TcpStream`] implements [`crate::io::Stream`], which
-//! this crate declared without providing an implementation.
+//! this crate declared without providing an implementation. [`resolve`] turns
+//! a hostname into those addresses, and [`connect_any`] tries them in order.
 //!
 //! [`block_on`] is the other arrangement: no reactor thread at all, one thread
 //! that waits for readiness and then polls the future itself. The handoff a
@@ -53,6 +54,7 @@ pub mod error;
 pub mod local;
 pub mod net;
 pub mod poller;
+mod resolve;
 pub mod socket;
 #[cfg(test)]
 mod testing;
@@ -62,4 +64,5 @@ pub use error::{Errno, Result};
 pub use local::{block_on, block_on_with, TaskSet};
 pub use net::{TcpListener, TcpStream};
 pub use poller::{Event, Interest, Poller};
+pub use resolve::{connect_any, resolve, ResolveError};
 pub use socket::{Addr, UnixPath, UNIX_PATH_CAPACITY};

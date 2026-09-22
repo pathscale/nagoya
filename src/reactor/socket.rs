@@ -26,9 +26,9 @@
 //!
 //! # What it is not
 //!
-//! Not a general sockets library. There is no UDP, no dual-stack fallback, no
-//! name resolution: an address arrives already resolved. What the fleet does
-//! not use is not here.
+//! Not a general sockets library. There is no UDP and no dual-stack fallback.
+//! Name resolution is [`resolve`](super::resolve); an address arrives at this
+//! module already resolved. What the fleet does not use is not here.
 
 // Calling the kernel is this module's entire purpose.
 #![allow(unsafe_code)]
