@@ -781,3 +781,23 @@ mod tests {
         });
     }
 }
+
+/// The same waiter, at the path tokio puts it.
+///
+/// tokio spells this `tokio::signal::unix::{signal, SignalKind, Signal}`, and
+/// a consumer being moved off it arrives looking for that. The one difference
+/// the name cannot carry is the `Handle`: tokio's `signal(kind)` reaches a
+/// process-global driver its runtime is already turning, and a nagoya
+/// [`Signal`] is registered on one reactor and only fires while that reactor
+/// is polled, so there is nowhere to infer it from and it has to be passed.
+pub mod unix {
+    pub use super::{Signal, SignalKind};
+
+    /// Wait for `kind` on the reactor behind `handle`.
+    ///
+    /// `tokio::signal::unix::signal(kind)` with the reactor named, and the
+    /// same thing as [`Signal::new`].
+    pub fn signal(kind: SignalKind, handle: &crate::reactor::Handle) -> super::Result<Signal> {
+        Signal::new(kind, handle)
+    }
+}
