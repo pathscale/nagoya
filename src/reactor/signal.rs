@@ -9,26 +9,40 @@
 //!
 //! # What outlives the waiter
 //!
-//! `sigaction` replaces the disposition for every thread. `SIGINT` and
-//! `SIGTERM` terminate the process until that happens, so the handler is
-//! installed while the signal is blocked and the write end is published
-//! before the block is lifted. A signal in between is queued, not delivered
-//! to the default action, and not lost.
+//! Only `sigaction` stops the default action, and it stops it for every
+//! thread at once. A signal mask does not: `pthread_sigmask` changes the
+//! calling thread and nothing else, so while any other thread is running with
+//! the disposition still `SIG_DFL`, a process-directed `kill` is delivered
+//! there and terminates the process no matter what this thread has masked.
+//! The BSD path is ordered around that. The pipe is created and its write end
+//! published first, then `sigaction` installs the handler; from that
+//! instruction on no thread can take the default action, and the handler
+//! never runs before it has somewhere to write. Nothing is blocked to get
+//! there, because blocking would not have helped and would only have widened
+//! the window it appeared to close. A signal arriving between the handler and
+//! the poller registration is a byte already in the pipe, and the
+//! registration starts readable.
 //!
 //! The pipe is not closed when the waiter is dropped. A handler that has
 //! already loaded the write end's number can still call `write`, and closing
 //! that descriptor would let the kernel hand the number out again underneath
 //! it. One pipe per signal number stays open for the process, and the next
-//! waiter reuses it. Drop puts the previous disposition back. Anything still
-//! pending at that moment is discarded: restoring the default and then
-//! unblocking would terminate the process on `SIGINT`.
+//! waiter reuses it. Drop puts the previous disposition back. There the block
+//! is real work rather than theatre: the swap goes through `SIG_IGN` with the
+//! signal blocked on this thread, because restoring the default first and
+//! then letting a still-pending `SIGINT` through would terminate the process.
 //!
 //! On Linux there is no handler. `signalfd` delivers a signal only while that
-//! signal stays blocked, so the block is not lifted on drop and it is not
-//! lifted for the next waiter either. `pthread_sigmask` is per thread. This
-//! thread and any thread it creates afterwards inherit the block. A thread
-//! that already existed does not, and a signal delivered there takes the
-//! default action instead of the descriptor.
+//! signal stays blocked, so every waiter blocks it on the calling thread,
+//! including one that finds the descriptor already made, and the block is not
+//! lifted on drop. The per-thread scope bites here and cannot be engineered
+//! away: this thread and any thread it creates afterwards inherit the block,
+//! a thread that already existed does not, and a signal delivered to one of
+//! those takes the default action instead of the descriptor.
+//!
+//! A signal the program had already blocked on the calling thread is left
+//! blocked. That state was deliberate and is not this module's to hand back,
+//! so the mask is restored only where this module was the one that took it.
 //!
 //! One waiter per signal number. A second [`Signal`] for the same number
 //! gets `EBUSY`.
@@ -87,7 +101,9 @@ impl SignalKind {
 ///
 /// The future from [`recv`](Self::recv) completes once each time the signal
 /// is delivered. While a waiter exists, `SIGINT` does not terminate the
-/// process.
+/// process: on the BSDs for any thread, because a handler is installed, and
+/// on Linux for this thread and the ones it goes on to create, because those
+/// are the threads that carry the block `signalfd` needs.
 ///
 /// On Linux the signal stays blocked after drop. `signalfd` only delivers a
 /// signal that is blocked, and lifting the block would hand a pending
@@ -96,11 +112,17 @@ impl SignalKind {
 #[derive(Debug)]
 pub struct Signal {
     kind: SignalKind,
-    /// Held so a second waiter for this number fails. Drop releases it, and
-    /// only after the disposition has been put back. The descriptor itself
-    /// is process-lifetime and is not owned here.
-    claim: Claim,
+    /// Before `claim`, because fields drop in declaration order and the
+    /// descriptor has to leave the poller before anyone else can be handed
+    /// it. The descriptor is process-lifetime and shared, so the next waiter
+    /// registers the same number; a claim released first would let that
+    /// registration happen and then be torn out by this one's removal, which
+    /// on kqueue is a silent delete and a wait that never completes.
     registration: Registration,
+    /// Held so a second waiter for this number fails. Released last of all:
+    /// after the disposition has been put back and after the descriptor is
+    /// out of the poller. The descriptor itself is not owned here.
+    claim: Claim,
     fd: i32,
 }
 
@@ -129,14 +151,17 @@ impl Signal {
         };
         if let Err(error) = platform::committed(kind.as_raw()) {
             platform::disarm(kind.as_raw());
-            drop(claim);
+            // The same order the fields drop in, and for the same reason: the
+            // claim is what keeps the next waiter out, so it cannot go while
+            // the descriptor is still in the poller waiting to be removed.
             drop(registration);
+            drop(claim);
             return Err(error);
         }
         Ok(Self {
             kind,
-            claim,
             registration,
+            claim,
             fd,
         })
     }
@@ -189,9 +214,10 @@ impl Signal {
 impl Drop for Signal {
     fn drop(&mut self) {
         // While the claim is still held, so a new waiter cannot install over
-        // the restore. The registration drops with the fields, after this,
-        // and takes the descriptor back out of the poller. The descriptor
-        // stays open.
+        // the restore. The fields drop after this and in their declared
+        // order: the registration takes the descriptor back out of the
+        // poller, and only then is the claim released. The descriptor stays
+        // open.
         platform::disarm(self.claim.0);
     }
 }
@@ -245,14 +271,36 @@ fn check(value: i32) -> Result<i32> {
     }
 }
 
-fn change_mask(sig: i32, how: libc::c_int) -> Result<()> {
-    // SAFETY: `set` is a live local. `sigemptyset` and `sigaddset` write it
-    // and do not retain it. `pthread_sigmask` copies the set before returning.
+/// Block `sig` on this thread, reporting whether it was already blocked.
+///
+/// The old mask is asked for rather than discarded, because a program is
+/// entitled to have blocked `SIGHUP` on this thread on purpose and would not
+/// expect creating a waiter to hand it back. The answer is the one bit that
+/// matters, so it is reduced to a `bool` here and the set is not kept.
+fn block_one(sig: i32) -> Result<bool> {
+    // SAFETY: `set` and `previous` are live locals. `sigemptyset` and
+    // `sigaddset` write theirs and do not retain it, `pthread_sigmask` copies
+    // the set before returning and fills `previous` in place.
     unsafe {
         let mut set = core::mem::zeroed::<libc::sigset_t>();
         check(libc::sigemptyset(&mut set))?;
         check(libc::sigaddset(&mut set, sig))?;
-        let status = libc::pthread_sigmask(how, &set, core::ptr::null_mut());
+        let mut previous = core::mem::zeroed::<libc::sigset_t>();
+        let status = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
+        if status != 0 {
+            return Err(Errno(status));
+        }
+        Ok(check(libc::sigismember(&previous, sig))? != 0)
+    }
+}
+
+fn unblock_one(sig: i32) -> Result<()> {
+    // SAFETY: as `block_one`, and the old mask is genuinely not wanted here.
+    unsafe {
+        let mut set = core::mem::zeroed::<libc::sigset_t>();
+        check(libc::sigemptyset(&mut set))?;
+        check(libc::sigaddset(&mut set, sig))?;
+        let status = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
         if status != 0 {
             return Err(Errno(status));
         }
@@ -260,17 +308,20 @@ fn change_mask(sig: i32, how: libc::c_int) -> Result<()> {
     Ok(())
 }
 
-fn block_one(sig: i32) -> Result<()> {
-    change_mask(sig, libc::SIG_BLOCK)
-}
-
-fn unblock_one(sig: i32) -> Result<()> {
-    change_mask(sig, libc::SIG_UNBLOCK)
+/// Undo a [`block_one`], given what it reported.
+///
+/// A caller that found the signal already blocked leaves it blocked. Only the
+/// block this module took is the block this module lifts.
+fn restore_mask(sig: i32, was_blocked: bool) -> Result<()> {
+    if was_blocked {
+        return Ok(());
+    }
+    unblock_one(sig)
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{block_one, check, unblock_one, Errno, Result, SignalKind};
+    use super::{block_one, check, restore_mask, Errno, Result, SignalKind};
     use std::sync::atomic::{AtomicI32, Ordering};
 
     /// One `signalfd` per signal number, open for the process.
@@ -281,11 +332,18 @@ mod platform {
     static FDS: [AtomicI32; 32] = [const { AtomicI32::new(-1) }; 32];
 
     pub(super) fn arm(sig: i32) -> Result<i32> {
+        // Before the cache is consulted, not after. The descriptor is shared
+        // between waiters but the mask is not: it belongs to whichever thread
+        // called, and `signalfd` reports nothing that thread is still allowed
+        // to receive. A second waiter created on another thread would find
+        // the descriptor already made, return here with its own mask
+        // untouched and its disposition still `SIG_DFL`, and be killed by the
+        // very signal a live waiter was sitting on the descriptor for.
+        let was_blocked = block_one(sig)?;
         let existing = FDS[sig as usize].load(Ordering::Acquire);
         if existing >= 0 {
             return Ok(existing);
         }
-        block_one(sig)?;
         match create(sig) {
             Ok(fd) => {
                 FDS[sig as usize].store(fd, Ordering::Release);
@@ -294,7 +352,7 @@ mod platform {
             Err(error) => {
                 // Nothing is waiting, so the block would only swallow the
                 // signal. Put the mask back.
-                let _ = unblock_one(sig);
+                let _ = restore_mask(sig, was_blocked);
                 Err(error)
             }
         }
@@ -350,7 +408,7 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    use super::{block_one, check, unblock_one, Errno, Result, SignalKind};
+    use super::{block_one, check, restore_mask, unblock_one, Errno, Result, SignalKind};
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Mutex;
 
@@ -375,39 +433,75 @@ mod platform {
 
     static SAVED: Mutex<[Option<Saved>; 32]> = Mutex::new([const { None }; 32]);
 
+    /// This thread's `errno` cell.
+    ///
+    /// Three spellings across the family this branch compiles for, and the
+    /// choice is per target rather than per BSD: apple and FreeBSD say
+    /// `__error`, DragonFly says `__errno_location` like Linux, and the
+    /// NetBSD-likes say `__errno`.
+    fn errno_slot() -> *mut libc::c_int {
+        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+        use libc::__error as errno_location;
+        #[cfg(target_os = "dragonfly")]
+        use libc::__errno_location as errno_location;
+        #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+        use libc::__errno as errno_location;
+
+        // SAFETY: returns a pointer to the calling thread's own errno, valid
+        // for the life of that thread. Getting the pointer is safe; what is
+        // done through it is the caller's problem.
+        unsafe { errno_location() }
+    }
+
     /// Write the signal number into that signal's pipe.
     ///
     /// `write` of one byte to a non-blocking pipe is async-signal-safe. The
     /// atomic load is one instruction. Nothing else is allowed here: the
     /// handler runs on whichever stack was interrupted.
+    ///
+    /// `errno` is saved and put back around it because that write does fail:
+    /// a pipe nobody is draining fills, and the failure is `EAGAIN`. The
+    /// handler interrupts arbitrary code between any two instructions, and
+    /// code that has just made a syscall and not yet read `errno` would see
+    /// this one instead of its own.
     extern "C" fn write_signal(sig: libc::c_int) {
-        if !(1..32).contains(&sig) {
-            return;
+        let slot = errno_slot();
+        // SAFETY: this thread's own errno cell, live for the life of the
+        // thread. Reading it and putting the value back is exactly what the
+        // interrupted code expects to still be able to do afterwards.
+        let saved = unsafe { *slot };
+        if (1..32).contains(&sig) {
+            let fd = PIPES[sig as usize].write.load(Ordering::Acquire);
+            if fd >= 0 {
+                let byte = sig as u8;
+                unsafe {
+                    libc::write(fd, core::ptr::addr_of!(byte).cast::<libc::c_void>(), 1);
+                }
+            }
         }
-        let fd = PIPES[sig as usize].write.load(Ordering::Acquire);
-        if fd < 0 {
-            return;
-        }
-        let byte = sig as u8;
-        unsafe {
-            libc::write(fd, core::ptr::addr_of!(byte).cast::<libc::c_void>(), 1);
-        }
+        unsafe { *slot = saved };
     }
 
     pub(super) fn arm(sig: i32) -> Result<i32> {
-        // Block first. Until the handler is installed, the default action
-        // for these three signals is to terminate the process.
-        block_one(sig)?;
-        match install_blocked(sig) {
-            Ok(fd) => Ok(fd),
-            Err(error) => {
-                let _ = unblock_one(sig);
-                Err(error)
-            }
-        }
+        // Nothing is blocked here, and deliberately so. The default action is
+        // what has to be displaced, only `sigaction` displaces it, and it
+        // displaces it for every thread at once; a `pthread_sigmask` would
+        // cover this thread alone and leave a process-directed `kill` free to
+        // be delivered to any other running thread, where the disposition is
+        // still `SIG_DFL`. Blocking first would therefore not close the
+        // window, it would open a wider one: a pipe and four `fcntl`s worth
+        // of time in which the code looks safe and is not. So the pipe is
+        // built and its write end published first, and then one `sigaction`
+        // ends the exposure outright.
+        install(sig)
     }
 
-    fn install_blocked(sig: i32) -> Result<i32> {
+    fn install(sig: i32) -> Result<i32> {
+        // Published before the `sigaction` below and never after it: the
+        // handler loads this slot and gives up when it is negative, so a
+        // handler installed first would drop the one delivery it exists to
+        // catch. Nothing reads it until then, so a failure past this point
+        // leaves a write end with no handler behind it, which is inert.
         let write = ensure_pipe(sig)?;
         PIPES[sig as usize].write.store(write, Ordering::Release);
         let read = PIPES[sig as usize].read.load(Ordering::Acquire);
@@ -462,10 +556,12 @@ mod platform {
         Ok(())
     }
 
-    pub(super) fn committed(sig: i32) -> Result<()> {
-        // The descriptor is in the poller now. Lifting the block is what
-        // lets a queued signal reach the handler instead of sitting forever.
-        unblock_one(sig)
+    pub(super) fn committed(_sig: i32) -> Result<()> {
+        // Nothing left to do. `arm` never masked anything, because the
+        // handler and not the mask is what keeps the default action away, so
+        // there is no block here to lift and no moment at which the waiter
+        // becomes armed later than it already was.
+        Ok(())
     }
 
     pub(super) fn disarm(sig: i32) {
@@ -476,13 +572,11 @@ mod platform {
         let Some(saved) = saved else {
             return;
         };
-        // Ignore for the gap, and do it while the signal is blocked. A
-        // pending `SIGINT` discarded here would otherwise run the default
-        // action when the block lifts, and that action terminates the
-        // process. POSIX drops a pending signal when the action becomes
-        // `SIG_IGN`. The unblock under ignore is the same thing for a kernel
-        // that only drops it on delivery.
-        let _ = block_one(sig);
+        // Here the block earns its place, unlike in `arm`: it is not standing
+        // in for the handler, it is holding this one thread still while the
+        // disposition goes from ours to `SIG_IGN` to the program's, so that a
+        // delivery cannot land on the default action mid-swap.
+        let was_blocked = block_one(sig).unwrap_or(true);
         let write = PIPES[sig as usize].write.swap(-1, Ordering::AcqRel);
         unsafe {
             let mut ignore: libc::sigaction = core::mem::zeroed();
@@ -490,15 +584,24 @@ mod platform {
             let _ = libc::sigemptyset(&mut ignore.sa_mask);
             let _ = libc::sigaction(sig, &ignore, core::ptr::null_mut());
         }
-        let _ = unblock_one(sig);
-        let _ = block_one(sig);
+        if !was_blocked {
+            // POSIX drops a pending signal when the action becomes `SIG_IGN`.
+            // The unblock and reblock under ignore is the same thing for a
+            // kernel that only drops it on delivery, and without it a
+            // `SIGINT` still pending would run the restored default action.
+            // Skipped when the program had the signal blocked already:
+            // letting it through would be undoing a decision that was not
+            // ours, and no handler of ours ever ran for it anyway.
+            let _ = unblock_one(sig);
+            let _ = block_one(sig);
+        }
         unsafe {
             let _ = libc::sigaction(sig, &saved.action, core::ptr::null_mut());
         }
         if write >= 0 {
             PIPES[sig as usize].write.store(write, Ordering::Release);
         }
-        let _ = unblock_one(sig);
+        let _ = restore_mask(sig, was_blocked);
     }
 
     pub(super) fn read_one(fd: i32) -> Result<SignalKind> {
