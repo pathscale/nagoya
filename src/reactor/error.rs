@@ -45,13 +45,20 @@ pub fn transient_accept(error: Errno) -> bool {
 ///
 /// libc's, because this crate has libc and nagoya does not: nagoya can name
 /// the constants but cannot read the location.
+/// Four spellings, and the split is not Linux against the rest: Linux and
+/// DragonFly say `__errno_location`, apple and FreeBSD say `__error`, and the
+/// NetBSD-likes say `__errno`. `signal.rs` needs the same cell and gates it
+/// the same way.
 #[allow(unsafe_code)]
 pub fn last() -> Errno {
-    // SAFETY: `__errno_location`/`__error` return a pointer to this thread's
-    // errno, valid for the life of the thread.
-    #[cfg(target_os = "linux")]
-    let value = unsafe { *libc::__errno_location() };
-    #[cfg(not(target_os = "linux"))]
-    let value = unsafe { *libc::__error() };
-    Errno(value)
+    #[cfg(any(target_os = "linux", target_os = "dragonfly"))]
+    use libc::__errno_location as errno_location;
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+    use libc::__error as errno_location;
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+    use libc::__errno as errno_location;
+
+    // SAFETY: the call returns a pointer to this thread's errno, valid for
+    // the life of the thread.
+    Errno(unsafe { *errno_location() })
 }
