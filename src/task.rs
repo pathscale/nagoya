@@ -116,7 +116,7 @@ pub(crate) fn current_worker(pool: &Arc<Pool>) -> Option<usize> {
 }
 
 /// Put `future` on `pool` and hand back the handle to its result.
-pub(crate) fn spawn<F>(
+pub(crate) fn spawn_on<F>(
     future: F,
     pool: Arc<Pool>,
     context: Option<Arc<dyn WorkerContext>>,
@@ -300,3 +300,21 @@ mod tests {
         assert_eq!(worker_for(&a, Some(&invalid)), None);
     }
 }
+
+/// Spawning and yielding, under the names tokio gives them.
+///
+/// A facade, not a second implementation. What arrives here mostly arrives
+/// from a consumer being moved off tokio, and making it spell
+/// `nagoya::runtime::background().spawn` where it used to write
+/// `tokio::task::spawn` is a diff per call site that teaches nobody anything.
+///
+/// Two of tokio's are absent rather than renamed, and deliberately so. There
+/// is no `spawn_blocking`: this crate owns no blocking pool, so work that
+/// blocks goes to a `std::thread` and the caller says so at the call site
+/// rather than being handed a pool it did not know it was using. There is no
+/// `spawn_local` either; the non-`Send` equivalent is a
+/// [`TaskSet`](crate::reactor::TaskSet) driven by
+/// [`block_on_with`](crate::reactor::block_on_with).
+pub use crate::yield_now::{yield_now, YieldNow};
+#[cfg(feature = "std")]
+pub use crate::{spawn, JoinHandle};
