@@ -90,9 +90,24 @@ pub mod runtime;
 // They are runtime-agnostic there too, which is exactly why the dependency was
 // easy to acquire and hard to notice: see the module comment.
 pub mod sync;
-mod task;
-mod time;
+pub mod task;
+pub mod time;
 mod yield_now;
+
+/// Spawn onto the shared pool, as `tokio::spawn` does.
+///
+/// The same thing as `nagoya::runtime::background().spawn(future)`, under the
+/// name a caller coming from tokio already has in their fingers. A caller that
+/// wants its own threads, its own count, or a pool it can stop builds a
+/// [`runtime::Runtime`] and spawns on that instead.
+#[cfg(feature = "std")]
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: core::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    runtime::background().spawn(future)
+}
 
 pub use block_on::{block_on, block_on_with_host};
 pub use par::{par_for, Cancel, ParFor};
@@ -284,7 +299,7 @@ impl Executor {
         F::Output: Send + 'static,
     {
         JoinHandle {
-            task: Some(task::spawn(future, self.pool.clone(), self.context.clone()).fallible()),
+            task: Some(task::spawn_on(future, self.pool.clone(), self.context.clone()).fallible()),
         }
     }
 

@@ -33,6 +33,17 @@ use crate::reactor::error::Result;
 use crate::reactor::poller::Interest;
 use crate::reactor::socket::{Addr, TcpListener as Listener, TcpSocket};
 
+/// Name resolution, which tokio also puts under `net`.
+///
+/// [`lookup_host`] is [`crate::resolve::resolve`] under the name tokio gives
+/// it. The two differ in a way the name does not warn about and the function's
+/// own documentation does: tokio's is an `async fn` its runtime resolves on a
+/// blocking pool, and this one is a plain `fn` that calls `getaddrinfo` on the
+/// calling thread, because this crate has no blocking pool to hand it to.
+/// Resolve before entering the reactor, or the lookup stalls every socket on
+/// it.
+pub use crate::resolve::{connect_any, resolve as lookup_host, resolve, ResolveError};
+
 /// A connection that yields to the executor instead of blocking.
 #[derive(Debug)]
 pub struct TcpStream {
