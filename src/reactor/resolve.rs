@@ -52,6 +52,21 @@ impl std::error::Error for ResolveError {}
 /// whatever else the machine is configured with. The port is the caller's:
 /// the service string is not passed, and each returned address carries `port`
 /// rather than whatever the resolver would have filled in.
+///
+/// **This blocks the calling thread, and there is nowhere here to put it.**
+/// `getaddrinfo` is synchronous and can sit in DNS for as long as the
+/// resolver's timeout, which is seconds, not milliseconds. This crate has no
+/// `spawn_blocking`. The arrangement the reactor documentation recommends is
+/// the one where the polling thread *is* the reactor thread, so a call to
+/// this function from inside a task stalls every other descriptor on that
+/// reactor for the whole lookup. It is a plain `fn` and not an `async fn`
+/// precisely so that this is visible at the call site rather than hidden
+/// behind an await.
+///
+/// Resolve before entering the reactor where the name is known up front,
+/// which is the common case for a client that connects to a configured host.
+/// A caller that must resolve names while a reactor is running needs a thread
+/// of its own for it; this function will not provide one.
 pub fn resolve(host: &str, port: u16) -> core::result::Result<Vec<Addr>, ResolveError> {
     let name = CString::new(host).map_err(|_| ResolveError::Nul)?;
 
