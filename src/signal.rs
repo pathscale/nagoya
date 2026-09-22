@@ -53,9 +53,9 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use super::driver::{Handle, Registration};
-use super::error::{Errno, Result};
-use super::poller::Interest;
+use crate::reactor::driver::{Handle, Registration};
+use crate::reactor::error::{Errno, Result};
+use crate::reactor::poller::Interest;
 
 /// Which signal a [`Signal`] waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,7 +264,7 @@ impl Drop for Claim {
 
 fn check(value: i32) -> Result<i32> {
     if value < 0 {
-        Err(super::error::last())
+        Err(crate::reactor::error::last())
     } else {
         Ok(value)
     }
@@ -393,7 +393,7 @@ mod platform {
             )
         };
         if read < 0 {
-            return Err(super::super::error::last());
+            return Err(crate::reactor::error::last());
         }
         if read == 0 {
             return Err(Errno(libc::EPIPE));
@@ -609,7 +609,7 @@ mod platform {
         let read =
             unsafe { libc::read(fd, core::ptr::addr_of_mut!(byte).cast::<libc::c_void>(), 1) };
         if read < 0 {
-            return Err(super::super::error::last());
+            return Err(crate::reactor::error::last());
         }
         if read == 0 {
             return Err(Errno(libc::EPIPE));
@@ -626,8 +626,8 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    use super::super::{block_on_with, Reactor};
     use super::{Signal, SignalKind};
+    use crate::reactor::{block_on_with, Reactor};
 
     /// Disposition is process-wide. Two tests installing handlers at once
     /// would restore each other's.

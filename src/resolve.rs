@@ -12,10 +12,10 @@
 
 use std::ffi::CString;
 
-use super::error::{Errno, Result};
-use super::net::TcpStream;
-use super::socket::Addr;
-use super::Handle;
+use crate::net::TcpStream;
+use crate::reactor::error::{Errno, Result};
+use crate::reactor::socket::Addr;
+use crate::reactor::Handle;
 
 /// Why [`resolve`] produced no addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
