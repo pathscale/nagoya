@@ -51,12 +51,12 @@ pub fn transient_accept(error: Errno) -> bool {
 /// the same way.
 #[allow(unsafe_code)]
 pub fn last() -> Errno {
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+    use libc::__errno as errno_location;
     #[cfg(any(target_os = "linux", target_os = "dragonfly"))]
     use libc::__errno_location as errno_location;
     #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
     use libc::__error as errno_location;
-    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
-    use libc::__errno as errno_location;
 
     // SAFETY: the call returns a pointer to this thread's errno, valid for
     // the life of the thread.
