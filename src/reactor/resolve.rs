@@ -131,15 +131,40 @@ pub fn resolve(host: &str, port: u16) -> core::result::Result<Vec<Addr>, Resolve
 /// network; what is needed here is only that a host answering on one family
 /// is reachable. An empty list fails with `ECONNREFUSED`, the same answer as
 /// a list whose every attempt was refused.
+///
+/// The error is the first one that describes the *service* rather than this
+/// machine's routing, not simply the last attempt's. `getaddrinfo` is asked
+/// without `AI_ADDRCONFIG`, so a host with an AAAA record yields a v6 address
+/// even on a box with no v6 route, and that attempt fails `ENETUNREACH` after
+/// the v4 attempt already reported the true `ECONNREFUSED`. Reporting the
+/// last error would hand the caller whichever answer the resolver happened to
+/// order last, which flips between machines and hides the real one.
 pub async fn connect_any(addrs: &[Addr], handle: &Handle) -> Result<TcpStream> {
-    let mut last = Errno(libc::ECONNREFUSED);
+    let mut fallback = Errno(libc::ECONNREFUSED);
+    let mut about_the_service = None;
     for addr in addrs {
         match TcpStream::connect(*addr, handle).await {
             Ok(stream) => return Ok(stream),
-            Err(error) => last = error,
+            Err(error) => {
+                if about_the_service.is_none() && !unreachable_family(error) {
+                    about_the_service = Some(error);
+                }
+                fallback = error;
+            }
         }
     }
-    Err(last)
+    Err(about_the_service.unwrap_or(fallback))
+}
+
+/// Whether `error` says this machine cannot reach that address family at all,
+/// rather than anything about the host on the other end.
+///
+/// Spelled out for the same reason as `transient_accept`: the values differ
+/// between Linux and the BSDs, and this crate has libc to ask.
+fn unreachable_family(error: Errno) -> bool {
+    error.0 == libc::ENETUNREACH
+        || error.0 == libc::EHOSTUNREACH
+        || error.0 == libc::EAFNOSUPPORT
 }
 
 #[cfg(test)]
@@ -161,6 +186,18 @@ mod tests {
                 .any(|addr| *addr == Addr::V4([127, 0, 0, 1], 9)),
             "127.0.0.1 did not resolve to itself: {addrs:?}"
         );
+    }
+
+    #[test]
+    fn a_routing_failure_does_not_outrank_a_refusal() {
+        // The shape `connect_any` sees on a dual-stacked host with no v6
+        // route: the v4 attempt is the true answer, the v6 attempt is an
+        // artefact of this machine, and the resolver decides which comes
+        // last.
+        assert!(!unreachable_family(Errno(libc::ECONNREFUSED)));
+        assert!(unreachable_family(Errno(libc::ENETUNREACH)));
+        assert!(unreachable_family(Errno(libc::EHOSTUNREACH)));
+        assert!(unreachable_family(Errno(libc::EAFNOSUPPORT)));
     }
 
     #[test]
