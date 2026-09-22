@@ -162,9 +162,7 @@ pub async fn connect_any(addrs: &[Addr], handle: &Handle) -> Result<TcpStream> {
 /// Spelled out for the same reason as `transient_accept`: the values differ
 /// between Linux and the BSDs, and this crate has libc to ask.
 fn unreachable_family(error: Errno) -> bool {
-    error.0 == libc::ENETUNREACH
-        || error.0 == libc::EHOSTUNREACH
-        || error.0 == libc::EAFNOSUPPORT
+    error.0 == libc::ENETUNREACH || error.0 == libc::EHOSTUNREACH || error.0 == libc::EAFNOSUPPORT
 }
 
 #[cfg(test)]
@@ -181,9 +179,7 @@ mod tests {
     fn an_address_literal_comes_back_with_the_callers_port() {
         let addrs = resolve("127.0.0.1", 9).expect("resolve");
         assert!(
-            addrs
-                .iter()
-                .any(|addr| *addr == Addr::V4([127, 0, 0, 1], 9)),
+            addrs.contains(&Addr::V4([127, 0, 0, 1], 9)),
             "127.0.0.1 did not resolve to itself: {addrs:?}"
         );
     }

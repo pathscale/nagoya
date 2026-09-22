@@ -178,7 +178,6 @@ impl Signal {
     /// polled is not lost: it is already a byte in the descriptor, and the
     /// registration starts readable because an edge that fired before `add`
     /// will not fire again.
-    #[must_use]
     pub fn recv(&mut self) -> Recv<'_> {
         Recv { signal: self }
     }
@@ -440,12 +439,12 @@ mod platform {
     /// `__error`, DragonFly says `__errno_location` like Linux, and the
     /// NetBSD-likes say `__errno`.
     fn errno_slot() -> *mut libc::c_int {
-        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
-        use libc::__error as errno_location;
-        #[cfg(target_os = "dragonfly")]
-        use libc::__errno_location as errno_location;
         #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
         use libc::__errno as errno_location;
+        #[cfg(target_os = "dragonfly")]
+        use libc::__errno_location as errno_location;
+        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+        use libc::__error as errno_location;
 
         // SAFETY: returns a pointer to the calling thread's own errno, valid
         // for the life of that thread. Getting the pointer is safe; what is
