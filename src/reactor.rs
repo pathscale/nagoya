@@ -40,6 +40,9 @@
 //! built on that, and [`TcpStream`] implements [`crate::io::Stream`], which
 //! this crate declared without providing an implementation. [`resolve`] turns
 //! a hostname into those addresses, and [`connect_any`] tries them in order.
+//! [`Signal`] waits for a unix signal. The descriptor it registers is a
+//! `signalfd` on Linux and the read end of a pipe on the BSDs: [`Registration`]
+//! names a file descriptor, and `EVFILT_SIGNAL` names a signal number.
 //!
 //! [`block_on`] is the other arrangement: no reactor thread at all, one thread
 //! that waits for readiness and then polls the future itself. The handoff a
@@ -55,6 +58,7 @@ pub mod local;
 pub mod net;
 pub mod poller;
 mod resolve;
+pub mod signal;
 pub mod socket;
 #[cfg(test)]
 mod testing;
@@ -65,4 +69,5 @@ pub use local::{block_on, block_on_with, TaskSet};
 pub use net::{TcpListener, TcpStream};
 pub use poller::{Event, Interest, Poller};
 pub use resolve::{connect_any, resolve, ResolveError};
+pub use signal::{Signal, SignalKind};
 pub use socket::{Addr, UnixPath, UNIX_PATH_CAPACITY};
