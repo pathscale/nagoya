@@ -145,6 +145,11 @@ pub fn block_on_with<F: Future>(reactor: &Reactor, future: F) -> F::Output {
         // because `poll_once` dispatches the wakes it collected before it
         // returns, and those are exactly the ones that must not pay a syscall
         // to interrupt a wait this thread has already left.
+        //
+        // The whole call also covers the timers `poll_once` fires *before* it
+        // waits, and a wake raised there is suppressed the same way while the
+        // wait is still ahead. `poll_once` answers that by not blocking when a
+        // timer fired, which is what lets a `timeout` expire on this thread.
         waker.waiting.store(key, Ordering::Release);
         let outcome = reactor.poll_once();
         waker.waiting.store(0, Ordering::Release);

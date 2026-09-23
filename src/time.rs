@@ -229,12 +229,26 @@ pub fn now_ns() -> u64 {
 /// Returns `None` when nothing is pending, so a caller with nothing else to do
 /// can sleep until something registers rather than spinning on an empty heap.
 pub fn poll(now: u64) -> Option<u64> {
+    fire_due(now).0
+}
+
+/// [`poll`], also saying whether any waker was woken.
+///
+/// A local reactor needs the second half. It services timers on the thread
+/// that also polls its future, just before it blocks in the kernel, and a
+/// wake raised there is one its own waker deliberately does not turn into a
+/// syscall. Told that a waker fired, the reactor waits without blocking so the
+/// woken task is polled; not told, it would sleep through the wake it had just
+/// delivered to itself.
+pub(crate) fn fire_due(now: u64) -> (Option<u64>, bool) {
     // Wakers are collected and woken after the lock is released. A waker may
     // register another timer, and this lock is not reentrant.
     let mut due: Vec<Waker> = Vec::new();
     let next = {
         let mut guard = PENDING.lock();
-        let heap = guard.as_mut()?;
+        let Some(heap) = guard.as_mut() else {
+            return (None, false);
+        };
         while let Some(entry) = heap.peek() {
             if entry.deadline > now {
                 break;
@@ -250,10 +264,11 @@ pub fn poll(now: u64) -> Option<u64> {
         }
         heap.peek().map(|entry| entry.deadline)
     };
+    let woke = !due.is_empty();
     for waker in due {
         waker.wake();
     }
-    next
+    (next, woke)
 }
 
 /// Register `slot` to fire at `deadline`, and say whether it is now the
