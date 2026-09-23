@@ -465,6 +465,21 @@ let rt = nagoya::runtime::Runtime::with_tuning(
     8, nagoya::Tuning::almost_tokio(), "almost_tokio");
 ```
 
+`Runtime::builder()` sets the same three and anything `with_tuning` has no
+argument for. `stack_size(bytes)` sizes every worker's stack. Unset, a worker
+gets the `std::thread` default: `RUST_MIN_STACK` if the process has it, two
+MiB otherwise. Tasks run on the worker's stack, so a runtime whose tasks
+recurse deeply should set it rather than depend on the environment.
+
+```rust
+let rt = nagoya::runtime::Runtime::builder()
+    .workers(2)
+    .label("deep")
+    .stack_size(16 * 1024 * 1024)
+    .build();
+rt.pool().shut_down();
+```
+
 WorkTable's six named flavors are WorkTable registry policy, not six
 different Nagoya executors. Distinct flavor pools can interfere through
 idle spinning, so performance comparisons should isolate them in child

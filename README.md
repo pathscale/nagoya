@@ -12,6 +12,12 @@ Typst is the canonical documentation source. Run `sh scripts/build-guide.sh`
 to create both PDFs in `docs/`; Rust examples are extracted and checked by
 `cargo test --doc`.
 
+Version 0.1.14 adds `Runtime::builder()`, which takes what `with_tuning` does
+plus the worker threads' stack size. Without it a worker's stack is whatever
+`RUST_MIN_STACK` says, or two MiB, so a caller whose tasks recurse deeply had
+to set an environment variable to run them. `new`, `with_tuning` and
+`background()` are unchanged.
+
 Version 0.1.12 adds `process`, behind a feature of the same name: `Command`,
 `Child` and the child's pipes, spelled as `tokio::process` spells them, with
 the pipes as `futures-io` readers and writers. `spawn`, `output` and `status`
