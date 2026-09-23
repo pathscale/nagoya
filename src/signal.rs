@@ -243,7 +243,11 @@ struct Claim(i32);
 
 impl Claim {
     fn acquire(sig: i32) -> Result<Self> {
-        if !(1..32).contains(&sig) {
+        // SIGKILL and SIGSTOP cannot be caught, and `sigaction` says so on
+        // the BSDs. On Linux `signalfd` silently drops them from its mask and
+        // succeeds, which would hand back a waiter that can never fire. Refused
+        // here, before either platform is asked, so both answer the same.
+        if !(1..32).contains(&sig) || sig == libc::SIGKILL || sig == libc::SIGSTOP {
             return Err(Errno(libc::EINVAL));
         }
         let bit = 1u64 << sig;
