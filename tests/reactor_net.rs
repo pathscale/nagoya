@@ -296,3 +296,21 @@ fn a_write_of_the_whole_send_buffer_fills_it() {
         Err(_) => panic!("follow-up write failed for an unrelated reason"),
     }
 }
+
+#[test]
+fn shared_listeners_on_two_reactors_hold_one_port() {
+    let first_reactor = Reactor::local().expect("reactor");
+    let first =
+        TcpListener::bind_shared(Addr::localhost(0), &first_reactor.handle()).expect("bind");
+    let addr = first.local_addr().expect("addr");
+
+    // A second reactor, as a second shard would have, binds the same port.
+    let second_reactor = Reactor::local().expect("reactor");
+    let second = TcpListener::bind_shared(addr, &second_reactor.handle())
+        .expect("second bind on the same port");
+    assert_eq!(second.local_addr().expect("addr"), addr);
+
+    // A plain bind does not share: the port is taken.
+    let third_reactor = Reactor::local().expect("reactor");
+    assert!(TcpListener::bind(addr, &third_reactor.handle()).is_err());
+}

@@ -516,6 +516,13 @@ impl TcpListener {
         Self::from_listener(listener, handle)
     }
 
+    /// Bind with `SO_REUSEPORT` and register, so that listeners on several
+    /// reactors can share `addr`. See [`Listener::bind_shared`].
+    pub fn bind_shared(addr: Addr, handle: &Handle) -> Result<Self> {
+        let listener = Listener::bind_shared(addr, Self::BACKLOG)?;
+        Self::from_listener(listener, handle)
+    }
+
     /// Adopt an already bound listener.
     pub fn from_listener(listener: Listener, handle: &Handle) -> Result<Self> {
         let registration = handle.register(listener.raw(), Interest::READABLE)?;

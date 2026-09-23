@@ -834,6 +834,28 @@ impl TcpListener {
     /// it, because a bind that quietly removes whatever it finds would remove a
     /// live server's socket.
     pub fn bind(addr: Addr, backlog: i32) -> Result<Self> {
+        Self::bind_with(addr, backlog, false)
+    }
+
+    /// Bind with `SO_REUSEPORT`, so several listeners can share one port.
+    ///
+    /// This is how one server listens on many reactors: each binds its own
+    /// socket to the same address, and the kernel hands every connection to
+    /// exactly one of them. An accepted socket is then registered with the
+    /// reactor that accepted it and never has to cross a thread. Every socket
+    /// on the port must ask for this, the first included.
+    ///
+    /// Linux balances connections across the sockets. macOS and the BSDs
+    /// accept the binds but do not balance, so there it is correct but not
+    /// faster. Not meaningful for Unix-domain sockets, and refused for them.
+    pub fn bind_shared(addr: Addr, backlog: i32) -> Result<Self> {
+        if addr.family() == libc::AF_UNIX {
+            return Err(Errno(libc::EINVAL));
+        }
+        Self::bind_with(addr, backlog, true)
+    }
+
+    fn bind_with(addr: Addr, backlog: i32, reuse_port: bool) -> Result<Self> {
         let family = addr.family();
         let fd = stream_socket(&addr)?;
         // Without this, a restart fails to bind while the previous socket's
@@ -841,6 +863,9 @@ impl TcpListener {
         // socket and no option to ask about, so it is not asked for.
         if family != libc::AF_UNIX {
             set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_REUSEADDR, true)?;
+        }
+        if reuse_port {
+            set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_REUSEPORT, true)?;
         }
 
         // SAFETY: zeroed storage, then written by `write_to`.
