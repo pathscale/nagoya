@@ -5,22 +5,24 @@
 //! `futures-io` readers and writers. A caller moving off tokio changes the
 //! import path and the `AsyncRead` it names, and nothing else.
 //!
-//! # No handle to pass
+//! # The reactor is the caller's
 //!
-//! Every other reactor type in this crate is registered on a reactor the
-//! caller names, because a caller that runs [`block_on`](crate::reactor::block_on)
-//! on its own poller wants its descriptors there. A child process is not that
-//! kind of caller. It is spawned from build scripts, from tests and from
-//! whatever executor a library happens to be polled by, and the future it
-//! hands back has to finish under all of them: `nagoya::block_on`,
-//! `nagoya::spawn`, and an executor this crate has never heard of.
+//! [`Command::spawn`], [`Command::output`] and [`Command::status`] take the
+//! reactor [`Handle`] to register on, exactly as a socket in `net` does. There
+//! is no process-wide reactor behind this module and nothing here starts a
+//! thread: the caller owns the [`Reactor`](crate::reactor::Reactor), decides when its thread starts and
+//! how long it lives, and passes it in.
 //!
-//! So the pipes and the exit notification register on one reactor per
-//! process, started with [`Reactor::start`] the first time anything here is
-//! spawned and kept in a static for the rest of the process. It never drops,
-//! on purpose: dropping a `Reactor` stops its thread, and every descriptor
-//! registered on it would then wait for an edge nobody is left to deliver. A
-//! build that never spawns a child never starts the thread.
+//! That is what lets an application register its signals before any thread
+//! exists, which a Linux `signalfd` requires, and what lets a test give each
+//! case a reactor of its own. The one obligation it puts on the caller is the
+//! usual one: keep the `Reactor` alive while a child spawned on it is. A
+//! dropped `Reactor` stops its thread, and a pipe or exit registered on it
+//! then waits for an edge nobody is left to deliver.
+//!
+//! A reactor started with [`Reactor::start`](crate::reactor::Reactor::start) has a thread of its own that
+//! polls it, so the futures here finish under any executor: `nagoya::block_on`,
+//! `nagoya::spawn`, or one this crate has never heard of.
 //!
 //! # Knowing that a child exited, without asking
 //!
@@ -76,41 +78,13 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 
-use crate::reactor::driver::{Handle, Reactor, Registration};
+use crate::reactor::driver::{Handle, Registration};
 use crate::reactor::poller::Interest;
 
 pub use std::process::{ExitStatus, Output, Stdio};
-
-/// The reactor every pipe and every exit notification in this module uses.
-///
-/// Started on first use and never dropped: a static is not dropped at exit,
-/// and that is the property wanted, because a dropped `Reactor` stops its
-/// thread and strands every registration on it.
-static REACTOR: OnceLock<Reactor> = OnceLock::new();
-
-/// A handle to the process-wide reactor, starting it if this is the first ask.
-///
-/// Not `get_or_init`, because starting a reactor can fail and a failure has to
-/// come back as an error from `spawn` rather than a panic inside a lazy
-/// initialiser. Two threads spawning their first child at the same moment can
-/// both start one; the loser's is dropped here, which stops and joins its
-/// thread before anything was ever registered on it.
-fn reactor() -> io::Result<Handle> {
-    if let Some(reactor) = REACTOR.get() {
-        return Ok(reactor.handle());
-    }
-    let started = Reactor::start()?;
-    if let Err(lost) = REACTOR.set(started) {
-        drop(lost);
-    }
-    match REACTOR.get() {
-        Some(reactor) => Ok(reactor.handle()),
-        None => Err(io::Error::other("the process reactor was not stored")),
-    }
-}
 
 /// A process to spawn, and how.
 ///
@@ -227,6 +201,18 @@ impl Command {
         self
     }
 
+    /// Start the child in process group `pgroup`, `0` meaning a new group led
+    /// by the child itself.
+    ///
+    /// Signalling the group reaches everything the child started as well, so
+    /// stopping a program that spawns helpers does not leave the helpers
+    /// running. The same as tokio's, and `std`'s `CommandExt::process_group`.
+    #[cfg(unix)]
+    pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
+        std::os::unix::process::CommandExt::process_group(&mut self.std, pgroup);
+        self
+    }
+
     /// Whether [`kill_on_drop`](Self::kill_on_drop) is set.
     #[must_use]
     pub fn get_kill_on_drop(&self) -> bool {
@@ -245,18 +231,16 @@ impl Command {
         &mut self.std
     }
 
-    /// Start the child.
+    /// Start the child, with its pipes and its exit registered on `handle`.
     ///
-    /// Returns as soon as it is running, with its pipes registered and its
-    /// exit watched. The reactor is started before the child is, so a
-    /// reactor that cannot start spawns nothing. A child that did start but
-    /// whose pipes or exit could not be registered is killed and reaped
-    /// before the error is returned, rather than left running with nobody
-    /// holding it.
-    pub fn spawn(&mut self) -> io::Result<Child> {
-        let handle = reactor()?;
+    /// Returns as soon as it is running. Keep the reactor behind `handle`
+    /// alive for as long as the child is: its thread is what reports the
+    /// pipes and the exit. A child that did start but whose pipes or exit
+    /// could not be registered is killed and reaped before the error is
+    /// returned, rather than left running with nobody holding it.
+    pub fn spawn(&mut self, handle: &Handle) -> io::Result<Child> {
         let mut child = self.std.spawn()?;
-        match adopt(&mut child, &handle) {
+        match adopt(&mut child, handle) {
             Ok((stdin, stdout, stderr, watch)) => Ok(Child {
                 stdin,
                 stdout,
@@ -279,10 +263,10 @@ impl Command {
     ///
     /// Standard output and standard error are captured whatever they were set
     /// to, as tokio does; standard input is left as configured.
-    pub async fn output(&mut self) -> io::Result<Output> {
+    pub async fn output(&mut self, handle: &Handle) -> io::Result<Output> {
         self.std.stdout(Stdio::piped());
         self.std.stderr(Stdio::piped());
-        let child = self.spawn();
+        let child = self.spawn(handle);
         child?.wait_with_output().await
     }
 
@@ -291,8 +275,8 @@ impl Command {
     /// Any pipes configured are closed on the parent's side before waiting,
     /// because a child blocked writing to a pipe nobody reads, or reading one
     /// nobody writes, would never exit.
-    pub async fn status(&mut self) -> io::Result<ExitStatus> {
-        let mut child = self.spawn()?;
+    pub async fn status(&mut self, handle: &Handle) -> io::Result<ExitStatus> {
+        let mut child = self.spawn(handle)?;
         child.stdin = None;
         child.stdout = None;
         child.stderr = None;

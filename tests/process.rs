@@ -1,10 +1,13 @@
 //! Child processes, through the public API, under three executors.
 //!
 //! The executor is the variable that matters here. A child's pipes and its
-//! exit are registered on a reactor the module starts for itself, so the
-//! claim being tested is that the futures finish whoever polls them:
-//! `nagoya::block_on`, a task on `nagoya::spawn`, and tokio's current thread
-//! runtime, which knows nothing about nagoya's reactor at all.
+//! exit are registered on the reactor the caller passes in, which has a thread
+//! of its own, so the claim being tested is that the futures finish whoever
+//! polls them: `nagoya::block_on`, a task on `nagoya::spawn`, and tokio's
+//! current thread runtime, which knows nothing about nagoya's reactor at all.
+//!
+//! Every test starts its own reactor and keeps it for the whole test. Nothing
+//! is shared between them, so no test can leave state behind for another.
 //!
 //! Every program is a real one from `/bin` or `/usr/bin`, because what could
 //! go wrong is the kernel's half: a pipe that never reports end of file, an
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use nagoya::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use nagoya::reactor::Reactor;
 
 /// How long any one of these may take before it counts as hung.
 ///
@@ -25,6 +29,11 @@ use nagoya::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdi
 /// seconds a test is allowed, so a failure here is a hang rather than a slow
 /// machine.
 const BOUND: Duration = Duration::from_secs(5);
+
+/// A reactor for one test, with a thread of its own polling it.
+fn reactor() -> Reactor {
+    Reactor::start().expect("reactor")
+}
 
 /// Run `future` on tokio's current thread runtime.
 ///
@@ -49,12 +58,13 @@ fn the_handles_are_send() {
 
 #[test]
 fn echo_is_read_to_end_of_file() {
+    let reactor = reactor();
     let started = Instant::now();
     let (output, status) = nagoya::block_on(async {
         let mut child = Command::new("/bin/echo")
             .arg("hello")
             .stdout(Stdio::piped())
-            .spawn()
+            .spawn(&reactor.handle())
             .expect("spawn echo");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut output = Vec::new();
@@ -68,12 +78,14 @@ fn echo_is_read_to_end_of_file() {
 
 #[test]
 fn cat_gives_back_what_it_was_given_once_its_input_is_closed() {
+    let reactor = reactor();
+    let handle = reactor.handle();
     let started = Instant::now();
-    let joined = nagoya::block_on(nagoya::spawn(async {
+    let joined = nagoya::block_on(nagoya::spawn(async move {
         let mut child = Command::new("/bin/cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()
+            .spawn(&handle)
             .expect("spawn cat");
         let mut stdin = child.stdin.take().expect("piped stdin");
         stdin.write_all(b"round trip").await.expect("write");
@@ -94,11 +106,12 @@ fn cat_gives_back_what_it_was_given_once_its_input_is_closed() {
 
 #[test]
 fn a_write_after_close_is_an_error_rather_than_a_hang() {
+    let reactor = reactor();
     nagoya::block_on(async {
         let mut child = Command::new("/bin/cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .spawn()
+            .spawn(&reactor.handle())
             .expect("spawn cat");
         let mut stdin = child.stdin.take().expect("piped stdin");
         stdin.close().await.expect("close");
@@ -109,8 +122,9 @@ fn a_write_after_close_is_an_error_rather_than_a_hang() {
 
 #[test]
 fn false_reports_failure_under_a_foreign_executor() {
+    let reactor = reactor();
     let started = Instant::now();
-    let status = on_tokio(Command::new("/usr/bin/false").status());
+    let status = on_tokio(Command::new("/usr/bin/false").status(&reactor.handle()));
     let status = status.expect("status");
     assert!(!status.success(), "false succeeded");
     assert_eq!(status.code(), Some(1));
@@ -119,11 +133,12 @@ fn false_reports_failure_under_a_foreign_executor() {
 
 #[test]
 fn output_collects_both_streams() {
+    let reactor = reactor();
     let output = on_tokio(
         Command::new("/bin/sh")
             .arg("-c")
             .arg("echo out; echo err 1>&2; exit 3")
-            .output(),
+            .output(&reactor.handle()),
     )
     .expect("output");
     assert_eq!(output.stdout, b"out\n");
@@ -133,11 +148,12 @@ fn output_collects_both_streams() {
 
 #[test]
 fn kill_returns_promptly_and_wait_reports_the_signal() {
+    let reactor = reactor();
     let started = Instant::now();
     nagoya::block_on(async {
         let mut child = Command::new("/bin/sleep")
             .arg("30")
-            .spawn()
+            .spawn(&reactor.handle())
             .expect("spawn sleep");
         assert!(child.id().is_some());
         child.kill().await.expect("kill");
@@ -151,11 +167,34 @@ fn kill_returns_promptly_and_wait_reports_the_signal() {
 }
 
 #[test]
+fn a_process_group_is_signalled_as_one() {
+    let reactor = reactor();
+    let started = Instant::now();
+    nagoya::block_on(async {
+        // The shell starts a sleep of its own and waits for it. Killing the
+        // group has to end both, or the wait below never returns.
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("/bin/sleep 30; exit 0")
+            .process_group(0)
+            .spawn(&reactor.handle())
+            .expect("spawn sh");
+        let group = child.id().expect("running") as libc::pid_t;
+        // SAFETY: a negative pid addresses the process group this test made.
+        assert_eq!(unsafe { libc::kill(-group, libc::SIGKILL) }, 0);
+        let status = child.wait().await.expect("wait after group kill");
+        assert_eq!(status.signal(), Some(9), "status {status:?}");
+    });
+    assert!(started.elapsed() < BOUND, "took {:?}", started.elapsed());
+}
+
+#[test]
 fn a_wait_dropped_part_way_can_be_waited_again() {
+    let reactor = reactor();
     let started = Instant::now();
     let mut child = Command::new("/bin/sleep")
         .arg("0.2")
-        .spawn()
+        .spawn(&reactor.handle())
         .expect("spawn sleep");
     {
         // Polled once, so its waker is parked with the reactor, and then
@@ -175,10 +214,11 @@ fn a_wait_dropped_part_way_can_be_waited_again() {
 
 #[test]
 fn kill_on_drop_kills_and_reaps() {
+    let reactor = reactor();
     let child = Command::new("/bin/sleep")
         .arg("30")
         .kill_on_drop(true)
-        .spawn()
+        .spawn(&reactor.handle())
         .expect("spawn sleep");
     let pid = child.id().expect("running") as libc::pid_t;
     drop(child);
@@ -186,7 +226,8 @@ fn kill_on_drop_kills_and_reaps() {
     // The reactor reaps it on its own thread when the exit arrives, so this
     // has to wait for that to happen rather than expect it already has. A
     // pid that `kill(pid, 0)` cannot find is one that was both killed and
-    // reaped; a zombie would still be found.
+    // reaped; a zombie would still be found. The reactor is held until the
+    // loop ends, because it is what does the reaping.
     let started = Instant::now();
     loop {
         // SAFETY: signal 0 checks for existence and delivers nothing.
@@ -200,17 +241,20 @@ fn kill_on_drop_kills_and_reaps() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    drop(reactor);
 }
 
 #[test]
 fn many_children_at_once_all_finish() {
+    let reactor = reactor();
     let started = Instant::now();
     let mut handles = Vec::new();
     for index in 0..16 {
+        let handle = reactor.handle();
         handles.push(nagoya::spawn(async move {
             let output = Command::new("/bin/echo")
                 .arg(index.to_string())
-                .output()
+                .output(&handle)
                 .await
                 .expect("output");
             assert!(output.status.success());
@@ -226,8 +270,9 @@ fn many_children_at_once_all_finish() {
 
 #[test]
 fn a_missing_program_is_an_error_from_spawn() {
+    let reactor = reactor();
     let error = Command::new("/nonexistent/nagoya-process-test")
-        .spawn()
+        .spawn(&reactor.handle())
         .expect_err("spawned something that does not exist");
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
@@ -236,9 +281,10 @@ fn a_missing_program_is_an_error_from_spawn() {
 /// than inferred from the test finishing.
 #[test]
 fn wait_is_pending_until_the_exit_and_ready_after() {
+    let reactor = reactor();
     let mut child = Command::new("/bin/sleep")
         .arg("0.1")
-        .spawn()
+        .spawn(&reactor.handle())
         .expect("spawn sleep");
     let mut context = Context::from_waker(Waker::noop());
     let mut waiting = pin!(child.wait());
