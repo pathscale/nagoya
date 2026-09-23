@@ -467,8 +467,16 @@ impl Reactor {
         let timeout = match cap {
             Some(0) => Some(0),
             other => {
-                let due = service_timers(&self.shared);
+                let (due, woke) = service_timers(&self.shared);
                 match (other, due) {
+                    // A timer fired here may belong to the task this thread
+                    // polls, and that task's waker skips the syscall for a
+                    // wake raised on the thread inside `poll_once`, which this
+                    // is. Blocking now would sleep through that wake, until an
+                    // unrelated event or the next deadline, and with neither
+                    // coming, forever. So look for I/O without waiting and
+                    // return, and let the caller poll what was woken.
+                    _ if woke => Some(0),
                     (Some(c), Some(d)) => Some(c.min(d)),
                     (Some(c), None) => Some(c),
                     (None, d) => d,
@@ -614,7 +622,9 @@ fn run(shared: &Arc<Shared>) {
     let mut pending: Vec<(u64, Waker)> = Vec::with_capacity(64);
 
     while shared.running.load(Ordering::Acquire) {
-        let timeout = service_timers(shared);
+        // Whether a waker fired does not matter here, unlike in `poll_once`:
+        // this thread runs no tasks, so anything it woke is polled elsewhere.
+        let (timeout, _) = service_timers(shared);
 
         events.clear();
         if shared.poller.wait(&mut events, timeout).is_err() {
@@ -627,28 +637,29 @@ fn run(shared: &Arc<Shared>) {
     }
 }
 
-/// Fire any due timers and return how long the next wait may block.
+/// Fire any due timers and return how long the next wait may block, and
+/// whether a waker was fired on the way.
 ///
 /// The timer wheel is only consulted when the cached deadline says something is
 /// actually due, so a connection delivering a flood of readiness events does
 /// not drag the timer lock along with it. `None` means block until an event
 /// arrives: there is no deadline to wake for.
-fn service_timers(shared: &Arc<Shared>) -> Option<u64> {
+fn service_timers(shared: &Arc<Shared>) -> (Option<u64>, bool) {
     let deadline = shared.next_deadline.load(Ordering::Acquire);
     let now = crate::now_ns();
 
     // Not due yet: wait exactly until it is, and do not touch the wheel.
     if deadline != NO_DEADLINE && deadline > now {
-        return Some(deadline - now);
+        return (Some(deadline - now), false);
     }
 
     // Either a deadline has arrived or a timer was armed and the cache was
     // invalidated. Both mean the wheel has work to report.
-    let next = crate::poll_timers(now);
+    let (next, woke) = crate::time::fire_due(now);
     shared
         .next_deadline
         .store(next.unwrap_or(NO_DEADLINE), Ordering::Release);
-    next.map(|deadline| deadline.saturating_sub(now))
+    (next.map(|deadline| deadline.saturating_sub(now)), woke)
 }
 
 /// Wake the tasks named by `events`.

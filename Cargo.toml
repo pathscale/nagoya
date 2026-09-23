@@ -1,6 +1,6 @@
 [package]
 name = "nagoya"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -112,6 +112,12 @@ required-features = ["reactor"]
 
 [[test]]
 name = "reactor_unix"
+required-features = ["reactor"]
+
+# Its own binary because it installs the process clock, which only the first
+# `set_clock` in a process can do.
+[[test]]
+name = "reactor_local_timeout"
 required-features = ["reactor"]
 
 [[example]]
