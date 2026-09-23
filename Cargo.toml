@@ -20,6 +20,12 @@ std = ["ps-st3/host", "async-task/std", "dep:futures-io", "futures-io/std", "dep
 # build that does not ask for sockets must not acquire a reactor thread as a
 # side effect of depending on this crate.
 reactor = ["std", "dep:libc", "dep:bytes"]
+# Child processes, as `nagoya::process`. Needs the reactor, which is where the
+# pipes and the exit notification register, and `futures-io`, whose `AsyncRead`
+# and `AsyncWrite` the pipes implement. Off by default for the same reason the
+# reactor is: the first spawn starts a reactor thread, and a build that never
+# asked for child processes must not be able to acquire one.
+process = ["reactor", "dep:futures-io"]
 # Count the reactor's syscalls. Off by default: the counters sit on the hottest
 # path in the crate, so they are compiled out rather than branched over.
 syscall-counters = ["reactor"]
@@ -119,6 +125,12 @@ required-features = ["reactor"]
 [[test]]
 name = "reactor_local_timeout"
 required-features = ["reactor"]
+
+# Spawns real programs from /bin and /usr/bin, so it needs the feature and a
+# Unix to run on.
+[[test]]
+name = "process"
+required-features = ["process"]
 
 [[example]]
 name = "core_detect"

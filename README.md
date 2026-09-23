@@ -12,6 +12,14 @@ Typst is the canonical documentation source. Run `sh scripts/build-guide.sh`
 to create both PDFs in `docs/`; Rust examples are extracted and checked by
 `cargo test --doc`.
 
+Version 0.1.12 adds `process`, behind a feature of the same name: `Command`,
+`Child` and the child's pipes, spelled as `tokio::process` spells them, with
+the pipes as `futures-io` readers and writers. They register on a
+process-wide reactor started on first spawn, so they finish under
+`nagoya::block_on`, `nagoya::spawn` or any other executor. A child's exit is a
+`pidfd` on Linux and an `EVFILT_PROC` kqueue on macOS and the BSDs, so nothing
+polls `waitpid`.
+
 Version 0.1.4 adds `reactor`, an off-by-default readiness driver, and with it
 the first implementation of `io::Stream`. It is epoll or kqueue behind a
 feature that implies `std`, on the same terms as `runtime`: a `no_std` build

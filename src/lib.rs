@@ -74,6 +74,12 @@ pub mod guide {}
 #[cfg(feature = "reactor")]
 pub mod net;
 mod par;
+// Child processes, at the path tokio gives them. They register on a reactor of
+// their own that starts on first use, rather than one the caller passes, so a
+// child's futures finish under any executor. Unix only, because the reactor is:
+// see the module comment for how an exit is noticed without polling for it.
+#[cfg(all(feature = "process", unix))]
+pub mod process;
 // Needs an operating system, so it needs `std`. See its module comment for why
 // a crate whose point is running without one carries a driver that cannot.
 #[cfg(feature = "reactor")]
