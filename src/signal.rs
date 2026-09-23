@@ -762,21 +762,34 @@ mod tests {
         let _guard = lock();
         let reactor = Reactor::local().expect("reactor");
         let mut signal = Signal::new(SignalKind::hangup(), &reactor.handle()).expect("signal");
+        // Aimed at this thread, the waiter. Not `raise` on the other thread:
+        // that targets the raising thread, which on Linux inherited the block
+        // `Signal::new` took, so the signal stayed pending there and
+        // `signalfd`, which reports only its reader's and process-wide
+        // signals, never saw it. The test hung until CI cancelled the job.
+        let waiter = unsafe { libc::pthread_self() } as usize;
         let started = AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 while !started.load(Ordering::Acquire) {
                     std::thread::yield_now();
                 }
-                // The waiter needs to reach the kernel wait. A raise that
-                // lands before that is still delivered, by the byte already
-                // being in the pipe; the sleep is what makes this the parked
-                // case rather than that one.
+                // The waiter needs to reach the kernel wait. A signal that
+                // lands before that is still delivered, by being pending
+                // already; the sleep is what makes this the parked case.
                 std::thread::sleep(Duration::from_millis(50));
-                unsafe { libc::raise(libc::SIGHUP) };
+                let status = unsafe { libc::pthread_kill(waiter as libc::pthread_t, libc::SIGHUP) };
+                assert_eq!(status, 0, "pthread_kill");
             });
             started.store(true, Ordering::Release);
-            let got = block_on_with(&reactor, signal.recv()).expect("recv");
+            // Bounded, so a regression fails here in seconds rather than
+            // holding the test lock until CI gives up on the job.
+            let got = block_on_with(
+                &reactor,
+                crate::timeout(Duration::from_secs(5), signal.recv()),
+            )
+            .expect("no SIGHUP within 5s")
+            .expect("recv");
             assert_eq!(got, SignalKind::hangup());
         });
     }
