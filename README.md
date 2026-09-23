@@ -14,9 +14,11 @@ to create both PDFs in `docs/`; Rust examples are extracted and checked by
 
 Version 0.1.12 adds `process`, behind a feature of the same name: `Command`,
 `Child` and the child's pipes, spelled as `tokio::process` spells them, with
-the pipes as `futures-io` readers and writers. They register on a
-process-wide reactor started on first spawn, so they finish under
-`nagoya::block_on`, `nagoya::spawn` or any other executor. A child's exit is a
+the pipes as `futures-io` readers and writers. `spawn`, `output` and `status`
+take the reactor `Handle` to register on, as a socket does: there is no
+process-wide reactor and nothing starts a thread behind the caller's back. On a
+reactor with a thread of its own they finish under `nagoya::block_on`,
+`nagoya::spawn` or any other executor. A child's exit is a
 `pidfd` on Linux and an `EVFILT_PROC` kqueue on macOS and the BSDs, so nothing
 polls `waitpid`.
 
