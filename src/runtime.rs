@@ -74,19 +74,46 @@ impl Runtime {
     /// the underlying pool's worker bitmap capacity.
     #[must_use]
     pub fn with_tuning(workers: usize, tuning: Tuning, label: &str) -> Self {
-        let workers = workers.max(1);
+        // Built directly rather than from `builder()`, whose default count asks
+        // the platform for a number this is about to replace.
+        Builder {
+            workers,
+            tuning,
+            label: alloc::string::String::from(label),
+            stack_size: None,
+        }
+        .build()
+    }
+
+    /// Everything [`Runtime::with_tuning`] sets, plus what it does not, such as
+    /// the worker threads' stack size.
+    ///
+    /// Starts at what [`background`] is built with: one worker per fast core,
+    /// the default tuning, the label `nagoya` and `std`'s default stack. So a
+    /// caller that wants the shared pool's shape with one thing changed says
+    /// only that thing.
+    pub fn builder() -> Builder {
+        Builder::new()
+    }
+
+    fn start(builder: &Builder) -> Self {
+        let workers = builder.workers.max(1);
         assert!(
             workers <= usize::BITS as usize,
             "worker count exceeds the pool bitmap capacity"
         );
         let host = Arc::new(StdHost::new(workers));
         let parking = host.clone();
-        let pool = Pool::with_tuning(workers, 1024, host, tuning);
+        let pool = Pool::with_tuning(workers, 1024, host, builder.tuning);
+        let label = &builder.label;
         for id in 0..workers {
             let pool = pool.clone();
             let runner = pool.runner(id);
-            std::thread::Builder::new()
-                .name(alloc::format!("{label}-{id}"))
+            let mut thread = std::thread::Builder::new().name(alloc::format!("{label}-{id}"));
+            if let Some(bytes) = builder.stack_size {
+                thread = thread.stack_size(bytes);
+            }
+            thread
                 .spawn(move || {
                     // Tells the scheduler that a wake happening on this thread
                     // belongs to worker `id`, so it can skip the injector. See
@@ -134,6 +161,80 @@ impl Runtime {
     #[must_use]
     pub fn pool(&self) -> &Arc<Pool> {
         self.executor.pool()
+    }
+}
+
+/// A [`Runtime`] described before it is started, from [`Runtime::builder`].
+///
+/// Exists for the settings that [`Runtime::with_tuning`] has no argument for.
+/// Adding one there would break every caller; adding one here breaks none.
+///
+/// # Stack size
+///
+/// A worker's stack is where every task it polls runs, so it bounds how deep a
+/// task can recurse. Unset, a worker gets what `std::thread` gives any thread:
+/// `RUST_MIN_STACK` when the process has it, two MiB when it does not. That
+/// makes the stack a property of whoever launched the process, which is wrong
+/// for a caller whose tasks recurse by design and know how far. Such a caller
+/// sets it here, and the environment stops mattering.
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct Builder {
+    workers: usize,
+    tuning: Tuning,
+    label: alloc::string::String,
+    stack_size: Option<usize>,
+}
+
+impl Builder {
+    fn new() -> Self {
+        Self {
+            workers: shared_threads(),
+            tuning: Tuning::default(),
+            label: alloc::string::String::from("nagoya"),
+            stack_size: None,
+        }
+    }
+
+    /// Worker threads. Zero means one, as in [`Runtime::new`]. Unset, the
+    /// count [`background`] uses.
+    pub fn workers(mut self, workers: usize) -> Self {
+        self.workers = workers;
+        self
+    }
+
+    /// The idle policy. [`Tuning::default`] unless set.
+    pub fn tuning(mut self, tuning: Tuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+
+    /// Threads are named `{label}-{id}`. `nagoya` unless set.
+    pub fn label(mut self, label: &str) -> Self {
+        self.label = alloc::string::String::from(label);
+        self
+    }
+
+    /// Each worker thread's stack, in bytes.
+    ///
+    /// Rounded up by the platform to its page size and minimum, as
+    /// `std::thread::Builder::stack_size` is. See the type's documentation for
+    /// what happens when it is not set.
+    pub fn stack_size(mut self, bytes: usize) -> Self {
+        self.stack_size = Some(bytes);
+        self
+    }
+
+    /// Start the threads.
+    ///
+    /// # Panics
+    ///
+    /// As [`Runtime::with_tuning`] does: if a thread cannot be started, which
+    /// includes a stack the platform will not allocate, or if the worker count
+    /// exceeds `usize::BITS`.
+    #[must_use]
+    pub fn build(&self) -> Runtime {
+        Runtime::start(self)
     }
 }
 
@@ -316,6 +417,28 @@ mod tests {
         let worker = block_on(task);
         runtime.pool().shut_down();
         assert_eq!(worker, Some(Some(0)));
+    }
+
+    /// A task that needs more stack than `std`'s two MiB default runs on a
+    /// runtime that asked for more.
+    ///
+    /// Four MiB of locals overflows a default worker, so this fails without
+    /// the setting unless the process was started with a large
+    /// `RUST_MIN_STACK`, which is the dependence the setting exists to remove.
+    #[test]
+    fn a_built_runtime_gives_its_workers_the_stack_it_asked_for() {
+        let runtime = Runtime::builder()
+            .workers(1)
+            .label("stack-test")
+            .stack_size(16 * 1024 * 1024)
+            .build();
+        let task = runtime.spawn(async {
+            let buffer = core::hint::black_box([1_u8; 4 * 1024 * 1024]);
+            buffer.iter().map(|&byte| usize::from(byte)).sum::<usize>()
+        });
+        let sum = block_on(task);
+        runtime.pool().shut_down();
+        assert_eq!(sum, Some(4 * 1024 * 1024));
     }
 
     #[test]
