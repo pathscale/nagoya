@@ -12,6 +12,11 @@ Typst is the canonical documentation source. Run `sh scripts/build-guide.sh`
 to create both PDFs in `docs/`; Rust examples are extracted and checked by
 `cargo test --doc`.
 
+Version 0.1.15 adds `net::UdpSocket` to the reactor: `bind`, `recv_from` and
+`send_to`, with the receive writing straight into the caller's slice, so a
+datagram costs no buffer and no allocation. One task can receive while
+another sends on the same socket.
+
 Version 0.1.14 adds `Runtime::builder()`, which takes what `with_tuning` does
 plus the worker threads' stack size. Without it a worker's stack is whatever
 `RUST_MIN_STACK` says, or two MiB, so a caller whose tasks recurse deeply had
