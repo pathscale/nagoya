@@ -1,12 +1,12 @@
 //! Sockets over the reactor, through the public API.
 //!
 //! These live here rather than inside `src/reactor/net.rs` because they need
-//! nothing the crate does not already export: a listener, a stream, a reactor
-//! and `block_on`. A test that only uses the public surface is an integration
-//! test, and keeping it beside the implementation only makes the
-//! implementation longer to read.
+//! nothing the crate does not already export: a listener, a stream or
+//! datagram socket, a reactor and `block_on`. A test that only uses the public
+//! surface is an integration test, and keeping it beside the implementation
+//! only makes the implementation longer to read.
 
-use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream};
+use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream, UdpSocket};
 
 /// A socket is usable through the trait, not just beside it.
 ///
@@ -59,6 +59,120 @@ fn a_socket_reads_and_writes_through_the_stream_trait() {
 /// Port zero: the kernel picks a free one, which `local_addr` reports.
 fn local() -> Addr {
     Addr::localhost(0)
+}
+
+#[test]
+fn udp_round_trips_to_an_explicit_addr() {
+    let reactor = Reactor::local().expect("reactor");
+    let handle = reactor.handle();
+    let receiver = UdpSocket::bind(local(), &handle).expect("receiver bind");
+    let sender = UdpSocket::bind(local(), &handle).expect("sender bind");
+    let destination = receiver.local_addr().expect("receiver addr");
+    let source = sender.local_addr().expect("sender addr");
+
+    let (sent, received, from, payload) = nagoya::reactor::block_on_with(&reactor, async {
+        let sent = sender.send_to(b"ping", destination).await.expect("send");
+        let mut buffer = [0u8; 8];
+        let (received, from) = receiver.recv_from(&mut buffer).await.expect("receive");
+        (sent, received, from, buffer[..received].to_vec())
+    });
+
+    assert_eq!(sent, 4);
+    assert_eq!(received, 4);
+    assert_eq!(payload, b"ping");
+    assert_eq!(from, source);
+}
+
+#[test]
+fn udp_receives_many_queued_datagrams_without_loss() {
+    const COUNT: u32 = 64;
+
+    let reactor = Reactor::local().expect("reactor");
+    let handle = reactor.handle();
+    let receiver = UdpSocket::bind(local(), &handle).expect("receiver bind");
+    let sender = UdpSocket::bind(local(), &handle).expect("sender bind");
+    let destination = receiver.local_addr().expect("receiver addr");
+    let source = sender.local_addr().expect("sender addr");
+
+    let received = nagoya::reactor::block_on_with(&reactor, async {
+        let first = 0u32.to_be_bytes();
+        sender.send_to(&first, destination).await.expect("send");
+        sender.send_to(&[], destination).await.expect("empty send");
+        for sequence in 1..COUNT {
+            let bytes = sequence.to_be_bytes();
+            sender.send_to(&bytes, destination).await.expect("send");
+        }
+
+        let mut buffer = [0u8; 4];
+        let mut seen = Vec::with_capacity(COUNT as usize);
+        let (length, from) = receiver.recv_from(&mut buffer).await.expect("receive");
+        assert_eq!(length, buffer.len());
+        assert_eq!(from, source);
+        seen.push(u32::from_be_bytes(buffer));
+
+        let (length, from) = receiver
+            .recv_from(&mut buffer)
+            .await
+            .expect("empty receive");
+        assert_eq!(length, 0);
+        assert_eq!(from, source);
+        // Sequence zero and the empty datagram were read above.
+        for _ in 1..COUNT {
+            let (length, from) = receiver.recv_from(&mut buffer).await.expect("receive");
+            assert_eq!(length, buffer.len());
+            assert_eq!(from, source);
+            seen.push(u32::from_be_bytes(buffer));
+        }
+        seen
+    });
+
+    assert_eq!(received, (0..COUNT).collect::<Vec<_>>());
+}
+
+#[test]
+fn udp_receive_parks_and_wakes_for_the_next_datagram() {
+    use core::task::Poll;
+
+    let reactor = Reactor::local().expect("reactor");
+    let handle = reactor.handle();
+    let receiver = UdpSocket::bind(local(), &handle).expect("receiver bind");
+    let destination = receiver.local_addr().expect("receiver addr");
+    let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+
+    // Send only after the receive poll has returned Pending, so this exercises
+    // the parked waker rather than a datagram that arrived before first poll.
+    let sender = std::thread::spawn(move || {
+        pending_rx.recv().expect("receive poll");
+        let sender = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("peer bind");
+        sender
+            .send_to(
+                b"wake",
+                std::net::SocketAddr::from(([127, 0, 0, 1], destination.port())),
+            )
+            .expect("peer send");
+    });
+
+    let mut buffer = [0u8; 8];
+    let mut announced_pending = false;
+    let (length, from) = nagoya::reactor::block_on_with(
+        &reactor,
+        std::future::poll_fn(|cx| match receiver.poll_recv_from(cx, &mut buffer) {
+            Poll::Pending => {
+                if !announced_pending {
+                    pending_tx.send(()).expect("announce pending receive");
+                    announced_pending = true;
+                }
+                Poll::Pending
+            }
+            ready => ready,
+        }),
+    )
+    .expect("receive");
+
+    sender.join().expect("peer");
+    assert_eq!(length, 4);
+    assert_eq!(&buffer[..length], b"wake");
+    assert!(matches!(from, Addr::V4([127, 0, 0, 1], port) if port != 0));
 }
 
 #[test]

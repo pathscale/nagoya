@@ -36,9 +36,10 @@
 //!
 //! [`Reactor`] owns the poller and a thread; [`Handle`] registers descriptors
 //! with it; [`Registration`] parks a waker for one descriptor's readability or
-//! writability. [`TcpStream`] and [`TcpListener`] are the ordinary sockets
-//! built on that, and [`TcpStream`] implements [`crate::io::Stream`], which
-//! this crate declared without providing an implementation. [`resolve`] turns
+//! writability. [`TcpStream`], [`TcpListener`] and [`UdpSocket`] are the
+//! ordinary sockets built on that, and [`TcpStream`] implements
+//! [`crate::io::Stream`], which this crate declared without providing an
+//! implementation. [`resolve`] turns
 //! a hostname into those addresses, and [`connect_any`] tries them in order.
 //! [`Signal`] waits for a unix signal. The descriptor it registers is a
 //! `signalfd` on Linux and the read end of a pipe on the BSDs: [`Registration`]
@@ -71,7 +72,7 @@ pub use crate::net;
 pub use crate::resolve;
 pub use crate::signal;
 
-pub use crate::net::{TcpListener, TcpStream};
+pub use crate::net::{TcpListener, TcpStream, UdpSocket};
 // The module above and the function here share a name and do not collide:
 // a module is in the type namespace and a function in the value namespace.
 // Keeping the function called `resolve` is what makes `nagoya::reactor::
