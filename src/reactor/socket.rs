@@ -26,8 +26,8 @@
 //!
 //! # What it is not
 //!
-//! Not a general sockets library. There is no UDP and no dual-stack fallback.
-//! Name resolution is [`resolve`](super::resolve); an address arrives at this
+//! Not a general sockets library. There is no dual-stack fallback. Name
+//! resolution is [`resolve`](super::resolve); an address arrives at this
 //! module already resolved. What the fleet does not use is not here.
 
 // Calling the kernel is this module's entire purpose.
@@ -533,6 +533,35 @@ fn stream_socket(addr: &Addr) -> Result<Fd> {
     Ok(fd)
 }
 
+/// Create a non-blocking datagram socket for `addr`'s family.
+fn datagram_socket(addr: &Addr) -> Result<Fd> {
+    // SOCK_NONBLOCK and SOCK_CLOEXEC are Linux extensions to `socket`; the
+    // BSDs set both flags after creation, before the descriptor is published.
+    #[cfg(target_os = "linux")]
+    let raw = check(unsafe {
+        libc::socket(
+            addr.family(),
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    })?;
+
+    #[cfg(not(target_os = "linux"))]
+    let raw = {
+        let raw = check(unsafe { libc::socket(addr.family(), libc::SOCK_DGRAM, 0) })?;
+        // SAFETY: `raw` is a descriptor the call above just returned.
+        unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        raw
+    };
+
+    // SAFETY: `raw` is a fresh descriptor owned exclusively here.
+    Ok(unsafe { Fd::from_raw(raw) })
+}
+
 /// Set a boolean socket option.
 fn set_flag(fd: i32, level: libc::c_int, name: libc::c_int, on: bool) -> Result<()> {
     let value: libc::c_int = i32::from(on);
@@ -541,6 +570,22 @@ fn set_flag(fd: i32, level: libc::c_int, name: libc::c_int, on: bool) -> Result<
         libc::setsockopt(
             fd,
             level,
+            name,
+            core::ptr::addr_of!(value).cast(),
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    })?;
+    Ok(())
+}
+
+/// Set an integer socket option, used for send and receive buffer sizes.
+fn set_socket_int(fd: i32, name: libc::c_int, value: usize) -> Result<()> {
+    let value = libc::c_int::try_from(value).map_err(|_| Errno(libc::EINVAL))?;
+    // SAFETY: SO_RCVBUF and SO_SNDBUF take an int, which is what is passed.
+    check(unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
             name,
             core::ptr::addr_of!(value).cast(),
             mem::size_of::<libc::c_int>() as libc::socklen_t,
@@ -810,6 +855,124 @@ impl TcpSocket {
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             Err(error)
+        } else {
+            Ok(sent as usize)
+        }
+    }
+}
+
+/// A non-blocking datagram socket.
+#[derive(Debug)]
+pub struct UdpSocket(Fd);
+
+impl UdpSocket {
+    /// Bind a datagram socket to `addr`.
+    pub fn bind(addr: Addr) -> Result<Self> {
+        Self::bind_with(addr, false)
+    }
+
+    /// Bind with `SO_REUSEADDR` enabled for IP addresses before they are
+    /// claimed.
+    pub fn bind_reuse_addr(addr: Addr) -> Result<Self> {
+        Self::bind_with(addr, true)
+    }
+
+    fn bind_with(addr: Addr, reuse_addr: bool) -> Result<Self> {
+        let fd = datagram_socket(&addr)?;
+        if reuse_addr && addr.family() != libc::AF_UNIX {
+            set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_REUSEADDR, true)?;
+        }
+
+        // SAFETY: zeroed storage, then written by `write_to` for this family.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let len = addr.write_to(&mut storage);
+        // SAFETY: `storage` holds a valid address of `len` bytes.
+        check(unsafe { libc::bind(fd.raw(), core::ptr::addr_of!(storage).cast(), len) })?;
+        Ok(Self(fd))
+    }
+
+    /// Adopt an existing non-blocking datagram descriptor.
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be an open, non-blocking datagram socket that nothing else
+    /// will close.
+    pub unsafe fn from_raw(fd: i32) -> Self {
+        Self(Fd::from_raw(fd))
+    }
+
+    /// The descriptor, for registering with the poller.
+    #[inline]
+    pub fn raw(&self) -> i32 {
+        self.0.raw()
+    }
+
+    /// This socket's own address.
+    pub fn local_addr(&self) -> Result<Addr> {
+        addr_of(self.raw(), false)
+    }
+
+    /// Set the kernel receive-buffer capacity in bytes.
+    pub fn set_recv_buffer(&self, size: usize) -> Result<()> {
+        set_socket_int(self.raw(), libc::SO_RCVBUF, size)
+    }
+
+    /// Set the kernel send-buffer capacity in bytes.
+    pub fn set_send_buffer(&self, size: usize) -> Result<()> {
+        set_socket_int(self.raw(), libc::SO_SNDBUF, size)
+    }
+
+    /// Receive one datagram directly into caller-owned memory.
+    ///
+    /// A datagram larger than `len` is truncated by the kernel. The returned
+    /// count is the number of bytes copied into the buffer.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must be valid for writes of `len` bytes.
+    pub unsafe fn recv_from(&self, pointer: *mut u8, len: usize) -> Result<(usize, Addr)> {
+        // SAFETY: zeroed storage is valid for the kernel to fill with a peer
+        // address, and `address_len` describes the full storage.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut address_len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: the caller guarantees the receive buffer, while the address
+        // storage and its length are live locals of the right types.
+        let read = unsafe {
+            libc::recvfrom(
+                self.raw(),
+                pointer.cast(),
+                len,
+                0,
+                core::ptr::addr_of_mut!(storage).cast(),
+                core::ptr::addr_of_mut!(address_len),
+            )
+        };
+        if read < 0 {
+            return Err(crate::reactor::error::last());
+        }
+        let addr = Addr::read_from(&storage, address_len).ok_or(Errno(libc::EAFNOSUPPORT))?;
+        Ok((read as usize, addr))
+    }
+
+    /// Send one datagram from caller-owned memory to `target`.
+    pub fn send_to(&self, buffer: &[u8], target: Addr) -> Result<usize> {
+        // SAFETY: zeroed storage, then written by `write_to` for this family.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let address_len = target.write_to(&mut storage);
+        // SAFETY: the buffer and address storage are live for the call, and
+        // `address_len` describes the address written above.
+        let sent = unsafe {
+            libc::sendto(
+                self.raw(),
+                buffer.as_ptr().cast(),
+                buffer.len(),
+                0,
+                core::ptr::addr_of!(storage).cast(),
+                address_len,
+            )
+        };
+        if sent < 0 {
+            Err(crate::reactor::error::last())
         } else {
             Ok(sent as usize)
         }

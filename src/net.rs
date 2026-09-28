@@ -1,4 +1,4 @@
-//! Non-blocking TCP over the reactor.
+//! Non-blocking TCP and UDP over the reactor.
 //!
 //! # No `std::net`
 //!
@@ -16,10 +16,12 @@
 //!
 //! # The edge triggered contract
 //!
-//! Every read and write loops until the kernel says `EWOULDBLOCK`, and only
-//! then parks a waker. Registering interest without first draining would wait
-//! for an edge that has already passed, and the task would hang with data
-//! sitting in the socket buffer.
+//! Readiness is parked only after the kernel says `EWOULDBLOCK`. A TCP read
+//! can return after filling its slice, so it restores readiness when data may
+//! remain. A UDP read consumes one datagram and restores readiness for the
+//! next poll; only an attempted receive that would block proves the queue is
+//! drained. Registering interest without either step would wait for an edge
+//! that has already passed, and the task would hang with data in the socket.
 
 // Reading into uninitialised memory is the one thing this module does that the
 // safe subset cannot express; see `poll_read_buf`.
@@ -31,7 +33,9 @@ use core::task::{Context, Poll};
 use crate::reactor::driver::{Handle, Registration};
 use crate::reactor::error::Result;
 use crate::reactor::poller::Interest;
-use crate::reactor::socket::{Addr, TcpListener as Listener, TcpSocket};
+use crate::reactor::socket::{
+    Addr, TcpListener as Listener, TcpSocket, UdpSocket as DatagramSocket,
+};
 
 /// Name resolution, which tokio also puts under `net`.
 ///
@@ -578,6 +582,170 @@ impl core::future::Future for Accept<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.listener.poll_accept(cx)
+    }
+}
+
+/// A message-oriented socket that yields instead of blocking.
+///
+/// The receiver and sender have separate readiness slots, so one task may
+/// receive while another sends on the same socket. There is one waker slot per
+/// direction: serialize receives with each other and sends with each other.
+#[derive(Debug)]
+pub struct UdpSocket {
+    inner: DatagramSocket,
+    registration: Registration,
+}
+
+impl UdpSocket {
+    /// Bind a non-blocking socket and register it for reads and writes.
+    pub fn bind(addr: Addr, handle: &Handle) -> Result<Self> {
+        Self::from_socket(DatagramSocket::bind(addr)?, handle)
+    }
+
+    /// Bind with `SO_REUSEADDR` enabled for IP addresses before they are
+    /// claimed.
+    pub fn bind_reuse_addr(addr: Addr, handle: &Handle) -> Result<Self> {
+        Self::from_socket(DatagramSocket::bind_reuse_addr(addr)?, handle)
+    }
+
+    /// Adopt an existing non-blocking datagram socket.
+    pub fn from_socket(socket: DatagramSocket, handle: &Handle) -> Result<Self> {
+        let registration = handle.register(socket.raw(), Interest::BOTH)?;
+        Ok(Self {
+            inner: socket,
+            registration,
+        })
+    }
+
+    /// This socket's own address.
+    pub fn local_addr(&self) -> Result<Addr> {
+        self.inner.local_addr()
+    }
+
+    /// Set the kernel receive-buffer capacity in bytes.
+    pub fn set_recv_buffer(&self, size: usize) -> Result<()> {
+        self.inner.set_recv_buffer(size)
+    }
+
+    /// Set the kernel send-buffer capacity in bytes.
+    pub fn set_send_buffer(&self, size: usize) -> Result<()> {
+        self.inner.set_send_buffer(size)
+    }
+
+    /// Receive one datagram directly into `buffer`.
+    ///
+    /// The receive is zero-copy at the crate boundary: the kernel writes into
+    /// the caller's slice, with no intermediate buffer or per-datagram
+    /// allocation. A larger datagram is truncated to fit.
+    pub fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<Result<(usize, Addr)>> {
+        if !self.registration.take_readable_or_park(cx.waker()) {
+            return Poll::Pending;
+        }
+        loop {
+            // SAFETY: `buffer` is live for this call, and the socket writes no
+            // more than its length into it.
+            match unsafe { self.inner.recv_from(buffer.as_mut_ptr(), buffer.len()) } {
+                Ok(received) => {
+                    // One datagram does not drain the receive queue. Keep this
+                    // registration ready so the next poll can try another;
+                    // if there is none, it will see EWOULDBLOCK and park.
+                    // This also handles queued zero-length datagrams, which
+                    // FIONREAD cannot distinguish from an empty queue.
+                    self.registration.mark_readable();
+                    return Poll::Ready(Ok(received));
+                }
+                Err(error) if error.would_block() => {
+                    self.registration.poll_readable(cx.waker());
+                    return Poll::Pending;
+                }
+                Err(error) if error.interrupted() => continue,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+
+    /// Send one datagram to `target`, parking if the send buffer is full.
+    pub fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+        target: Addr,
+    ) -> Poll<Result<usize>> {
+        if !self.registration.take_writable_or_park(cx.waker()) {
+            return Poll::Pending;
+        }
+        loop {
+            match self.inner.send_to(buffer, target) {
+                Ok(sent) => {
+                    // Datagram sends are atomic: after this one fit, let the
+                    // next send attempt the syscall. If concurrent senders
+                    // have since filled the buffer it will park on
+                    // EWOULDBLOCK below.
+                    self.registration.mark_writable();
+                    return Poll::Ready(Ok(sent));
+                }
+                Err(error) if error.would_block() => {
+                    self.registration.poll_writable(cx.waker());
+                    return Poll::Pending;
+                }
+                Err(error) if error.interrupted() => continue,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+
+    /// Receive one datagram, as a future.
+    pub fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> RecvFrom<'a> {
+        RecvFrom {
+            socket: self,
+            buffer,
+        }
+    }
+
+    /// Send one datagram to `target`, as a future.
+    pub fn send_to<'a>(&'a self, buffer: &'a [u8], target: Addr) -> SendTo<'a> {
+        SendTo {
+            socket: self,
+            buffer,
+            target,
+        }
+    }
+}
+
+/// The future returned by [`UdpSocket::recv_from`].
+#[derive(Debug)]
+pub struct RecvFrom<'a> {
+    socket: &'a UdpSocket,
+    buffer: &'a mut [u8],
+}
+
+impl core::future::Future for RecvFrom<'_> {
+    type Output = Result<(usize, Addr)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.socket.poll_recv_from(cx, this.buffer)
+    }
+}
+
+/// The future returned by [`UdpSocket::send_to`].
+#[derive(Debug)]
+pub struct SendTo<'a> {
+    socket: &'a UdpSocket,
+    buffer: &'a [u8],
+    target: Addr,
+}
+
+impl core::future::Future for SendTo<'_> {
+    type Output = Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.socket.poll_send_to(cx, this.buffer, this.target)
     }
 }
 
