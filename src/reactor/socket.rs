@@ -26,7 +26,8 @@
 //!
 //! # What it is not
 //!
-//! Not a general sockets library. There is no UDP and no dual-stack fallback.
+//! Not a general sockets library. TCP and UDP use explicit address families;
+//! there is no automatic dual-stack fallback.
 //! Name resolution is [`resolve`](super::resolve); an address arrives at this
 //! module already resolved. What the fleet does not use is not here.
 
@@ -292,6 +293,11 @@ pub enum Addr {
     V4([u8; 4], u16),
     /// An IPv6 address and port.
     V6([u8; 16], u16),
+    /// An IPv6 address, port and interface scope ID.
+    ///
+    /// Use this for addresses such as link-local IPv6 addresses that require
+    /// an interface. A scope ID of zero is reported back as [`Self::V6`].
+    V6Scoped([u8; 16], u16, u32),
     /// A Unix-domain socket's name, or its lack of one.
     Path(UnixPath),
 }
@@ -319,7 +325,7 @@ impl Addr {
     /// transport is a file.
     pub const fn port(&self) -> u16 {
         match self {
-            Self::V4(_, port) | Self::V6(_, port) => *port,
+            Self::V4(_, port) | Self::V6(_, port) | Self::V6Scoped(_, port, _) => *port,
             Self::Path(_) => 0,
         }
     }
@@ -328,7 +334,7 @@ impl Addr {
     const fn family(&self) -> libc::c_int {
         match self {
             Self::V4(..) => libc::AF_INET,
-            Self::V6(..) => libc::AF_INET6,
+            Self::V6(..) | Self::V6Scoped(..) => libc::AF_INET6,
             Self::Path(_) => libc::AF_UNIX,
         }
     }
@@ -347,13 +353,17 @@ impl Addr {
                 }
                 mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
             }
-            Self::V6(octets, port) => {
+            Self::V6(octets, port) | Self::V6Scoped(octets, port, _) => {
                 let addr = storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6;
                 // SAFETY: as above, for the v6 layout.
                 unsafe {
                     (*addr).sin6_family = libc::AF_INET6 as libc::sa_family_t;
                     (*addr).sin6_port = port.to_be();
                     (*addr).sin6_addr.s6_addr = *octets;
+                    (*addr).sin6_scope_id = match self {
+                        Self::V6Scoped(_, _, scope) => *scope,
+                        _ => 0,
+                    };
                 }
                 mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
             }
@@ -399,10 +409,14 @@ impl Addr {
                 let addr = storage as *const libc::sockaddr_storage as *const libc::sockaddr_in6;
                 // SAFETY: the family field says this is a `sockaddr_in6`.
                 unsafe {
-                    Some(Self::V6(
-                        (*addr).sin6_addr.s6_addr,
-                        u16::from_be((*addr).sin6_port),
-                    ))
+                    let octets = (*addr).sin6_addr.s6_addr;
+                    let port = u16::from_be((*addr).sin6_port);
+                    let scope = (*addr).sin6_scope_id;
+                    Some(if scope == 0 {
+                        Self::V6(octets, port)
+                    } else {
+                        Self::V6Scoped(octets, port, scope)
+                    })
                 }
             }
             libc::AF_UNIX => {
@@ -568,6 +582,248 @@ fn addr_of(fd: i32, peer: bool) -> Result<Addr> {
         )
     })?;
     Addr::read_from(&storage, len).ok_or(Errno(libc::EAFNOSUPPORT))
+}
+
+/// The result of consuming one UDP datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Datagram {
+    /// Bytes copied into the supplied buffer.
+    ///
+    /// This can be zero for an empty datagram or an empty receive buffer.
+    /// Zero does not indicate end of stream.
+    pub len: usize,
+    /// The sender's address, including an IPv6 scope ID when present.
+    pub source: Addr,
+    /// Whether the buffer was too small for the datagram.
+    ///
+    /// The kernel discards the remainder of that datagram. The next receive
+    /// starts with the next datagram. The original length is not reported
+    /// because platforms differ in whether they make it available.
+    pub truncated: bool,
+}
+
+/// Create a UDP descriptor without exposing a blocking socket.
+fn datagram_socket(addr: &Addr) -> Result<Fd> {
+    if matches!(addr, Addr::Path(_)) {
+        return Err(Errno(libc::EAFNOSUPPORT));
+    }
+
+    #[cfg(target_os = "linux")]
+    let fd = {
+        let raw = check(unsafe {
+            libc::socket(
+                addr.family(),
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_UDP,
+            )
+        })?;
+        // SAFETY: this is a fresh descriptor owned exclusively here.
+        unsafe { Fd::from_raw(raw) }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let fd = {
+        let raw =
+            check(unsafe { libc::socket(addr.family(), libc::SOCK_DGRAM, libc::IPPROTO_UDP) })?;
+        // Take ownership before setting flags so every failure closes it.
+        // SAFETY: this is a fresh descriptor owned exclusively here.
+        let fd = unsafe { Fd::from_raw(raw) };
+        let flags = check(unsafe { libc::fcntl(fd.raw(), libc::F_GETFL) })?;
+        check(unsafe { libc::fcntl(fd.raw(), libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
+        let flags = check(unsafe { libc::fcntl(fd.raw(), libc::F_GETFD) })?;
+        check(unsafe { libc::fcntl(fd.raw(), libc::F_SETFD, flags | libc::FD_CLOEXEC) })?;
+        set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_NOSIGPIPE, true)?;
+        fd
+    };
+
+    // An explicit IPv6 socket stays IPv6. Callers that need both families
+    // own one socket for each rather than depending on platform defaults.
+    if addr.family() == libc::AF_INET6 {
+        set_flag(fd.raw(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, true)?;
+    }
+    Ok(fd)
+}
+
+/// An owned, non-blocking IPv4 or IPv6 UDP socket.
+///
+/// Operations here are single syscalls. The reactor-facing futures live in
+/// [`crate::net::UdpSocket`]. Dropping this socket closes its descriptor.
+#[derive(Debug)]
+pub struct UdpSocket {
+    fd: Fd,
+    family: libc::c_int,
+}
+
+impl UdpSocket {
+    /// Bind, optionally enabling `SO_REUSEADDR` before the bind.
+    ///
+    /// A port of zero requests an ephemeral port; [`Self::local_addr`]
+    /// reports the chosen port. Unix-domain addresses are refused.
+    pub fn bind(addr: Addr, reuse_addr: bool) -> Result<Self> {
+        let fd = datagram_socket(&addr)?;
+        set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_REUSEADDR, reuse_addr)?;
+        // SAFETY: zeroed storage is filled for the selected address family.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let len = addr.write_to(&mut storage);
+        // SAFETY: storage holds a valid address of len bytes.
+        check(unsafe { libc::bind(fd.raw(), core::ptr::addr_of!(storage).cast(), len) })?;
+        Ok(Self {
+            fd,
+            family: addr.family(),
+        })
+    }
+
+    /// The descriptor, still owned by this socket.
+    pub fn raw(&self) -> i32 {
+        self.fd.raw()
+    }
+
+    /// This socket's bound address.
+    pub fn local_addr(&self) -> Result<Addr> {
+        addr_of(self.raw(), false)
+    }
+
+    /// The configured peer, or `ENOTCONN` for an unconnected socket.
+    pub fn peer_addr(&self) -> Result<Addr> {
+        addr_of(self.raw(), true)
+    }
+
+    /// Select a peer and let the kernel filter incoming datagrams by it.
+    ///
+    /// UDP has no handshake. A platform that returns `EINPROGRESS` requires
+    /// writable readiness and [`Self::connect_error`] before use.
+    pub fn connect(&self, addr: Addr) -> Result<()> {
+        if addr.family() != self.family {
+            return Err(Errno(libc::EAFNOSUPPORT));
+        }
+        // SAFETY: zeroed storage is filled for the selected address family.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let len = addr.write_to(&mut storage);
+        // SAFETY: storage holds a valid address of len bytes.
+        check(unsafe { libc::connect(self.raw(), core::ptr::addr_of!(storage).cast(), len) })?;
+        Ok(())
+    }
+
+    /// Check the result of an in-flight connect.
+    pub fn connect_error(&self) -> Result<()> {
+        let mut value: libc::c_int = 0;
+        let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: SO_ERROR writes one int into the live value.
+        check(unsafe {
+            libc::getsockopt(
+                self.raw(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                core::ptr::addr_of_mut!(value).cast(),
+                core::ptr::addr_of_mut!(len),
+            )
+        })?;
+        if value == 0 {
+            Ok(())
+        } else {
+            Err(Errno(value))
+        }
+    }
+
+    /// Receive exactly one datagram into potentially uninitialised memory.
+    ///
+    /// Empty datagrams and empty receive buffers are valid. `MSG_TRUNC`
+    /// reports discarded bytes without consuming any following datagram.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must be valid for writes of `len` bytes.
+    pub unsafe fn recv_from(&self, pointer: *mut u8, len: usize) -> Result<Datagram> {
+        let mut storage: libc::sockaddr_storage = mem::zeroed();
+        let mut iovec = libc::iovec {
+            iov_base: pointer.cast(),
+            iov_len: len,
+        };
+        let mut message: libc::msghdr = mem::zeroed();
+        message.msg_name = core::ptr::addr_of_mut!(storage).cast();
+        message.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        message.msg_iov = core::ptr::addr_of_mut!(iovec);
+        message.msg_iovlen = 1;
+
+        #[cfg(feature = "syscall-counters")]
+        crate::reactor::counters::RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Do not pass MSG_TRUNC as an input flag: Linux would then return the
+        // original length instead of the number of initialised bytes.
+        let received = libc::recvmsg(self.raw(), core::ptr::addr_of_mut!(message), 0);
+        if received < 0 {
+            let error = crate::reactor::error::last();
+            #[cfg(feature = "syscall-counters")]
+            if error.would_block() {
+                crate::reactor::counters::RECV_WOULD_BLOCK
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            return Err(error);
+        }
+        let source =
+            Addr::read_from(&storage, message.msg_namelen).ok_or(Errno(libc::EAFNOSUPPORT))?;
+        Ok(Datagram {
+            len: (received as usize).min(len),
+            source,
+            truncated: message.msg_flags & libc::MSG_TRUNC != 0 || received as usize > len,
+        })
+    }
+
+    /// Send one complete datagram to an explicit destination.
+    pub fn send_to(&self, buffer: &[u8], destination: Addr) -> Result<usize> {
+        self.send_datagram(buffer, Some(destination))
+    }
+
+    /// Send one complete datagram to the configured peer.
+    pub fn send(&self, buffer: &[u8]) -> Result<usize> {
+        self.send_datagram(buffer, None)
+    }
+
+    fn send_datagram(&self, buffer: &[u8], destination: Option<Addr>) -> Result<usize> {
+        // SAFETY: zeroed storage is filled before its address is used.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let (address, len) = if let Some(destination) = destination {
+            if destination.family() != self.family {
+                return Err(Errno(libc::EAFNOSUPPORT));
+            }
+            let len = destination.write_to(&mut storage);
+            (core::ptr::addr_of!(storage).cast::<libc::sockaddr>(), len)
+        } else {
+            (core::ptr::null(), 0)
+        };
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_NOSIGNAL;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+
+        #[cfg(feature = "syscall-counters")]
+        crate::reactor::counters::SEND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: buffer and the optional address remain live for the call.
+        let sent = unsafe {
+            libc::sendto(
+                self.raw(),
+                buffer.as_ptr().cast(),
+                buffer.len(),
+                flags,
+                address,
+                len,
+            )
+        };
+        if sent < 0 {
+            let error = crate::reactor::error::last();
+            #[cfg(feature = "syscall-counters")]
+            if error.would_block() {
+                crate::reactor::counters::SEND_WOULD_BLOCK
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Err(error)
+        } else if sent as usize != buffer.len() {
+            // UDP writes are atomic. Never turn a short result into another
+            // datagram by retrying a suffix.
+            Err(Errno(libc::EMSGSIZE))
+        } else {
+            Ok(sent as usize)
+        }
+    }
 }
 
 /// A connected stream socket: TCP, or Unix-domain.

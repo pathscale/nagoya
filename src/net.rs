@@ -1,4 +1,4 @@
-//! Non-blocking TCP over the reactor.
+//! Non-blocking TCP and UDP over the reactor.
 //!
 //! # No `std::net`
 //!
@@ -593,5 +593,370 @@ impl crate::io::Stream for TcpStream {
 
     async fn write_all(&mut self, buffer: &[u8]) -> Result<()> {
         Self::write_all(self, buffer).await
+    }
+}
+
+pub use crate::reactor::socket::Datagram;
+
+/// An owned UDP socket driven by a nagoya reactor.
+///
+/// Each receive consumes one datagram. Successful operations retain readiness
+/// until a subsequent syscall returns `WouldBlock`, including receives of
+/// empty datagrams. UDP must not use TCP's FIONREAD optimisation: zero can
+/// mean that an empty datagram is queued.
+///
+/// Operation futures borrow the socket exclusively, so there is only one
+/// waiter per direction. A transport task can also use the poll methods to
+/// drive sending and receiving together. It must call [`Self::cancel_recv`]
+/// or [`Self::cancel_send`] when abandoning a pending poll operation.
+///
+/// Dropping a pending receive or send future releases its waiter. A pending
+/// receive has consumed nothing, and a pending send has sent nothing.
+/// Dropping the socket deregisters it before closing the descriptor.
+#[derive(Debug)]
+pub struct UdpSocket {
+    // Fields drop in declaration order. The registration must go first.
+    registration: Registration,
+    inner: crate::reactor::socket::UdpSocket,
+}
+
+impl UdpSocket {
+    /// Bind and register an IPv4 or IPv6 UDP socket.
+    ///
+    /// The bind is performed when this future is polled. It never waits for
+    /// network traffic. `SO_REUSEADDR` is disabled by default.
+    pub async fn bind(addr: Addr, handle: &Handle) -> Result<Self> {
+        Self::bind_with_reuse(addr, handle, false).await
+    }
+
+    /// Bind with an explicit `SO_REUSEADDR` setting applied before binding.
+    ///
+    /// IPv6 sockets are IPv6-only. Own a separate IPv4 socket when both
+    /// families are needed. A port of zero selects an ephemeral port.
+    pub async fn bind_with_reuse(addr: Addr, handle: &Handle, reuse_addr: bool) -> Result<Self> {
+        let socket = crate::reactor::socket::UdpSocket::bind(addr, reuse_addr)?;
+        Self::from_socket(socket, handle)
+    }
+
+    /// Register an owned non-blocking UDP socket.
+    pub fn from_socket(socket: crate::reactor::socket::UdpSocket, handle: &Handle) -> Result<Self> {
+        let registration = handle.register(socket.raw(), Interest::BOTH)?;
+        Ok(Self {
+            registration,
+            inner: socket,
+        })
+    }
+
+    /// Select a peer, returning the owned socket once the operation completes.
+    ///
+    /// UDP has no handshake. The kernel filters incoming datagrams by the
+    /// selected peer. The peer must have the same address family as the socket.
+    ///
+    /// This future owns the socket: cancelling an in-flight connect closes
+    /// it, rather than exposing a socket whose peer may have changed.
+    pub async fn connect(self, addr: Addr) -> Result<Self> {
+        match self.inner.connect(addr) {
+            Ok(()) => {
+                self.registration.mark_writable();
+                return Ok(self);
+            }
+            Err(error)
+                if error.0 == libc::EINPROGRESS
+                    || error.0 == libc::EALREADY
+                    || error.interrupted() => {}
+            Err(error) if error.0 == libc::EISCONN => {
+                if self.inner.peer_addr()? == addr {
+                    return Ok(self);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+
+        core::future::poll_fn(|cx| {
+            if !self.registration.take_writable_or_park(cx.waker()) {
+                return Poll::Pending;
+            }
+            loop {
+                match self.inner.connect_error() {
+                    Ok(()) => break,
+                    Err(error) if error.interrupted() => continue,
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
+            }
+            match self.inner.peer_addr() {
+                Ok(peer) if peer == addr => {
+                    self.registration.mark_writable();
+                    Poll::Ready(Ok(()))
+                }
+                Ok(_) => Poll::Ready(Err(crate::reactor::error::Errno(libc::EINVAL))),
+                Err(error) if error.0 == libc::ENOTCONN || error.interrupted() => {
+                    self.registration.poll_writable(cx.waker());
+                    Poll::Pending
+                }
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        })
+        .await?;
+        Ok(self)
+    }
+
+    /// This socket's bound address and actual local port.
+    pub fn local_addr(&self) -> Result<Addr> {
+        self.inner.local_addr()
+    }
+
+    /// The configured peer, or `ENOTCONN` when unconnected.
+    pub fn peer_addr(&self) -> Result<Addr> {
+        self.inner.peer_addr()
+    }
+
+    /// Receive one datagram into an initialised slice.
+    ///
+    /// An empty buffer still consumes one datagram and reports truncation
+    /// when that datagram is nonempty. Zero bytes never mean end of stream.
+    pub fn recv_from<'a>(&'a mut self, buffer: &'a mut [u8]) -> RecvFrom<'a> {
+        RecvFrom {
+            socket: self,
+            buffer,
+        }
+    }
+
+    /// Append one datagram directly into a `BytesMut`'s spare capacity.
+    ///
+    /// No staging copy or initialisation of the spare capacity is needed.
+    /// The returned length counts only the appended bytes. The caller can
+    /// freeze the buffer to share immutable packet ownership without copying.
+    ///
+    /// An empty spare region returns `ENOBUFS` without consuming a datagram.
+    pub fn recv_from_buf<'a>(&'a mut self, buffer: &'a mut bytes::BytesMut) -> RecvFromBuf<'a> {
+        RecvFromBuf {
+            socket: self,
+            buffer,
+        }
+    }
+
+    /// Send one datagram without copying or retaining the supplied bytes.
+    ///
+    /// This also sends empty datagrams. An oversized packet is an error;
+    /// no suffix is retried as a separate datagram.
+    pub fn send_to<'a>(&'a mut self, buffer: &'a [u8], destination: Addr) -> SendTo<'a> {
+        SendTo {
+            socket: self,
+            buffer,
+            destination: Some(destination),
+        }
+    }
+
+    /// Send one datagram to the configured peer.
+    ///
+    /// Returns the kernel's error if no peer has been configured.
+    pub fn send<'a>(&'a mut self, buffer: &'a [u8]) -> SendTo<'a> {
+        SendTo {
+            socket: self,
+            buffer,
+            destination: None,
+        }
+    }
+
+    /// Poll for one datagram, parking the reader only after `WouldBlock`.
+    pub fn poll_recv_from(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<Result<Datagram>> {
+        // SAFETY: the slice is live and writable for its whole length.
+        unsafe { self.poll_recv_into(cx, buffer.as_mut_ptr(), buffer.len()) }
+    }
+
+    /// Poll a receive directly into uninitialised spare buffer capacity.
+    pub fn poll_recv_from_buf(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &mut bytes::BytesMut,
+    ) -> Poll<Result<Datagram>> {
+        let filled = buffer.len();
+        let spare = buffer.spare_capacity_mut();
+        if spare.is_empty() {
+            self.cancel_recv();
+            return Poll::Ready(Err(crate::reactor::error::Errno(libc::ENOBUFS)));
+        }
+        let pointer = spare.as_mut_ptr().cast::<u8>();
+        let capacity = spare.len();
+        // SAFETY: the spare region is allocated, writable and disjoint from
+        // the buffer's initialised prefix. The syscall reports copied bytes.
+        let result = unsafe { self.poll_recv_into(cx, pointer, capacity) };
+        if let Poll::Ready(Ok(datagram)) = &result {
+            // SAFETY: precisely datagram.len bytes in the spare region were
+            // initialised, and the low-level socket clamps that to capacity.
+            unsafe { buffer.set_len(filled + datagram.len) };
+        }
+        result
+    }
+
+    unsafe fn poll_recv_into(
+        &mut self,
+        cx: &mut Context<'_>,
+        pointer: *mut u8,
+        len: usize,
+    ) -> Poll<Result<Datagram>> {
+        if !self.registration.take_readable_or_park(cx.waker()) {
+            return Poll::Pending;
+        }
+        loop {
+            match self.inner.recv_from(pointer, len) {
+                Ok(datagram) => {
+                    // A single datagram never proves the receive queue empty,
+                    // regardless of its size or whether it was truncated.
+                    self.registration.mark_readable();
+                    self.cancel_recv();
+                    return Poll::Ready(Ok(datagram));
+                }
+                Err(error) if error.would_block() => {
+                    self.registration.poll_readable(cx.waker());
+                    return Poll::Pending;
+                }
+                Err(error) if error.interrupted() => continue,
+                Err(error) => {
+                    // An asynchronous UDP error need not drain queued data.
+                    self.registration.mark_readable();
+                    self.cancel_recv();
+                    return Poll::Ready(Err(error));
+                }
+            }
+        }
+    }
+
+    /// Poll sending one datagram to an explicit destination.
+    pub fn poll_send_to(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+        destination: Addr,
+    ) -> Poll<Result<usize>> {
+        self.poll_send_datagram(cx, buffer, Some(destination))
+    }
+
+    /// Poll sending one datagram to the configured peer.
+    pub fn poll_send(&mut self, cx: &mut Context<'_>, buffer: &[u8]) -> Poll<Result<usize>> {
+        self.poll_send_datagram(cx, buffer, None)
+    }
+
+    fn poll_send_datagram(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+        destination: Option<Addr>,
+    ) -> Poll<Result<usize>> {
+        if !self.registration.take_writable_or_park(cx.waker()) {
+            return Poll::Pending;
+        }
+        loop {
+            let result = match destination {
+                Some(destination) => self.inner.send_to(buffer, destination),
+                None => self.inner.send(buffer),
+            };
+            match result {
+                Ok(sent) => {
+                    self.registration.mark_writable();
+                    self.cancel_send();
+                    return Poll::Ready(Ok(sent));
+                }
+                Err(error) if error.would_block() => {
+                    self.registration.poll_writable(cx.waker());
+                    return Poll::Pending;
+                }
+                Err(error) if error.interrupted() => continue,
+                Err(error) => {
+                    // An invalid destination or oversized packet does not
+                    // establish that the socket's send buffer is full.
+                    self.registration.mark_writable();
+                    self.cancel_send();
+                    return Poll::Ready(Err(error));
+                }
+            }
+        }
+    }
+
+    /// Release the waiter for an abandoned direct receive poll.
+    ///
+    /// Cached readiness is preserved. Receive futures call this on drop.
+    pub fn cancel_recv(&mut self) {
+        self.registration.cancel_read_wait();
+    }
+
+    /// Release the waiter for an abandoned direct send poll.
+    ///
+    /// Cached readiness is preserved. Send futures call this on drop.
+    pub fn cancel_send(&mut self) {
+        self.registration.cancel_write_wait();
+    }
+}
+
+/// The cancellation-safe future returned by [`UdpSocket::recv_from`].
+#[derive(Debug)]
+pub struct RecvFrom<'a> {
+    socket: &'a mut UdpSocket,
+    buffer: &'a mut [u8],
+}
+
+impl core::future::Future for RecvFrom<'_> {
+    type Output = Result<Datagram>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.socket.poll_recv_from(cx, this.buffer)
+    }
+}
+
+impl Drop for RecvFrom<'_> {
+    fn drop(&mut self) {
+        self.socket.cancel_recv();
+    }
+}
+
+/// The cancellation-safe future returned by [`UdpSocket::recv_from_buf`].
+#[derive(Debug)]
+pub struct RecvFromBuf<'a> {
+    socket: &'a mut UdpSocket,
+    buffer: &'a mut bytes::BytesMut,
+}
+
+impl core::future::Future for RecvFromBuf<'_> {
+    type Output = Result<Datagram>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.socket.poll_recv_from_buf(cx, this.buffer)
+    }
+}
+
+impl Drop for RecvFromBuf<'_> {
+    fn drop(&mut self) {
+        self.socket.cancel_recv();
+    }
+}
+
+/// The cancellation-safe future returned by UDP send operations.
+#[derive(Debug)]
+pub struct SendTo<'a> {
+    socket: &'a mut UdpSocket,
+    buffer: &'a [u8],
+    destination: Option<Addr>,
+}
+
+impl core::future::Future for SendTo<'_> {
+    type Output = Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.socket
+            .poll_send_datagram(cx, this.buffer, this.destination)
+    }
+}
+
+impl Drop for SendTo<'_> {
+    fn drop(&mut self) {
+        self.socket.cancel_send();
     }
 }

@@ -28,18 +28,18 @@
 //!
 //! The timer integration is the clearest case. The next deadline is cached, so
 //! a socket delivering ten thousand events a second never touches the timer
-//! heap's lock to be told that nothing is due. Socket traffic and timer work
-//! are independent: neither makes the other do any work. `select!` cannot
-//! express that, because it folds every branch into one poll set.
+//! heap's lock to be told, almost always, that nothing is due. Socket traffic
+//! and timer work are independent: neither makes the other do any work.
+//! `select!` cannot express that, because it folds every branch into one poll set.
 //!
 //! # What a caller gets
 //!
 //! [`Reactor`] owns the poller and a thread; [`Handle`] registers descriptors
 //! with it; [`Registration`] parks a waker for one descriptor's readability or
-//! writability. [`TcpStream`] and [`TcpListener`] are the ordinary sockets
-//! built on that, and [`TcpStream`] implements [`crate::io::Stream`], which
-//! this crate declared without providing an implementation. [`resolve`] turns
-//! a hostname into those addresses, and [`connect_any`] tries them in order.
+//! writability. [`TcpStream`], [`TcpListener`] and [`UdpSocket`] are the ordinary
+//! sockets built on that, and [`TcpStream`] implements [`crate::io::Stream`],
+//! which this crate declared without providing an implementation. [`resolve`]
+//! turns a hostname into those addresses, and [`connect_any`] tries them in order.
 //! [`Signal`] waits for a unix signal. The descriptor it registers is a
 //! `signalfd` on Linux and the read end of a pipe on the BSDs: [`Registration`]
 //! names a file descriptor, and `EVFILT_SIGNAL` names a signal number.
@@ -71,7 +71,7 @@ pub use crate::net;
 pub use crate::resolve;
 pub use crate::signal;
 
-pub use crate::net::{TcpListener, TcpStream};
+pub use crate::net::{TcpListener, TcpStream, UdpSocket};
 // The module above and the function here share a name and do not collide:
 // a module is in the type namespace and a function in the value namespace.
 // Keeping the function called `resolve` is what makes `nagoya::reactor::
@@ -82,4 +82,4 @@ pub use driver::{Handle, Reactor, Registration, Sharded};
 pub use error::{Errno, Result};
 pub use local::{block_on, block_on_with, TaskSet};
 pub use poller::{Event, Interest, Poller};
-pub use socket::{Addr, UnixPath, UNIX_PATH_CAPACITY};
+pub use socket::{Addr, Datagram, UnixPath, UNIX_PATH_CAPACITY};
