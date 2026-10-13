@@ -109,7 +109,12 @@ pub fn resolve(host: &str, port: u16) -> core::result::Result<Vec<Addr>, Resolve
             libc::AF_INET6 => {
                 // SAFETY: the family says this is a `sockaddr_in6`.
                 let addr = unsafe { &*(entry.ai_addr as *const libc::sockaddr_in6) };
-                found.push(Addr::V6(addr.sin6_addr.s6_addr, port));
+                let octets = addr.sin6_addr.s6_addr;
+                found.push(if addr.sin6_scope_id == 0 {
+                    Addr::V6(octets, port)
+                } else {
+                    Addr::V6Scoped(octets, port, addr.sin6_scope_id)
+                });
             }
             // A family this crate does not speak, skipped rather than guessed at.
             _ => {}
@@ -202,7 +207,9 @@ mod tests {
         assert!(!addrs.is_empty(), "no addresses");
         assert!(addrs.iter().all(|addr| addr.port() == 1234));
         let v4 = addrs.iter().any(|addr| matches!(addr, Addr::V4(..)));
-        let v6 = addrs.iter().any(|addr| matches!(addr, Addr::V6(..)));
+        let v6 = addrs
+            .iter()
+            .any(|addr| matches!(addr, Addr::V6(..) | Addr::V6Scoped(..)));
         assert!(v4 || v6, "localhost resolved to neither family: {addrs:?}");
     }
 }

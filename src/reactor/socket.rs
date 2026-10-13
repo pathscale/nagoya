@@ -292,6 +292,11 @@ pub enum Addr {
     V4([u8; 4], u16),
     /// An IPv6 address and port.
     V6([u8; 16], u16),
+    /// An IPv6 address, port and interface scope ID.
+    ///
+    /// Use this for addresses such as link-local IPv6 addresses that require
+    /// an interface. A scope ID of zero is reported back as [`Self::V6`].
+    V6Scoped([u8; 16], u16, u32),
     /// A Unix-domain socket's name, or its lack of one.
     Path(UnixPath),
 }
@@ -319,7 +324,7 @@ impl Addr {
     /// transport is a file.
     pub const fn port(&self) -> u16 {
         match self {
-            Self::V4(_, port) | Self::V6(_, port) => *port,
+            Self::V4(_, port) | Self::V6(_, port) | Self::V6Scoped(_, port, _) => *port,
             Self::Path(_) => 0,
         }
     }
@@ -328,7 +333,7 @@ impl Addr {
     const fn family(&self) -> libc::c_int {
         match self {
             Self::V4(..) => libc::AF_INET,
-            Self::V6(..) => libc::AF_INET6,
+            Self::V6(..) | Self::V6Scoped(..) => libc::AF_INET6,
             Self::Path(_) => libc::AF_UNIX,
         }
     }
@@ -347,13 +352,17 @@ impl Addr {
                 }
                 mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
             }
-            Self::V6(octets, port) => {
+            Self::V6(octets, port) | Self::V6Scoped(octets, port, _) => {
                 let addr = storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6;
                 // SAFETY: as above, for the v6 layout.
                 unsafe {
                     (*addr).sin6_family = libc::AF_INET6 as libc::sa_family_t;
                     (*addr).sin6_port = port.to_be();
                     (*addr).sin6_addr.s6_addr = *octets;
+                    (*addr).sin6_scope_id = match self {
+                        Self::V6Scoped(_, _, scope) => *scope,
+                        _ => 0,
+                    };
                 }
                 mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
             }
@@ -399,10 +408,14 @@ impl Addr {
                 let addr = storage as *const libc::sockaddr_storage as *const libc::sockaddr_in6;
                 // SAFETY: the family field says this is a `sockaddr_in6`.
                 unsafe {
-                    Some(Self::V6(
-                        (*addr).sin6_addr.s6_addr,
-                        u16::from_be((*addr).sin6_port),
-                    ))
+                    let octets = (*addr).sin6_addr.s6_addr;
+                    let port = u16::from_be((*addr).sin6_port);
+                    let scope = (*addr).sin6_scope_id;
+                    Some(if scope == 0 {
+                        Self::V6(octets, port)
+                    } else {
+                        Self::V6Scoped(octets, port, scope)
+                    })
                 }
             }
             libc::AF_UNIX => {

@@ -296,12 +296,26 @@ impl Registration {
     /// poller is edge triggered, so registering interest without first draining
     /// means waiting for an edge that has already passed.
     pub fn poll_readable(&self, waker: &Waker) {
-        let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
-        // `will_wake` avoids the atomic refcount bump when the same task parks
-        // again, which on a busy connection is every single read.
-        match &wakers.reader {
-            Some(existing) if existing.will_wake(waker) => {}
-            _ => wakers.reader = Some(waker.clone()),
+        let ready = {
+            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            // An edge can arrive after EWOULDBLOCK and before this lock.
+            // In that case schedule another poll instead of parking after
+            // the poller has already dispatched the only available edge.
+            if wakers.readable || wakers.hangup {
+                true
+            } else {
+                // `will_wake` avoids the atomic refcount bump when the same
+                // task parks again.
+                match &wakers.reader {
+                    Some(existing) if existing.will_wake(waker) => {}
+                    _ => wakers.reader = Some(waker.clone()),
+                }
+                false
+            }
+        };
+        // A waker can execute arbitrary code; invoke it outside the lock.
+        if ready {
+            waker.wake_by_ref();
         }
     }
 
@@ -331,10 +345,20 @@ impl Registration {
 
     /// Park `waker` until the descriptor is writable. See [`Self::poll_readable`].
     pub fn poll_writable(&self, waker: &Waker) {
-        let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
-        match &wakers.writer {
-            Some(existing) if existing.will_wake(waker) => {}
-            _ => wakers.writer = Some(waker.clone()),
+        let ready = {
+            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            if wakers.writable {
+                true
+            } else {
+                match &wakers.writer {
+                    Some(existing) if existing.will_wake(waker) => {}
+                    _ => wakers.writer = Some(waker.clone()),
+                }
+                false
+            }
+        };
+        if ready {
+            waker.wake_by_ref();
         }
     }
 
