@@ -492,7 +492,7 @@ mod platform {
         // cover this thread alone and leave a process-directed `kill` free to
         // be delivered to any other running thread, where the disposition is
         // still `SIG_DFL`. Blocking first would therefore not close the
-        // window, it would open a wider one: a pipe and four `fcntl`s worth
+        // window, it would open a wider one: a pipe and its flag setup worth
         // of time in which the code looks safe and is not. So the pipe is
         // built and its write end published first, and then one `sigaction`
         // ends the exposure outright.
@@ -534,6 +534,11 @@ mod platform {
         if existing >= 0 {
             return Ok(existing);
         }
+        #[cfg(all(feature = "process", unix))]
+        let _cloexec_guard = crate::process::FD_CLOEXEC_LOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut ends = [0; 2];
         check(unsafe { libc::pipe(ends.as_mut_ptr()) })?;
         for fd in ends {
@@ -554,7 +559,8 @@ mod platform {
         unsafe {
             let flags = check(libc::fcntl(fd, libc::F_GETFL))?;
             check(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
-            check(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
+            let flags = check(libc::fcntl(fd, libc::F_GETFD))?;
+            check(libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC))?;
         }
         Ok(())
     }
