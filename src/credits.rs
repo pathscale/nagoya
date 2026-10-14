@@ -53,9 +53,28 @@ impl<K> CreditAccount<K> {
         self.changed.notify_waiters();
     }
 
-    /// Register before rechecking admission, then await a refund/refill event.
-    /// Use Notified::enable for register/recheck. Never scan accounts on a tick.
+    /// Register before inspecting balance and in-flight state, then await a
+    /// refund/refill event. Prefer wait_for after a rejected reservation:
+    /// attempting reservation here can itself emit a rollback notification.
     pub fn changed(&self) -> Notified<'_> { self.changed.notified() }
+
+    /// Suspend until this request could be admitted, without reserving or
+    /// emitting notifications. The caller then retries its retained callback.
+    /// A racing admission can win first, so repeat this wait after rejection.
+    pub async fn wait_for(&self, credits: NonZeroU64) -> Result<(), CreditRequestTooLarge> {
+        let credits = i64::try_from(credits.get()).map_err(|_| CreditRequestTooLarge)?;
+        if credits > self.capacity { return Err(CreditRequestTooLarge); }
+        loop {
+            let notified = self.changed.notified();
+            let mut notified = core::pin::pin!(notified);
+            notified.as_mut().enable();
+            if self.balance.load(Ordering::Acquire) >= credits &&
+                self.in_flight.load(Ordering::Acquire) < self.parallelism {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
 
     fn adjust(&self, credits: i64) {
         let _ = self.balance.fetch_update(Ordering::AcqRel, Ordering::Acquire,
@@ -63,9 +82,22 @@ impl<K> CreditAccount<K> {
     }
 }
 
+/// A request exceeds the account's maximum spendable credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreditRequestTooLarge;
+
+impl core::fmt::Display for CreditRequestTooLarge {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CPU credit request exceeds account capacity")
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CreditRequestTooLarge {}
+
 /// CPU admission using a host's monotonic current-worker CPU nanosecond clock.
 ///
-/// The supplied function must measure CPU, not wall/guest time. A turn never
+/// The supplied function must never panic and must measure CPU, not wall/guest time. A turn never
 /// suspends between its two reads, so per-worker clock origins may differ.
 /// This hook supplies accounting, not native preemption: callers must bound
 /// turns at real safepoints and react to retained debt by throttling or killing.
@@ -113,7 +145,7 @@ impl<K: Send + Sync + 'static> CpuBudget<CreditAccount<K>> for CpuCredits {
         -> Option<Self::Permit> {
         let reserved = i64::try_from(credits).ok().filter(|value| *value > 0)?;
         key.in_flight.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-            |count| (count < key.parallelism).then_some(count + 1)).ok()?;
+            |count| (count < key.parallelism).then(|| count + 1)).ok()?;
         if key.balance.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |balance| (balance >= reserved).then(|| balance - reserved)).is_err() {
             key.in_flight.fetch_sub(1, Ordering::AcqRel);

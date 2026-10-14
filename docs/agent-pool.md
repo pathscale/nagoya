@@ -92,9 +92,12 @@ integration. Chuzz supplies the DAG, revision validation and deficit/deadline
 ordering, foreground dependency priority, control/progress capacity and
 site-to-agent selection. Admission hooks alone do not implement that policy.
 
-Register `CreditAccount::changed()` with `Notified::enable`, recheck the
-blocked dispatch and await only if still denied. Refunds and explicit refill
-events wake waiters. Refill is one retained due deadline or a class/input
+After denial, call `CreditAccount::wait_for` with the retained request size.
+It registers then rechecks balance and in-flight state without attempting a
+reservation or emitting its own rollback notification. After it returns, retry
+the retained callback; another real admission may win first. `changed` remains
+a lower-level notification hook for register/recheck of accounting state.
+Refunds and explicit refill events wake waiters. Refill is one retained due deadline or a class/input
 event, never a scan. A background site has a shared in-flight limit; trusted
 foreground/control policy may use separate reserved authority. Native
 safepoints must bound CPU overshoot and termination. Cooperative dispatch
