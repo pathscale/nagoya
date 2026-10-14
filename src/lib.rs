@@ -61,6 +61,7 @@ use st3::fanout::Pool;
 
 mod block_on;
 pub mod io;
+pub mod credits;
 /// Tutorial and callsite reference, with compiled examples.
 #[cfg(feature = "std")]
 #[doc = include_str!(concat!(env!("OUT_DIR"), "/guide-examples.md"))]
