@@ -125,11 +125,29 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    spawn_on_at(future, pool, context, None)
+}
+
+/// The ordinary task path with a preference for its first queue only.
+pub(crate) fn spawn_on_at<F>(future: F, pool: Arc<Pool>,
+    context: Option<Arc<dyn WorkerContext>>, first_worker: Option<usize>) -> Task<F::Output>
+where F: Future + Send + 'static, F::Output: Send + 'static,
+{
     // Called for the first poll and for every wake after it. The `Runnable` is
     // a single heap allocation that already holds the future and its state, so
     // turning it into a job is `into_raw`: no box, no closure, nothing new.
     let weak_pool = Arc::downgrade(&pool);
+    let first = core::sync::atomic::AtomicBool::new(true);
     let schedule = move |runnable: Runnable| {
+        if first.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            if let Some(worker) = first_worker {
+                if let Some(pool) = weak_pool.upgrade() {
+                    assert!(worker < pool.workers(), "invalid initial worker");
+                    pool.submit_local(worker, into_job(runnable));
+                }
+                return;
+            }
+        }
         let mut runnable = Some(runnable);
         let mut local = |owner: &Pool, worker: usize| {
             if core::ptr::eq(owner, weak_pool.as_ptr()) && worker < owner.workers() {
