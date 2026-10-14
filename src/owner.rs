@@ -1,9 +1,9 @@
 //! Typed exclusive turns with admission before queue submission.
 
+use crate::{Executor, JoinHandle};
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
-use crate::{Executor, JoinHandle};
 
 /// Caller-owned CPU admission policy, shared by every worker and helper.
 pub trait CpuBudget<K>: Send + Sync + 'static {
@@ -43,7 +43,9 @@ impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
         // SAFETY: this lease is the sole successful admission, including
         // cancellation before execution and unwinding during a turn.
-        unsafe { *self.state.value.get() = self.value.take(); }
+        unsafe {
+            *self.state.value.get() = self.value.take();
+        }
         self.state.admitted.store(false, Ordering::Release);
     }
 }
@@ -104,12 +106,21 @@ impl<T: Send + 'static, K: Send + Sync + 'static, B: CpuBudget<K>> Owner<T, K, B
 
     /// The same typed key is used by every turn, independent of worker choice.
     #[must_use]
-    pub fn key(&self) -> &Arc<K> { &self.key }
+    pub fn key(&self) -> &Arc<K> {
+        &self.key
+    }
 
     /// Dispatch one complete synchronous turn on any worker.
-    pub fn dispatch<F, R>(&self, executor: &Executor, credits: u64, turn: F)
-        -> Result<JoinHandle<R>, Rejected<F>>
-    where F: FnOnce(&mut T) -> R + Send + 'static, R: Send + 'static {
+    pub fn dispatch<F, R>(
+        &self,
+        executor: &Executor,
+        credits: u64,
+        turn: F,
+    ) -> Result<JoinHandle<R>, Rejected<F>>
+    where
+        F: FnOnce(&mut T) -> R + Send + 'static,
+        R: Send + 'static,
+    {
         self.dispatch_to(executor, None, credits, turn)
     }
 
@@ -117,23 +128,47 @@ impl<T: Send + 'static, K: Send + Sync + 'static, B: CpuBudget<K>> Owner<T, K, B
     ///
     /// Work stealing may move the queued turn. The next turn can prefer a
     /// different worker only after this one has returned ownership.
-    pub fn dispatch_to<F, R>(&self, executor: &Executor, worker: Option<usize>,
-        credits: u64, turn: F) -> Result<JoinHandle<R>, Rejected<F>>
-    where F: FnOnce(&mut T) -> R + Send + 'static, R: Send + 'static {
+    pub fn dispatch_to<F, R>(
+        &self,
+        executor: &Executor,
+        worker: Option<usize>,
+        credits: u64,
+        turn: F,
+    ) -> Result<JoinHandle<R>, Rejected<F>>
+    where
+        F: FnOnce(&mut T) -> R + Send + 'static,
+        R: Send + 'static,
+    {
         if worker.is_some_and(|id| id >= executor.pool().workers()) {
-            return Err(Rejected { reason: DispatchDenied::Worker, turn });
+            return Err(Rejected {
+                reason: DispatchDenied::Worker,
+                turn,
+            });
         }
-        if self.state.admitted.compare_exchange(false, true,
-            Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return Err(Rejected { reason: DispatchDenied::Busy, turn });
+        if self
+            .state
+            .admitted
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(Rejected {
+                reason: DispatchDenied::Busy,
+                turn,
+            });
         }
         // SAFETY: the successful admission owns this slot until Lease drops.
-        let value = unsafe { (*self.state.value.get()).take() }
-            .expect("ExclusiveOwnerDuplicateAdmission");
-        let mut lease = Lease { state: Arc::clone(&self.state), value: Some(value) };
+        let value =
+            unsafe { (*self.state.value.get()).take() }.expect("ExclusiveOwnerDuplicateAdmission");
+        let mut lease = Lease {
+            state: Arc::clone(&self.state),
+            value: Some(value),
+        };
         let Some(mut permit) = self.budget.reserve(&self.key, credits) else {
             drop(lease);
-            return Err(Rejected { reason: DispatchDenied::Budget, turn });
+            return Err(Rejected {
+                reason: DispatchDenied::Budget,
+                turn,
+            });
         };
         let future = async move {
             permit.enter();
@@ -145,7 +180,16 @@ impl<T: Send + 'static, K: Send + Sync + 'static, B: CpuBudget<K>> Owner<T, K, B
             drop(lease);
             output
         };
-        Ok(JoinHandle { task: Some(crate::task::spawn_on_at(future,
-            Arc::clone(executor.pool()), executor.context.clone(), worker).fallible()) })
+        Ok(JoinHandle {
+            task: Some(
+                crate::task::spawn_on_at(
+                    future,
+                    Arc::clone(executor.pool()),
+                    executor.context.clone(),
+                    worker,
+                )
+                .fallible(),
+            ),
+        })
     }
 }

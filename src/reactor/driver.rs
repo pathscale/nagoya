@@ -683,7 +683,9 @@ fn service_timers(shared: &Arc<Shared>) -> (Option<u64>, bool) {
     // kernel wait. An arm racing with fire_due's return must survive publication.
     shared.next_deadline.swap(NO_DEADLINE, Ordering::AcqRel);
     let (next, woke) = crate::time::fire_due(now);
-    shared.next_deadline.fetch_min(next.unwrap_or(NO_DEADLINE), Ordering::AcqRel);
+    shared
+        .next_deadline
+        .fetch_min(next.unwrap_or(NO_DEADLINE), Ordering::AcqRel);
     let cached = shared.next_deadline.load(Ordering::Acquire);
     let wait = (cached != NO_DEADLINE).then(|| cached.saturating_sub(now));
     (wait, woke)

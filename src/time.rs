@@ -480,8 +480,7 @@ impl std::error::Error for TimerDriverStarted {}
 /// supplies that process-lifetime ownership. Clock reads alone do not select
 /// the backend. This function never replaces an already-selected driver.
 #[cfg(feature = "reactor")]
-pub fn set_timer_reactor(handle: crate::reactor::Handle)
-    -> Result<(), TimerDriverStarted> {
+pub fn set_timer_reactor(handle: crate::reactor::Handle) -> Result<(), TimerDriverStarted> {
     driver::bind_reactor(handle)
 }
 
@@ -504,9 +503,11 @@ mod driver {
     static HOST: OnceLock<Host> = OnceLock::new();
 
     #[cfg(feature = "reactor")]
-    pub(super) fn bind_reactor(handle: crate::reactor::Handle)
-        -> Result<(), super::TimerDriverStarted> {
-        HOST.set(Host::Reactor(handle)).map_err(|_| super::TimerDriverStarted)
+    pub(super) fn bind_reactor(
+        handle: crate::reactor::Handle,
+    ) -> Result<(), super::TimerDriverStarted> {
+        HOST.set(Host::Reactor(handle))
+            .map_err(|_| super::TimerDriverStarted)
     }
 
     fn std_clock() -> u64 {
@@ -537,7 +538,9 @@ mod driver {
             }
             #[cfg(feature = "reactor")]
             Host::Reactor(handle) => {
-                handle.timer_armed(deadline).expect("nagoya timer reactor wake");
+                handle
+                    .timer_armed(deadline)
+                    .expect("nagoya timer reactor wake");
             }
         }
     }
@@ -585,7 +588,7 @@ mod driver {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use super::{now_ns, sleep, timeout, Elapsed};
+    use super::{Elapsed, now_ns, sleep, timeout};
     use crate::block_on;
     use core::time::Duration;
     use std::time::Instant;
@@ -652,9 +655,11 @@ mod tests {
         use std::task::Waker;
         let waker = Waker::noop();
         let mut sleep = super::sleep_until(u64::MAX);
-        assert!(Pin::new(&mut sleep)
-            .poll(&mut Context::from_waker(waker))
-            .is_pending());
+        assert!(
+            Pin::new(&mut sleep)
+                .poll(&mut Context::from_waker(waker))
+                .is_pending()
+        );
         let weak = Arc::downgrade(sleep.slot.as_ref().unwrap());
         drop(sleep);
         assert!(

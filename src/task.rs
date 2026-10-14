@@ -37,7 +37,7 @@ std::thread_local! {
 /// measured 38 percent faster at eight connections and two and a half times
 /// slower at ten thousand, which is the wrong trade. Routing by descriptor
 /// spreads them and keeps each one settled.
-#[cfg(feature = "std")]
+#[cfg(feature = "reactor")]
 pub(crate) fn route_wakes(worker: usize) -> RouteGuard {
     let previous = ROUTE.with(|route| route.replace(Some(worker)));
     RouteGuard {
@@ -46,13 +46,13 @@ pub(crate) fn route_wakes(worker: usize) -> RouteGuard {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "reactor")]
 pub(crate) struct RouteGuard {
     previous: Option<usize>,
     _thread_bound: core::marker::PhantomData<alloc::rc::Rc<()>>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "reactor")]
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         ROUTE.with(|route| route.set(self.previous.take()));
@@ -129,9 +129,15 @@ where
 }
 
 /// The ordinary task path with a preference for its first queue only.
-pub(crate) fn spawn_on_at<F>(future: F, pool: Arc<Pool>,
-    context: Option<Arc<dyn WorkerContext>>, first_worker: Option<usize>) -> Task<F::Output>
-where F: Future + Send + 'static, F::Output: Send + 'static,
+pub(crate) fn spawn_on_at<F>(
+    future: F,
+    pool: Arc<Pool>,
+    context: Option<Arc<dyn WorkerContext>>,
+    first_worker: Option<usize>,
+) -> Task<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
 {
     // Called for the first poll and for every wake after it. The `Runnable` is
     // a single heap allocation that already holds the future and its state, so
@@ -333,6 +339,6 @@ mod tests {
 /// `spawn_local` either; the non-`Send` equivalent is a
 /// [`TaskSet`](crate::reactor::TaskSet) driven by
 /// [`block_on_with`](crate::reactor::block_on_with).
-pub use crate::yield_now::{yield_now, YieldNow};
+pub use crate::yield_now::{YieldNow, yield_now};
 #[cfg(feature = "std")]
-pub use crate::{spawn, JoinHandle};
+pub use crate::{JoinHandle, spawn};
