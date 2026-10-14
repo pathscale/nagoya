@@ -154,6 +154,26 @@ impl Runtime {
         &self.executor
     }
 
+    /// The process's shared readiness and timer host, owned by nagoya.
+    ///
+    /// Initialize immediately after installing the shared pool, before any
+    /// pending timer is polled. One accounted OS driver waits for readiness
+    /// and deadlines; all task and page execution remains on pool workers.
+    /// Pass this Handle into sockets and services instead of starting reactors.
+    #[cfg(feature = "reactor")]
+    pub fn readiness(&self) -> Result<crate::reactor::Handle, ReadinessError> {
+        let host = READINESS.get_or_init(|| {
+            let reactor = crate::reactor::Reactor::start().map_err(ReadinessError::Reactor)?;
+            crate::time::set_timer_reactor(reactor.handle())
+                .map_err(|_| ReadinessError::TimerDriverStarted)?;
+            Ok(reactor)
+        });
+        match host {
+            Ok(reactor) => Ok(reactor.handle()),
+            Err(error) => Err(*error),
+        }
+    }
+
     /// The pool underneath, for the APIs that take one directly.
     ///
     /// [`crate::par_for`] takes an `Arc<Pool>` because it schedules closures
@@ -163,6 +183,33 @@ impl Runtime {
         self.executor.pool()
     }
 }
+
+/// A failure to initialize the one process readiness/timer host.
+#[cfg(feature = "reactor")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessError {
+    /// The OS refused the reactor or its driver thread.
+    Reactor(crate::reactor::Errno),
+    /// A prior timer selected a different backend; initialize readiness first.
+    TimerDriverStarted,
+}
+
+#[cfg(feature = "reactor")]
+impl core::fmt::Display for ReadinessError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Reactor(error) => write!(f, "nagoya readiness host: {error}"),
+            Self::TimerDriverStarted => f.write_str("nagoya timer driver already selected"),
+        }
+    }
+}
+
+#[cfg(feature = "reactor")]
+impl std::error::Error for ReadinessError {}
+
+#[cfg(feature = "reactor")]
+static READINESS: std::sync::OnceLock<Result<crate::reactor::Reactor, ReadinessError>> =
+    std::sync::OnceLock::new();
 
 /// A [`Runtime`] described before it is started, from [`Runtime::builder`].
 ///
