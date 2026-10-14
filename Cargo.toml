@@ -187,3 +187,7 @@ required-features = ["reactor"]
 [[example]]
 name = "syscall_cost"
 required-features = ["reactor"]
+
+[[example]]
+name = "agent_pool_witness"
+required-features = ["syscall-counters"]
