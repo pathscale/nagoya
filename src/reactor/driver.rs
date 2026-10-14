@@ -362,6 +362,24 @@ impl Registration {
         }
     }
 
+    /// Release a cancelled UDP reader without consuming cached readiness.
+    pub(crate) fn cancel_read_wait(&self) {
+        let waiting = {
+            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            wakers.reader.take()
+        };
+        drop(waiting);
+    }
+
+    /// Release a cancelled UDP writer without consuming cached readiness.
+    pub(crate) fn cancel_write_wait(&self) {
+        let waiting = {
+            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            wakers.writer.take()
+        };
+        drop(waiting);
+    }
+
     /// Change what this descriptor is watched for.
     pub fn modify(&self, interest: Interest) -> Result<()> {
         self.shared.poller.modify(self.fd, self.token, interest)
