@@ -670,20 +670,23 @@ fn run(shared: &Arc<Shared>) {
 /// arrives: there is no deadline to wake for.
 fn service_timers(shared: &Arc<Shared>) -> (Option<u64>, bool) {
     let deadline = shared.next_deadline.load(Ordering::Acquire);
+    if deadline == NO_DEADLINE {
+        return (None, false);
+    }
     let now = crate::now_ns();
-
-    // Not due yet: wait exactly until it is, and do not touch the wheel.
-    if deadline != NO_DEADLINE && deadline > now {
+    if deadline > now {
         return (Some(deadline - now), false);
     }
 
-    // Either a deadline has arrived or a timer was armed and the cache was
-    // invalidated. Both mean the wheel has work to report.
+    // Clear before draining, then merge rather than overwrite. An arm before
+    // the swap is in the heap; an arm after it lowers the cache and wakes the
+    // kernel wait. An arm racing with fire_due's return must survive publication.
+    shared.next_deadline.swap(NO_DEADLINE, Ordering::AcqRel);
     let (next, woke) = crate::time::fire_due(now);
-    shared
-        .next_deadline
-        .store(next.unwrap_or(NO_DEADLINE), Ordering::Release);
-    (next.map(|deadline| deadline.saturating_sub(now)), woke)
+    shared.next_deadline.fetch_min(next.unwrap_or(NO_DEADLINE), Ordering::AcqRel);
+    let cached = shared.next_deadline.load(Ordering::Acquire);
+    let wait = (cached != NO_DEADLINE).then(|| cached.saturating_sub(now));
+    (wait, woke)
 }
 
 /// Wake the tasks named by `events`.

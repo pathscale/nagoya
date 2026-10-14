@@ -18,7 +18,10 @@
 //!
 //! # What drives it
 //!
-//! With `std`, a thread, started the first time anything sleeps. Never before:
+//! With `std`, a bound reactor, or a thread started on first timer admission.
+//! `Runtime::readiness` binds the shared reactor before the first timer;
+//! an already-selected timer backend is rejected instead of doubled.
+//! The dedicated-thread default remains for existing callers. Never before:
 //! a runtime that is only ever polled should not own a thread it does not use.
 //!
 //! Without `std` there is no thread and no clock, so the consumer supplies
@@ -370,7 +373,7 @@ impl Future for Sleep {
                 this.slot = Some(slot);
                 if earliest {
                     #[cfg(feature = "std")]
-                    driver::nudge();
+                    driver::nudge(this.deadline);
                 }
                 Poll::Pending
             }
@@ -455,6 +458,33 @@ impl<F: Future> Future for Timeout<F> {
     }
 }
 
+/// The timer backend was selected by an earlier timer or reactor binding.
+#[cfg(feature = "reactor")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerDriverStarted;
+
+#[cfg(feature = "reactor")]
+impl core::fmt::Display for TimerDriverStarted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("nagoya timer driver already selected")
+    }
+}
+
+#[cfg(feature = "reactor")]
+impl std::error::Error for TimerDriverStarted {}
+
+/// Route all future timer arms to this retained reactor, without a timer thread.
+///
+/// Call before the first pending Sleep is polled. The reactor must outlive all
+/// armed timers and must have exactly one servicing loop. Runtime::readiness
+/// supplies that process-lifetime ownership. Clock reads alone do not select
+/// the backend. This function never replaces an already-selected driver.
+#[cfg(feature = "reactor")]
+pub fn set_timer_reactor(handle: crate::reactor::Handle)
+    -> Result<(), TimerDriverStarted> {
+    driver::bind_reactor(handle)
+}
+
 #[cfg(feature = "std")]
 mod driver {
     use super::{now_ns, poll, set_clock};
@@ -464,6 +494,20 @@ mod driver {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     static NUDGE: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
     static THREAD: OnceLock<()> = OnceLock::new();
+
+    enum Host {
+        Dedicated,
+        #[cfg(feature = "reactor")]
+        Reactor(crate::reactor::Handle),
+    }
+
+    static HOST: OnceLock<Host> = OnceLock::new();
+
+    #[cfg(feature = "reactor")]
+    pub(super) fn bind_reactor(handle: crate::reactor::Handle)
+        -> Result<(), super::TimerDriverStarted> {
+        HOST.set(Host::Reactor(handle)).map_err(|_| super::TimerDriverStarted)
+    }
 
     fn std_clock() -> u64 {
         let origin = ORIGIN.get_or_init(Instant::now);
@@ -482,11 +526,20 @@ mod driver {
 
     /// Wake the driver because a nearer deadline than it is waiting for now
     /// exists. Starts the driver if this is the first timer in the process.
-    pub(super) fn nudge() {
-        start();
-        let (lock, signal) = nudge_pair();
-        *lock.lock().expect("the nudge lock") = true;
-        signal.notify_one();
+    pub(super) fn nudge(deadline: u64) {
+        match HOST.get_or_init(|| Host::Dedicated) {
+            Host::Dedicated => {
+                let _ = deadline;
+                start();
+                let (lock, signal) = nudge_pair();
+                *lock.lock().expect("the nudge lock") = true;
+                signal.notify_one();
+            }
+            #[cfg(feature = "reactor")]
+            Host::Reactor(handle) => {
+                handle.timer_armed(deadline).expect("nagoya timer reactor wake");
+            }
+        }
     }
 
     fn start() {
