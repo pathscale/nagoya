@@ -670,11 +670,10 @@ fn run(shared: &Arc<Shared>) {
 /// arrives: there is no deadline to wake for.
 fn service_timers(shared: &Arc<Shared>) -> (Option<u64>, bool) {
     let deadline = shared.next_deadline.load(Ordering::Acquire);
-    if deadline == NO_DEADLINE {
-        return (None, false);
-    }
     let now = crate::now_ns();
-    if deadline > now {
+    // No cached deadline still asks the wheel: a timer armed through another
+    // reactor's handle (a local reactor) never lowered this cache.
+    if deadline != NO_DEADLINE && deadline > now {
         return (Some(deadline - now), false);
     }
 
