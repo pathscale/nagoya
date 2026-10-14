@@ -33,7 +33,7 @@ syscall-counters = ["reactor"]
 
 
 [dependencies]
-ps-st3 = { path = "../ps-st3", version = "^0.6", default-features = false, features = ["fanout"] }
+ps-st3 = { version = "^0.6", default-features = false, features = ["fanout"] }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 # The task itself: one allocation holding the future, its state machine, its
 # waker vtable and its output, with `Runnable::into_raw` handing the pointer
@@ -57,7 +57,7 @@ futures-io = { version = "0.3", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
-ps-st3 = { path = "../ps-st3", version = "^0.6", features = ["fanout", "host"] }
+ps-st3 = { version = "^0.6", features = ["fanout", "host"] }
 # The comparison arm. Only the scheduler is used; nothing here needs its I/O.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 # The other comparison arm. Not an async runtime: a data-parallel pool, so it
