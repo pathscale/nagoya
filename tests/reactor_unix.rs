@@ -253,8 +253,7 @@ fn read_exact_names_a_stream_that_ends_early() {
         let mut length = [0u8; 4];
         stream.read_exact(&mut length).await.expect("length");
         let mut payload = vec![0u8; u32::from_be_bytes(length) as usize];
-        let outcome = stream.read_exact(&mut payload).await;
-        outcome
+        stream.read_exact(&mut payload).await
     });
 
     server.join().expect("server");
