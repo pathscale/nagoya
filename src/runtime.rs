@@ -280,7 +280,11 @@ impl Builder {
             installed = true;
             self.build()
         });
-        if installed { Ok(runtime) } else { Err(BackgroundStarted) }
+        if installed {
+            Ok(runtime)
+        } else {
+            Err(BackgroundStarted)
+        }
     }
 
     /// The idle policy. [`Tuning::default`] unless set.
@@ -435,6 +439,7 @@ fn supported_default_threads(available: usize) -> usize {
 /// Spreads descriptors over the pool by index while keeping each one on a
 /// stable worker, so a task finds its own cache lines without every
 /// connection sharing a queue.
+#[cfg(feature = "reactor")]
 pub(crate) fn route_reactor_wake(index: u64) -> Option<crate::task::RouteGuard> {
     // Only route onto a pool that is already running. Asking `background()`
     // for its width *starts* it, one thread per core, and the reactor is not

@@ -1,10 +1,10 @@
 //! Retained, coalesced wake reasons for one logical scheduling owner.
 
+use crate::sync::Notify;
+use crate::{Executor, JoinHandle};
 use alloc::sync::Arc;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::Notify;
-use crate::{Executor, JoinHandle};
 
 struct Signals {
     reasons: AtomicU64,
@@ -26,22 +26,29 @@ pub struct ReadyHandle {
 }
 
 impl Default for ReadySource {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReadySource {
     /// Make a single-consumer source with no pending reasons.
     #[must_use]
     pub fn new() -> Self {
-        Self { signals: Arc::new(Signals {
-            reasons: AtomicU64::new(0), notify: Notify::new(),
-        }) }
+        Self {
+            signals: Arc::new(Signals {
+                reasons: AtomicU64::new(0),
+                notify: Notify::new(),
+            }),
+        }
     }
 
     /// Give a timer, readiness callback or typed completion an owned producer.
     #[must_use]
     pub fn handle(&self) -> ReadyHandle {
-        ReadyHandle { signals: Arc::clone(&self.signals) }
+        ReadyHandle {
+            signals: Arc::clone(&self.signals),
+        }
     }
 
     /// Consume retained reasons, or register and suspend until a real event.
@@ -54,7 +61,9 @@ impl ReadySource {
             let mut notified = core::pin::pin!(notified);
             notified.as_mut().enable();
             let reasons = self.signals.reasons.swap(0, Ordering::AcqRel);
-            if reasons != 0 { return reasons; }
+            if reasons != 0 {
+                return reasons;
+            }
             notified.await;
         }
     }
@@ -77,8 +86,14 @@ impl std::error::Error for DeadlineOverflow {}
 /// u64::MAX is reserved by the reactor for an unarmed deadline.
 pub fn coarse_deadline(deadline: u64, quantum: NonZeroU64) -> Result<u64, DeadlineOverflow> {
     let remainder = deadline % quantum.get();
-    let extra = if remainder == 0 { 0 } else { quantum.get() - remainder };
-    deadline.checked_add(extra).filter(|value| *value != u64::MAX)
+    let extra = if remainder == 0 {
+        0
+    } else {
+        quantum.get() - remainder
+    };
+    deadline
+        .checked_add(extra)
+        .filter(|value| *value != u64::MAX)
         .ok_or(DeadlineOverflow)
 }
 
@@ -97,8 +112,13 @@ impl ReadyHandle {
     /// The caller retains the JoinHandle and cancels it when eligibility or
     /// the due event changes. It must initialize Runtime::readiness first.
     /// This is delivery only; it does not grant CPU or service-worker admission.
-    pub fn wake_at(&self, executor: &Executor, deadline: u64,
-        quantum: NonZeroU64, reasons: u64) -> Result<JoinHandle<()>, DeadlineOverflow> {
+    pub fn wake_at(
+        &self,
+        executor: &Executor,
+        deadline: u64,
+        quantum: NonZeroU64,
+        reasons: u64,
+    ) -> Result<JoinHandle<()>, DeadlineOverflow> {
         let deadline = coarse_deadline(deadline, quantum)?;
         let handle = self.clone();
         Ok(executor.spawn(async move {
