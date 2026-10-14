@@ -203,6 +203,39 @@ impl Builder {
         self
     }
 
+    /// Use every logical CPU available to this process, including performance
+    /// and efficiency cores. This sets the worker count, not OS CPU affinity.
+    ///
+    /// The default still uses `shared_threads()`, which prefers Apple's
+    /// `hw.perflevel0.logicalcpu`. Call this after any `workers` override.
+    /// Failure to detect a count or fit the ps-st3 bitmap is reported instead
+    /// of silently configuring fewer workers.
+    pub fn all_cores(mut self) -> std::io::Result<Self> {
+        let workers = std::thread::available_parallelism()?.get();
+        if workers > usize::BITS as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "all-core worker count exceeds the ps-st3 bitmap capacity",
+            ));
+        }
+        self.workers = workers;
+        Ok(self)
+    }
+
+    /// Install this configuration as the process's shared pool.
+    ///
+    /// Call before any `nagoya::spawn` or `background()` use. Concurrent
+    /// initializers create exactly one runtime; every loser gets an error.
+    /// Libraries using the shared entry points then use this same pool.
+    pub fn install_background(&self) -> Result<&'static Runtime, BackgroundStarted> {
+        let mut installed = false;
+        let runtime = SHARED.get_or_init(|| {
+            installed = true;
+            self.build()
+        });
+        if installed { Ok(runtime) } else { Err(BackgroundStarted) }
+    }
+
     /// The idle policy. [`Tuning::default`] unless set.
     pub fn tuning(mut self, tuning: Tuning) -> Self {
         self.tuning = tuning;
@@ -237,6 +270,18 @@ impl Builder {
         Runtime::start(self)
     }
 }
+
+/// The shared pool was initialized before configuration could be installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackgroundStarted;
+
+impl core::fmt::Display for BackgroundStarted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("nagoya shared runtime already started")
+    }
+}
+
+impl std::error::Error for BackgroundStarted {}
 
 /// Threads for the shared pool.
 ///
@@ -306,7 +351,7 @@ fn sysctl_usize(name: &core::ffi::CStr) -> Option<usize> {
 }
 
 #[cfg(target_vendor = "apple")]
-extern "C" {
+unsafe extern "C" {
     fn sysctlbyname(
         name: *const core::ffi::c_char,
         oldp: *mut core::ffi::c_void,
