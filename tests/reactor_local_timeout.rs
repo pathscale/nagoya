@@ -20,8 +20,8 @@ use std::cell::Cell;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use nagoya::reactor::{block_on_with, Reactor};
-use nagoya::{now_ns, set_clock, timeout, Elapsed};
+use nagoya::reactor::{Reactor, block_on_with};
+use nagoya::{Elapsed, now_ns, set_clock, timeout};
 
 /// Where the clock starts. Any non-zero reading will do.
 const START: u64 = 1_000_000_000;

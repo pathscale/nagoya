@@ -2,12 +2,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::thread;
 
-use nagoya::{block_on, Executor};
+use nagoya::{Executor, block_on};
 use st3::fanout::{Pool, StdHost};
 
 /// A pool with real threads behind it, and a guard that stops them.
@@ -289,10 +289,12 @@ fn a_reversed_empty_range_finishes_without_starting_workers() {
     let pool = Pool::new(1, 256, Arc::new(StdHost::new(1)));
     let mut loop_ = Box::pin(nagoya::par_for(pool, 10..5, |_| panic!("empty range ran")));
     let waker = std::task::Waker::noop();
-    assert!(loop_
-        .as_mut()
-        .poll(&mut Context::from_waker(waker))
-        .is_ready());
+    assert!(
+        loop_
+            .as_mut()
+            .poll(&mut Context::from_waker(waker))
+            .is_ready()
+    );
 }
 
 #[test]

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use nagoya::io::{Stream, StreamError};
-use nagoya::reactor::{block_on_with, Addr, Reactor, TcpListener, TcpStream, UnixPath};
+use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream, UnixPath, block_on_with};
 
 /// A socket path that removes itself.
 ///

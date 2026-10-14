@@ -368,8 +368,8 @@ fn tcp_sees_eof_after_a_short_read() {
 /// so this is where that gets answered rather than reasoned about.
 #[test]
 fn a_write_of_the_whole_send_buffer_fills_it() {
-    use nagoya::reactor::socket::TcpSocket;
     use nagoya::reactor::Addr;
+    use nagoya::reactor::socket::TcpSocket;
     use std::os::unix::ffi::OsStrExt as _;
 
     let path = std::env::temp_dir().join(format!("nagoya-fill-{}.sock", std::process::id()));

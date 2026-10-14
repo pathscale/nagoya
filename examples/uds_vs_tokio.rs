@@ -241,7 +241,7 @@ impl Drop for SocketPath {
 /// nagoya over AF_UNIX, on a reactor with no thread of its own.
 fn nagoya_unix() -> Vec<u64> {
     use nagoya::reactor::socket::TcpListener as RawListener;
-    use nagoya::reactor::{block_on_with, Addr, Reactor, TcpListener, TcpStream};
+    use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream, block_on_with};
 
     let path = SocketPath::new("nagoya-uds");
     let addr = Addr::path(path.as_path().as_os_str().as_bytes()).expect("path fits");
@@ -273,7 +273,7 @@ fn nagoya_unix() -> Vec<u64> {
 /// The same nagoya code over loopback TCP, for the family delta.
 fn nagoya_tcp() -> Vec<u64> {
     use nagoya::reactor::socket::TcpListener as RawListener;
-    use nagoya::reactor::{block_on_with, Addr, Reactor, TcpListener, TcpStream};
+    use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream, block_on_with};
 
     let listener = RawListener::bind(Addr::localhost(0), 128).expect("bind");
     let addr = listener.local_addr().expect("addr");

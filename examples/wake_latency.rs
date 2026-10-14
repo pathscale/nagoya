@@ -13,8 +13,8 @@
 //!
 //! One task at a time, submitted to an idle pool, timed to completion.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Instant;

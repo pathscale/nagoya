@@ -3,8 +3,8 @@
 //! Batched rather than one huge spawn: the spawn loop outruns the workers, so a
 //! single batch of the size this needs would hold millions of live tasks and
 //! measure the allocator instead of the scheduler.
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 

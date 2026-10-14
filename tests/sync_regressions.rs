@@ -1,8 +1,8 @@
 //! Deterministic polling tests: no executor scheduling or sleeps are involved.
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use nagoya::sync::{Notify, RwLock, Semaphore};

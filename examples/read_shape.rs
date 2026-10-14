@@ -44,7 +44,7 @@ fn main() {
 /// Run the client end here and the server in a child, so the counters see one
 /// end only.
 fn client(read_buffer: usize) -> (f64, f64, f64) {
-    use nagoya::reactor::{block_on_with, Addr, Reactor, TcpStream};
+    use nagoya::reactor::{Addr, Reactor, TcpStream, block_on_with};
 
     let path = std::env::temp_dir().join(format!(
         "nagoya-readshape-{}-{read_buffer}.sock",
@@ -98,7 +98,7 @@ fn client(read_buffer: usize) -> (f64, f64, f64) {
 fn serve(path: &str) {
     use nagoya::io::Stream as _;
     use nagoya::reactor::socket::TcpListener as RawListener;
-    use nagoya::reactor::{block_on_with, Addr, Reactor, TcpListener};
+    use nagoya::reactor::{Addr, Reactor, TcpListener, block_on_with};
 
     let addr = Addr::path(path.as_bytes()).expect("path fits");
     let listener = RawListener::bind(addr, 128).expect("bind");

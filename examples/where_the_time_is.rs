@@ -10,8 +10,8 @@
 //! If arm 1 is close to arm 2, the executor is not the problem and no amount of
 //! tuning it will help.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Instant;

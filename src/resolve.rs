@@ -13,9 +13,9 @@
 use std::ffi::CString;
 
 use crate::net::TcpStream;
+use crate::reactor::Handle;
 use crate::reactor::error::{Errno, Result};
 use crate::reactor::socket::Addr;
-use crate::reactor::Handle;
 
 /// Why [`resolve`] produced no addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,7 +8,7 @@
 
 #![cfg(feature = "syscall-counters")]
 
-use nagoya::reactor::{block_on_with, counters, Addr, Reactor, TcpStream};
+use nagoya::reactor::{Addr, Reactor, TcpStream, block_on_with, counters};
 use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
 

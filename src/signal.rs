@@ -324,7 +324,7 @@ fn restore_mask(sig: i32, was_blocked: bool) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{block_one, check, restore_mask, Errno, Result, SignalKind};
+    use super::{Errno, Result, SignalKind, block_one, check, restore_mask};
     use std::sync::atomic::{AtomicI32, Ordering};
 
     /// One `signalfd` per signal number, open for the process.
@@ -411,9 +411,9 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    use super::{block_one, check, restore_mask, unblock_one, Errno, Result, SignalKind};
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use super::{Errno, Result, SignalKind, block_one, check, restore_mask, unblock_one};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     struct Ends {
         read: AtomicI32,
@@ -625,13 +625,13 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use super::{Signal, SignalKind};
-    use crate::reactor::{block_on_with, Reactor};
+    use crate::reactor::{Reactor, block_on_with};
 
     /// Disposition is process-wide. Two tests installing handlers at once
     /// would restore each other's.
