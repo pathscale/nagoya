@@ -83,4 +83,4 @@ pub use driver::{Handle, Reactor, Registration, Sharded};
 pub use error::{Errno, Result};
 pub use local::{TaskSet, block_on, block_on_with};
 pub use poller::{Event, Interest, Poller};
-pub use socket::{Addr, UNIX_PATH_CAPACITY, UnixPath};
+pub use socket::{Addr, Datagram, UNIX_PATH_CAPACITY, UnixPath};
