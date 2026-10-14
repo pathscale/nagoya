@@ -7,6 +7,34 @@ use alloc::sync::Arc;
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
+/// Compare-exchange update for `AtomicI64`; `fetch_update` is deprecated on
+/// current stable and its replacement is newer than the crate MSRV.
+fn update_i64(cell: &AtomicI64, mut f: impl FnMut(i64) -> Option<i64>) -> Result<i64, i64> {
+    let mut current = cell.load(Ordering::Acquire);
+    loop {
+        let next = f(current).ok_or(current)?;
+        match cell.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// The `AtomicUsize` form of [`update_i64`].
+fn update_usize(
+    cell: &AtomicUsize,
+    mut f: impl FnMut(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    let mut current = cell.load(Ordering::Acquire);
+    loop {
+        let next = f(current).ok_or(current)?;
+        match cell.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// One stable accounting key, shared across its agents and helper jobs.
 ///
 /// Migration and host reentry reuse this same Arc. Replenishment is a policy
@@ -91,11 +119,9 @@ impl<K> CreditAccount<K> {
     }
 
     fn adjust(&self, credits: i64) {
-        let _ = self
-            .balance
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |balance| {
-                Some(balance.saturating_add(credits).min(self.capacity))
-            });
+        let _ = update_i64(&self.balance, |balance| {
+            Some(balance.saturating_add(credits).min(self.capacity))
+        });
     }
 }
 
@@ -172,17 +198,14 @@ impl<K: Send + Sync + 'static> CpuBudget<CreditAccount<K>> for CpuCredits {
 
     fn reserve(&self, key: &Arc<CreditAccount<K>>, credits: u64) -> Option<Self::Permit> {
         let reserved = i64::try_from(credits).ok().filter(|value| *value > 0)?;
-        key.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < key.parallelism).then(|| count + 1)
-            })
-            .ok()?;
-        if key
-            .balance
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |balance| {
-                (balance >= reserved).then(|| balance - reserved)
-            })
-            .is_err()
+        update_usize(&key.in_flight, |count| {
+            (count < key.parallelism).then(|| count + 1)
+        })
+        .ok()?;
+        if update_i64(&key.balance, |balance| {
+            (balance >= reserved).then(|| balance - reserved)
+        })
+        .is_err()
         {
             key.in_flight.fetch_sub(1, Ordering::AcqRel);
             key.changed.notify_waiters();
