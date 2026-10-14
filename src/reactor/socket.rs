@@ -708,7 +708,8 @@ impl TcpSocket {
     /// `fd` must be an open, non-blocking, connected TCP socket that nothing
     /// else will close.
     pub unsafe fn from_raw(fd: i32) -> Self {
-        Self(Fd::from_raw(fd))
+        // SAFETY: the caller guarantees the descriptor is open and uniquely owned.
+        Self(unsafe { Fd::from_raw(fd) })
     }
 
     /// The descriptor, for registering with the poller.
@@ -804,7 +805,9 @@ impl TcpSocket {
     pub unsafe fn recv(&self, pointer: *mut u8, len: usize) -> Result<usize> {
         #[cfg(feature = "syscall-counters")]
         crate::reactor::counters::RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let read = libc::recv(self.raw(), pointer.cast(), len, 0);
+        // SAFETY: the caller guarantees a writable buffer of `len` bytes, and
+        // this socket owns a live descriptor.
+        let read = unsafe { libc::recv(self.raw(), pointer.cast(), len, 0) };
         if read < 0 {
             let error = crate::reactor::error::last();
             #[cfg(feature = "syscall-counters")]
@@ -911,7 +914,8 @@ impl UdpSocket {
     /// `fd` must be an open, non-blocking datagram socket that nothing else
     /// will close.
     pub unsafe fn from_raw(fd: i32) -> Self {
-        Self(Fd::from_raw(fd))
+        // SAFETY: the caller guarantees the descriptor is open and uniquely owned.
+        Self(unsafe { Fd::from_raw(fd) })
     }
 
     /// The descriptor, for registering with the poller.
