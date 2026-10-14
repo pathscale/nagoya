@@ -74,6 +74,7 @@ pub mod guide {}
 #[cfg(feature = "reactor")]
 pub mod net;
 mod par;
+pub mod owner;
 // Child processes, at the path tokio gives them. They register on a reactor of
 // their own that starts on first use, rather than one the caller passes, so a
 // child's futures finish under any executor. Unix only, because the reactor is:
@@ -296,6 +297,15 @@ impl Executor {
     #[must_use]
     pub fn pool(&self) -> &Arc<Pool> {
         &self.pool
+    }
+
+    /// The executing worker for this pool, when called from a pool task.
+    #[must_use]
+    pub fn current_worker(&self) -> Option<usize> {
+        match self.context.as_deref() {
+            Some(context) => context.current_worker(&self.pool),
+            None => crate::task::current_worker(&self.pool),
+        }.filter(|id| *id < self.pool.workers())
     }
 
     /// Run a future to completion somewhere on the pool.
