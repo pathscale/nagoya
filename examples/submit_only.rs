@@ -7,8 +7,8 @@
 //!
 //! No workers are started. The pool fills up and nothing runs.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use st3::fanout::{Job, Pool, StdHost};

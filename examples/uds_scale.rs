@@ -237,10 +237,12 @@ fn start_child(path: &Path, mode: &str, connections: usize) -> std::process::Chi
 /// Connect `count` blocking sockets, retrying while the child finishes binding.
 fn connect_all(path: &Path, count: usize) -> Vec<std::os::unix::net::UnixStream> {
     (0..count)
-        .map(|_| loop {
-            match std::os::unix::net::UnixStream::connect(path) {
-                Ok(stream) => break stream,
-                Err(_) => std::thread::yield_now(),
+        .map(|_| {
+            loop {
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(stream) => break stream,
+                    Err(_) => std::thread::yield_now(),
+                }
             }
         })
         .collect()
@@ -251,7 +253,7 @@ fn connect_all(path: &Path, count: usize) -> Vec<std::os::unix::net::UnixStream>
 /// nagoya driving `connections` echo clients on one thread, one reactor.
 fn nagoya_echo(connections: usize) -> f64 {
     use nagoya::io::Stream as _;
-    use nagoya::reactor::{block_on_with, Addr, Reactor, TaskSet, TcpStream};
+    use nagoya::reactor::{Addr, Reactor, TaskSet, TcpStream, block_on_with};
 
     let path = SocketPath::new("nagoya-echo");
     let mut child = start_child(path.as_path(), "echo", connections);
@@ -262,10 +264,12 @@ fn nagoya_echo(connections: usize) -> f64 {
 
     // Connected before timing, so the measured region is messages only.
     let sockets: Vec<_> = (0..connections)
-        .map(|_| loop {
-            match nagoya::reactor::socket::TcpSocket::connect(addr) {
-                Ok(socket) => break socket,
-                Err(_) => std::thread::yield_now(),
+        .map(|_| {
+            loop {
+                match nagoya::reactor::socket::TcpSocket::connect(addr) {
+                    Ok(socket) => break socket,
+                    Err(_) => std::thread::yield_now(),
+                }
             }
         })
         .collect();
@@ -303,17 +307,19 @@ fn nagoya_echo(connections: usize) -> f64 {
 
 /// nagoya streaming `VOLUME` bytes and counting them in.
 fn nagoya_throughput(chunk_size: usize, connections: usize) -> f64 {
-    use nagoya::reactor::{block_on_with, Addr, Reactor, TaskSet, TcpStream};
+    use nagoya::reactor::{Addr, Reactor, TaskSet, TcpStream, block_on_with};
 
     let path = SocketPath::new("nagoya-sink");
     let mut child = start_child(path.as_path(), "sink", connections);
     let addr = Addr::path(path.as_path().as_os_str().as_bytes()).expect("path fits");
 
     let sockets: Vec<_> = (0..connections)
-        .map(|_| loop {
-            match nagoya::reactor::socket::TcpSocket::connect(addr) {
-                Ok(socket) => break socket,
-                Err(_) => std::thread::yield_now(),
+        .map(|_| {
+            loop {
+                match nagoya::reactor::socket::TcpSocket::connect(addr) {
+                    Ok(socket) => break socket,
+                    Err(_) => std::thread::yield_now(),
+                }
             }
         })
         .collect();

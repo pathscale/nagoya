@@ -46,7 +46,7 @@ use crate::reactor::socket::{
 /// calling thread, because this crate has no blocking pool to hand it to.
 /// Resolve before entering the reactor, or the lookup stalls every socket on
 /// it.
-pub use crate::resolve::{connect_any, resolve as lookup_host, resolve, ResolveError};
+pub use crate::resolve::{ResolveError, connect_any, resolve as lookup_host, resolve};
 
 /// A connection that yields to the executor instead of blocking.
 #[derive(Debug)]
@@ -441,7 +441,7 @@ impl core::future::Future for WriteAllVectored<'_> {
                 // peer has gone. Reported as a broken pipe, which is what the
                 // next write would have produced anyway.
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(crate::reactor::error::codes::BROKEN_PIPE))
+                    return Poll::Ready(Err(crate::reactor::error::codes::BROKEN_PIPE));
                 }
                 Poll::Ready(Ok(n)) => this.written += n,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -487,7 +487,7 @@ impl core::future::Future for WriteAll<'_> {
                 // peer has gone. Reported as a broken pipe, which is what the
                 // next write would have produced anyway.
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(crate::reactor::error::codes::BROKEN_PIPE))
+                    return Poll::Ready(Err(crate::reactor::error::codes::BROKEN_PIPE));
                 }
                 Poll::Ready(Ok(n)) => this.written += n,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),

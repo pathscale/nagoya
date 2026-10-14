@@ -53,7 +53,7 @@ fn main() {
 
 fn run(join: bool) -> f64 {
     use nagoya::io::Stream as _;
-    use nagoya::reactor::{block_on_with, Addr, Reactor, TaskSet, TcpStream};
+    use nagoya::reactor::{Addr, Reactor, TaskSet, TcpStream, block_on_with};
 
     let path = std::env::temp_dir().join(format!(
         "nagoya-only-{}-{}.sock",
@@ -74,10 +74,12 @@ fn run(join: bool) -> f64 {
     let reactor = Reactor::local().expect("reactor");
     let handle = reactor.handle();
     let sockets: Vec<_> = (0..CONNECTIONS)
-        .map(|_| loop {
-            match nagoya::reactor::socket::TcpSocket::connect(addr) {
-                Ok(socket) => break socket,
-                Err(_) => std::thread::yield_now(),
+        .map(|_| {
+            loop {
+                match nagoya::reactor::socket::TcpSocket::connect(addr) {
+                    Ok(socket) => break socket,
+                    Err(_) => std::thread::yield_now(),
+                }
             }
         })
         .collect();

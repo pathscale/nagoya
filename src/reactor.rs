@@ -77,10 +77,10 @@ pub use crate::net::{TcpListener, TcpStream, UdpSocket};
 // a module is in the type namespace and a function in the value namespace.
 // Keeping the function called `resolve` is what makes `nagoya::reactor::
 // resolve(host, port)` still compile for the callers that already wrote it.
-pub use crate::resolve::{connect_any, resolve, ResolveError};
+pub use crate::resolve::{ResolveError, connect_any, resolve};
 pub use crate::signal::{Signal, SignalKind};
 pub use driver::{Handle, Reactor, Registration, Sharded};
 pub use error::{Errno, Result};
-pub use local::{block_on, block_on_with, TaskSet};
+pub use local::{TaskSet, block_on, block_on_with};
 pub use poller::{Event, Interest, Poller};
-pub use socket::{Addr, UnixPath, UNIX_PATH_CAPACITY};
+pub use socket::{Addr, UNIX_PATH_CAPACITY, UnixPath};

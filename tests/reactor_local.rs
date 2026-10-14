@@ -4,10 +4,10 @@
 //! exports, so they are integration tests and belong beside the other ones
 //! rather than at the bottom of the module they exercise.
 
-use nagoya::reactor::{block_on_with, Reactor};
+use nagoya::reactor::{Reactor, block_on_with};
 
-use nagoya::reactor::socket::Addr;
 use nagoya::reactor::TcpListener;
+use nagoya::reactor::socket::Addr;
 
 #[test]
 fn drives_a_connection_on_one_thread() {

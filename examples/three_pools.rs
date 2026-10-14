@@ -15,8 +15,8 @@
 //! CPU is user + system across every thread, so an arm that finishes quickly by
 //! burning eight cores cannot hide it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Instant;

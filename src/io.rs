@@ -447,8 +447,8 @@ impl From<SeekFrom> for std::io::SeekFrom {
 
 #[cfg(feature = "std")]
 pub use host::{
-    append, create, create_dir_all, metadata, open, open_or_create, read, remove_dir_all,
-    remove_file, rename, write, Compat, HostFile,
+    Compat, HostFile, append, create, create_dir_all, metadata, open, open_or_create, read,
+    remove_dir_all, remove_file, rename, write,
 };
 
 #[cfg(feature = "std")]
@@ -822,7 +822,7 @@ mod portable {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::{
-        create, metadata, open, remove_file, ErrorKind, File, Read, Seek, SeekFrom, Write,
+        ErrorKind, File, Read, Seek, SeekFrom, Write, create, metadata, open, remove_file,
     };
     use crate::block_on;
 

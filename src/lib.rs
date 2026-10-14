@@ -60,8 +60,8 @@ use core::task::{Context, Poll};
 use st3::fanout::Pool;
 
 mod block_on;
-pub mod io;
 pub mod credits;
+pub mod io;
 /// Tutorial and callsite reference, with compiled examples.
 #[cfg(feature = "std")]
 #[doc = include_str!(concat!(env!("OUT_DIR"), "/guide-examples.md"))]
@@ -74,8 +74,8 @@ pub mod guide {}
 // that is the path already-published consumers compiled against.
 #[cfg(feature = "reactor")]
 pub mod net;
-mod par;
 pub mod owner;
+mod par;
 // Child processes, at the path tokio gives them. They register on a reactor of
 // their own that starts on first use, rather than one the caller passes, so a
 // child's futures finish under any executor. Unix only, because the reactor is:
@@ -97,10 +97,10 @@ pub mod runtime;
 // The four async primitives a consumer was otherwise taking from `tokio::sync`.
 // They are runtime-agnostic there too, which is exactly why the dependency was
 // easy to acquire and hard to notice: see the module comment.
+pub mod readiness;
 pub mod sync;
 pub mod task;
 pub mod time;
-pub mod readiness;
 mod yield_now;
 
 /// Spawn onto the shared pool, as `tokio::spawn` does.
@@ -119,7 +119,7 @@ where
 }
 
 pub use block_on::{block_on, block_on_with_host};
-pub use par::{par_for, Cancel, ParFor};
+pub use par::{Cancel, ParFor, par_for};
 /// The idle policy a pool runs with, from the queues underneath.
 ///
 /// Re-exported because selecting one is a nagoya-level decision and every
@@ -128,9 +128,9 @@ pub use par::{par_for, Cancel, ParFor};
 /// contains it transitively.
 pub use st3::fanout::Tuning;
 pub use time::{
-    now_ns, poll as poll_timers, set_clock, sleep, sleep_until, timeout, Elapsed, Sleep, Timeout,
+    Elapsed, Sleep, Timeout, now_ns, poll as poll_timers, set_clock, sleep, sleep_until, timeout,
 };
-pub use yield_now::{yield_now, YieldNow};
+pub use yield_now::{YieldNow, yield_now};
 
 /// A handle to a spawned task's output.
 ///
@@ -307,7 +307,8 @@ impl Executor {
         match self.context.as_deref() {
             Some(context) => context.current_worker(&self.pool),
             None => crate::task::current_worker(&self.pool),
-        }.filter(|id| *id < self.pool.workers())
+        }
+        .filter(|id| *id < self.pool.workers())
     }
 
     /// Run a future to completion somewhere on the pool.

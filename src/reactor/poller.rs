@@ -155,7 +155,7 @@ fn check(value: i32) -> Result<i32> {
 ))]
 mod sys {
     use super::super::error::Result;
-    use super::{check, Event, Interest};
+    use super::{Event, Interest, check};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     /// The identifier used for the user event that implements `wake`.
@@ -342,7 +342,7 @@ mod sys {
 #[cfg(target_os = "linux")]
 mod sys {
     use super::super::error::Result;
-    use super::{check, Event, Interest};
+    use super::{Event, Interest, check};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     /// Token reserved for the eventfd that implements `wake`.
