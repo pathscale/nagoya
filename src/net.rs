@@ -545,8 +545,13 @@ impl TcpListener {
     /// Accept one connection, parking `cx`'s waker if none is waiting.
     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<Result<(TcpStream, Addr)>> {
         loop {
+            if !self.registration.take_readable_or_park(cx.waker()) {
+                return Poll::Pending;
+            }
             match self.inner.accept() {
                 Ok((socket, addr)) => {
+                    // Keep draining queued connections until accept would block.
+                    self.registration.mark_readable();
                     return Poll::Ready(
                         TcpStream::from_socket(socket, &self.handle).map(|stream| (stream, addr)),
                     );
@@ -555,11 +560,17 @@ impl TcpListener {
                     self.registration.poll_readable(cx.waker());
                     return Poll::Pending;
                 }
-                Err(error) if error.interrupted() => continue,
+                Err(error) if error.interrupted() => {
+                    self.registration.mark_readable();
+                    continue;
+                }
                 // A connection that died between the readiness event and the
                 // accept is not this listener's problem: drop it and look for
                 // the next one rather than failing the accept loop.
-                Err(error) if crate::reactor::error::transient_accept(error) => continue,
+                Err(error) if crate::reactor::error::transient_accept(error) => {
+                    self.registration.mark_readable();
+                    continue;
+                }
                 Err(error) => return Poll::Ready(Err(error)),
             }
         }
