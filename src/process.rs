@@ -86,6 +86,12 @@ use crate::reactor::poller::Interest;
 
 pub use std::process::{ExitStatus, Output, Stdio};
 
+// Non-Linux socket and signal-pipe creation holds a read guard until every
+// fresh descriptor is close-on-exec or closed. Command::spawn holds the write
+// guard only while std creates the child. Direct std spawns do not participate.
+#[cfg(not(target_os = "linux"))]
+pub(crate) static FD_CLOEXEC_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// A process to spawn, and how.
 ///
 /// A wrapper over [`std::process::Command`] with tokio's method names, which
@@ -238,8 +244,19 @@ impl Command {
     /// pipes and the exit. A child that did start but whose pipes or exit
     /// could not be registered is killed and reaped before the error is
     /// returned, rather than left running with nobody holding it.
+    ///
+    /// On non-Linux targets, spawning here is serialized with this crate's
+    /// socket and signal-pipe creation until their descriptors are close-on-exec.
+    /// Direct calls to `std::process::Command::spawn`, including through
+    /// [`Self::as_std_mut`], do not participate in that coordination.
     pub fn spawn(&mut self, handle: &Handle) -> io::Result<Child> {
-        let mut child = self.std.spawn()?;
+        let mut child = {
+            #[cfg(not(target_os = "linux"))]
+            let _cloexec_guard = FD_CLOEXEC_LOCK
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.std.spawn()?
+        };
         match adopt(&mut child, handle) {
             Ok((stdin, stdout, stderr, watch)) => Ok(Child {
                 stdin,
