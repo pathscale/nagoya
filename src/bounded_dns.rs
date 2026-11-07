@@ -537,6 +537,53 @@ mod tests {
         }
     }
 
+    fn held_resolver() -> (
+        Resolver,
+        std::sync::mpsc::Receiver<u16>,
+        Vec<std::sync::mpsc::Sender<()>>,
+    ) {
+        let (entered, entries) = std::sync::mpsc::channel();
+        let mut senders = Vec::with_capacity(WORKERS);
+        let mut releases = std::collections::HashMap::with_capacity(WORKERS);
+        for port in 1..=WORKERS as u16 {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            senders.push(sender);
+            releases.insert(port, receiver);
+        }
+        let gate = EntryReleaseGate {
+            entered,
+            releases: Mutex::new(releases),
+        };
+        let resolver = Resolver::start(Arc::new(move |_, port| {
+            if port <= WORKERS as u16 {
+                gate.publish_and_wait(port);
+            } else {
+                let _ = gate.entered.send(port);
+            }
+            addrs(port)
+        }))
+        .expect("workers");
+        (resolver, entries, senders)
+    }
+
+    fn wait_for_deadline(deadline: u64) {
+        std::thread::sleep(Duration::from_nanos(
+            deadline.saturating_sub(time::now_ns()),
+        ));
+        assert!(time::now_ns() >= deadline);
+    }
+
+    fn wait_for_disconnect(reply: &Reply) {
+        let bound = std::time::Instant::now() + Duration::from_secs(2);
+        while !reply.mailbox.disconnected.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < bound,
+                "worker disconnects the reply endpoint"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn expired_and_closed_requests_never_call_the_system_resolver() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -622,6 +669,113 @@ mod tests {
             other => panic!("unexpected result: {other:?}"),
         }
         resolver.close();
+    }
+
+    #[test]
+    fn timer_wakes_held_lookup_at_deadline() {
+        let (resolver, entries, senders) = held_resolver();
+        let _guard = WorkerReleaseGuard {
+            resolver: &resolver,
+            senders,
+        };
+        let (mut cx, wakes) = context();
+        let deadline = time::now_ns().saturating_add(500_000_000);
+        let mut future = admit(&resolver, "held", 1, deadline, &mut cx);
+        assert_eq!(entries.recv_timeout(Duration::from_secs(2)), Ok(1));
+
+        wakes
+            .recv_timeout(Duration::from_secs(2))
+            .expect("deadline wakes the pending lookup");
+        let reply = future.reply.as_ref().expect("lookup was admitted");
+        assert!(!reply.mailbox.disconnected.load(Ordering::Acquire));
+        assert_eq!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ResolveUntilError::Deadline))
+        );
+    }
+
+    #[test]
+    fn queued_expiry_skips_lookup_when_workers_are_released() {
+        let (resolver, entries, senders) = held_resolver();
+        let guard = WorkerReleaseGuard {
+            resolver: &resolver,
+            senders,
+        };
+        let (mut cx, _) = context();
+        let active_deadline = time::now_ns().saturating_add(5_000_000_000);
+        let _active: Vec<_> = (1..=WORKERS as u16)
+            .map(|port| admit(&resolver, "held", port, active_deadline, &mut cx))
+            .collect();
+        receive_entries(&entries, WORKERS, Duration::from_secs(2))
+            .expect("all workers are held");
+
+        let deadline = time::now_ns().saturating_add(500_000_000);
+        let queued = admit(&resolver, "queued", 10, deadline, &mut cx);
+        let reply = queued.reply.as_ref().expect("lookup was admitted");
+        wait_for_deadline(deadline);
+        guard.release();
+
+        wait_for_disconnect(reply);
+        assert_eq!(
+            entries.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+    }
+
+    #[test]
+    fn late_answer_after_deadline_is_discarded() {
+        let (resolver, entries, senders) = held_resolver();
+        let guard = WorkerReleaseGuard {
+            resolver: &resolver,
+            senders,
+        };
+        let (mut cx, _) = context();
+        let deadline = time::now_ns().saturating_add(500_000_000);
+        let mut future = admit(&resolver, "late", 1, deadline, &mut cx);
+        assert_eq!(entries.recv_timeout(Duration::from_secs(2)), Ok(1));
+
+        let reply = future.reply.as_ref().expect("lookup was admitted");
+        wait_for_deadline(deadline);
+        guard.release();
+
+        wait_for_disconnect(reply);
+        assert!(reply.mailbox.value.lock().unwrap().is_none());
+        assert_eq!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ResolveUntilError::Deadline))
+        );
+    }
+
+    #[test]
+    fn close_wakes_queued_request_while_lookups_are_held() {
+        let (resolver, entries, senders) = held_resolver();
+        let _guard = WorkerReleaseGuard {
+            resolver: &resolver,
+            senders,
+        };
+        let (mut active_cx, _) = context();
+        let deadline = time::now_ns().saturating_add(5_000_000_000);
+        let _active: Vec<_> = (1..=WORKERS as u16)
+            .map(|port| admit(&resolver, "held", port, deadline, &mut active_cx))
+            .collect();
+        receive_entries(&entries, WORKERS, Duration::from_secs(2))
+            .expect("all workers are held");
+
+        let (mut queued_cx, wakes) = context();
+        let mut queued = admit(&resolver, "queued", 10, deadline, &mut queued_cx);
+        resolver.close();
+
+        wakes
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close wakes the queued lookup");
+        assert_eq!(
+            queued.as_mut().poll(&mut queued_cx),
+            Poll::Ready(Err(ResolveUntilError::Closed))
+        );
+        assert_eq!(
+            entries.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
     }
 
     #[test]
