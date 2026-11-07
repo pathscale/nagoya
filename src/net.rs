@@ -28,7 +28,7 @@
 #![allow(unsafe_code)]
 
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 
 use crate::reactor::driver::{Handle, Registration};
 use crate::reactor::error::Result;
@@ -542,55 +542,78 @@ impl TcpListener {
         self.inner.local_addr()
     }
 
-    /// Accept one connection, parking `cx`'s waker if none is waiting.
+    /// Accept one connection, parking the task if the queue is empty.
+    ///
+    /// Distinct tasks can wait concurrently, with one direct wait per task
+    /// waker. Before abandoning a pending direct poll or switching its waker,
+    /// call [`Self::cancel_accept`] with the previously registered waker.
+    /// For cancellation on drop and automatic waker replacement, use
+    /// [`Self::accept`].
     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<Result<(TcpStream, Addr)>> {
-        self.poll_accept_with(cx, || self.inner.accept())
+        self.poll_accept_with(cx, None, || self.inner.accept())
     }
 
-    fn poll_accept_with<F>(&self, cx: &mut Context<'_>, mut accept: F) -> Poll<Result<(TcpStream, Addr)>>
+    /// Release the direct accept wait for this task's waker.
+    ///
+    /// Call this once the task has no remaining direct accept polls pending
+    /// with this waker. An event already dispatched may still wake the task.
+    pub fn cancel_accept(&self, waker: &Waker) {
+        self.registration
+            .cancel_accept_wait(|id, parked| id.is_none() && parked.will_wake(waker));
+    }
+
+    fn poll_accept_with<F>(
+        &self,
+        cx: &mut Context<'_>,
+        mut waiter: Option<&mut Option<u64>>,
+        mut accept: F,
+    ) -> Poll<Result<(TcpStream, Addr)>>
     where
         F: FnMut() -> Result<(TcpSocket, Addr)>,
     {
+        let waker = cx.waker();
+        let Some(generation) = self
+            .registration
+            .poll_accept_readable(waker, waiter.as_deref_mut(), None)
+        else {
+            return Poll::Pending;
+        };
         loop {
-            if !self.registration.take_readable_or_park(cx.waker()) {
-                return Poll::Pending;
-            }
             match accept() {
                 Ok((socket, addr)) => {
-                    // Keep draining queued connections until accept would block.
-                    self.registration.mark_readable();
                     return Poll::Ready(
                         TcpStream::from_socket(socket, &self.handle).map(|stream| (stream, addr)),
                     );
                 }
                 Err(error) if error.would_block() => {
-                    self.registration.poll_readable(cx.waker());
+                    if self
+                        .registration
+                        .poll_accept_readable(waker, waiter, Some(generation))
+                        .is_some()
+                    {
+                        waker.wake_by_ref();
+                    }
                     return Poll::Pending;
                 }
-                Err(error) if error.interrupted() => {
-                    self.registration.mark_readable();
-                    continue;
-                }
-                // A connection that died between the readiness event and the
-                // accept is not this listener's problem: drop it and look for
-                // the next one rather than failing the accept loop.
-                Err(error) if crate::reactor::error::transient_accept(error) => {
-                    self.registration.mark_readable();
-                    continue;
-                }
-                Err(error) => {
-                    // The caller may recover (for example, by freeing a descriptor).
-                    // Preserve the queued edge so its next poll retries accept.
-                    self.registration.mark_readable();
-                    return Poll::Ready(Err(error));
-                }
+                Err(error) if error.interrupted() => continue,
+                // A connection that died between readiness and accept can be
+                // skipped while looking for the next one.
+                Err(error) if crate::reactor::error::transient_accept(error) => continue,
+                // Preserve readiness so a caller that recovers can retry.
+                Err(error) => return Poll::Ready(Err(error)),
             }
         }
     }
 
     /// Accept one connection, as a future.
+    ///
+    /// Dropping a pending future releases its wait. An event already
+    /// dispatched may still wake the task.
     pub fn accept(&self) -> Accept<'_> {
-        Accept { listener: self }
+        Accept {
+            listener: self,
+            waiter: None,
+        }
     }
 }
 
@@ -598,13 +621,26 @@ impl TcpListener {
 #[derive(Debug)]
 pub struct Accept<'a> {
     listener: &'a TcpListener,
+    waiter: Option<u64>,
 }
 
 impl core::future::Future for Accept<'_> {
     type Output = Result<(TcpStream, Addr)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.listener.poll_accept(cx)
+        let this = self.get_mut();
+        let listener = this.listener;
+        listener.poll_accept_with(cx, Some(&mut this.waiter), || listener.inner.accept())
+    }
+}
+
+impl Drop for Accept<'_> {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter {
+            self.listener
+                .registration
+                .cancel_accept_wait(|id, _| id == Some(waiter));
+        }
     }
 }
 
@@ -1078,26 +1114,197 @@ impl crate::io::Stream for TcpStream {
 #[cfg(test)]
 mod accept_recovery_tests {
     use super::*;
+    use core::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counted_waker() -> (Arc<WakeCount>, Waker) {
+        let count = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&count));
+        (count, waker)
+    }
+
+    fn connect_peer(listener: &TcpListener) -> std::net::TcpStream {
+        let port = listener.local_addr().expect("listener address").port();
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_secs(1),
+        )
+        .expect("connect peer")
+    }
+
+    fn wait_for_peer(listener: &TcpListener) {
+        let mut readiness = libc::pollfd {
+            fd: listener.inner.raw(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: readiness is one live pollfd and the listener owns its fd.
+        let ready = unsafe { libc::poll(&mut readiness, 1, 1000) };
+        assert_eq!(ready, 1, "peer did not reach the accept queue");
+        assert_ne!(readiness.revents & libc::POLLIN, 0);
+    }
+
+    fn accepted_port(result: Poll<Result<(TcpStream, Addr)>>) -> u16 {
+        let Poll::Ready(Ok((_, addr))) = result else {
+            panic!("expected an accepted connection, got {result:?}");
+        };
+        addr.port()
+    }
+
+    fn assert_peers(mut ports: [u16; 2], peers: [std::net::TcpStream; 2]) {
+        let mut expected = peers.map(|peer| peer.local_addr().expect("peer address").port());
+        ports.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(ports, expected);
+    }
+
+    #[test]
+    fn one_listener_event_wakes_two_pending_accepts() {
+        let reactor = crate::reactor::Reactor::local().expect("reactor");
+        let listener = TcpListener::bind(Addr::localhost(0), &reactor.handle()).expect("listener");
+        let (first_wakes, first_waker) = counted_waker();
+        let (second_wakes, second_waker) = counted_waker();
+        let (cancelled_wakes, cancelled_waker) = counted_waker();
+        let mut first_cx = Context::from_waker(&first_waker);
+        let mut second_cx = Context::from_waker(&second_waker);
+        let mut first = listener.accept();
+        assert!(Pin::new(&mut first).poll(&mut first_cx).is_pending());
+        assert!(listener.poll_accept(&mut second_cx).is_pending());
+        let mut cancelled = listener.accept();
+        assert!(Pin::new(&mut cancelled)
+            .poll(&mut Context::from_waker(&cancelled_waker))
+            .is_pending());
+        drop(cancelled);
+
+        let first_peer = connect_peer(&listener);
+        let second_peer = connect_peer(&listener);
+        wait_for_peer(&listener);
+        reactor.poll_once_timeout(Some(0)).expect("listener event");
+        assert_eq!(first_wakes.0.load(Ordering::Relaxed), 1);
+        assert_eq!(second_wakes.0.load(Ordering::Relaxed), 1);
+        assert_eq!(cancelled_wakes.0.load(Ordering::Relaxed), 0);
+
+        let first_port = accepted_port(Pin::new(&mut first).poll(&mut first_cx));
+        // The second handshake may still be reaching the listener. Wait on
+        // the kernel without dispatching another Nagoya event.
+        wait_for_peer(&listener);
+        let second_port = accepted_port(listener.poll_accept(&mut second_cx));
+        assert_peers([first_port, second_port], [first_peer, second_peer]);
+    }
+
+    #[test]
+    fn accept_cancellation_and_waker_replacement_are_independent() {
+        let reactor = crate::reactor::Reactor::local().expect("reactor");
+        let listener = TcpListener::bind(Addr::localhost(0), &reactor.handle()).expect("listener");
+        let (shared_wakes, shared) = counted_waker();
+        let (old_wakes, old) = counted_waker();
+        let (new_wakes, new) = counted_waker();
+        let (direct_wakes, direct) = counted_waker();
+        let mut shared_cx = Context::from_waker(&shared);
+        let mut survivor = listener.accept();
+        let mut cancelled = listener.accept();
+        assert!(Pin::new(&mut survivor).poll(&mut shared_cx).is_pending());
+        assert!(Pin::new(&mut cancelled).poll(&mut shared_cx).is_pending());
+        drop(cancelled);
+
+        let mut migrated = listener.accept();
+        assert!(Pin::new(&mut migrated)
+            .poll(&mut Context::from_waker(&old))
+            .is_pending());
+        let mut new_cx = Context::from_waker(&new);
+        assert!(Pin::new(&mut migrated).poll(&mut new_cx).is_pending());
+        assert!(listener.poll_accept(&mut Context::from_waker(&direct)).is_pending());
+        listener.cancel_accept(&direct);
+
+        let first = connect_peer(&listener);
+        let second = connect_peer(&listener);
+        wait_for_peer(&listener);
+        reactor.poll_once_timeout(Some(0)).expect("listener event");
+        assert_eq!(shared_wakes.0.load(Ordering::Relaxed), 1);
+        assert_eq!(old_wakes.0.load(Ordering::Relaxed), 0);
+        assert_eq!(new_wakes.0.load(Ordering::Relaxed), 1);
+        assert_eq!(direct_wakes.0.load(Ordering::Relaxed), 0);
+
+        let first_port = accepted_port(Pin::new(&mut survivor).poll(&mut shared_cx));
+        wait_for_peer(&listener);
+        let second_port = accepted_port(Pin::new(&mut migrated).poll(&mut new_cx));
+        assert_peers([first_port, second_port], [first, second]);
+    }
+
+    #[test]
+    fn in_flight_accept_leaves_queued_peer_visible() {
+        let reactor = crate::reactor::Reactor::local().expect("reactor");
+        let listener = TcpListener::bind(Addr::localhost(0), &reactor.handle()).expect("listener");
+        let first_peer = connect_peer(&listener);
+        let second_peer = connect_peer(&listener);
+        wait_for_peer(&listener);
+        reactor.poll_once_timeout(Some(0)).expect("listener event");
+
+        let (_, other_waker) = counted_waker();
+        let mut other_cx = Context::from_waker(&other_waker);
+        let mut other_port = None;
+        let mut cx = Context::from_waker(Waker::noop());
+        let first = listener.poll_accept_with(&mut cx, None, || {
+            let first = listener.inner.accept()?;
+            wait_for_peer(&listener);
+            other_port = Some(accepted_port(listener.poll_accept(&mut other_cx)));
+            Ok(first)
+        });
+        assert_peers(
+            [accepted_port(first), other_port.expect("overlapping accept")],
+            [first_peer, second_peer],
+        );
+    }
+
+    #[test]
+    fn would_block_preserves_a_newer_listener_event() {
+        let reactor = crate::reactor::Reactor::local().expect("reactor");
+        let listener = TcpListener::bind(Addr::localhost(0), &reactor.handle()).expect("listener");
+        let (wakes, waker) = counted_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut peer = None;
+        let result = listener.poll_accept_with(&mut cx, None, || {
+            let error = listener.inner.accept().expect_err("listener is empty");
+            assert!(error.would_block());
+            peer = Some(connect_peer(&listener));
+            wait_for_peer(&listener);
+            reactor.poll_once_timeout(Some(0)).expect("new listener event");
+            Err(error)
+        });
+
+        assert!(result.is_pending());
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        let peer = peer.expect("queued peer");
+        let expected = peer.local_addr().expect("peer address").port();
+        assert_eq!(accepted_port(listener.poll_accept(&mut cx)), expected);
+    }
 
     #[test]
     fn accept_retries_after_emfile() {
         let reactor = crate::reactor::Reactor::local().expect("reactor");
         let listener = TcpListener::bind(Addr::localhost(0), &reactor.handle()).expect("listener");
-        let Addr::V4(ip, port) = listener.local_addr().expect("address") else { panic!("IPv4 listener") };
-        let peer = std::net::TcpStream::connect_timeout(
-            &std::net::SocketAddr::from((ip, port)), std::time::Duration::from_secs(1),
-        ).expect("queued peer");
-        let mut readiness = libc::pollfd { fd: listener.inner.raw(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: readiness is one live pollfd; the bounded call neither owns
-        // nor closes its descriptor. It does not drive the Nagoya reactor.
-        #[allow(unsafe_code)]
-        let ready = unsafe { libc::poll(&mut readiness, 1, 1000) };
-        assert_eq!(ready, 1, "peer did not reach the accept queue");
-        assert_ne!(readiness.revents & libc::POLLIN, 0);
+        let peer = connect_peer(&listener);
+        wait_for_peer(&listener);
         let mut cx = Context::from_waker(core::task::Waker::noop());
         listener.registration.mark_readable();
         let mut attempts = 0;
-        let first = listener.poll_accept_with(&mut cx, || {
+        let first = listener.poll_accept_with(&mut cx, None, || {
             attempts += 1;
             Err(crate::reactor::error::Errno(libc::EMFILE))
         });
