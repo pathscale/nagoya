@@ -487,6 +487,56 @@ fn check(value: libc::c_int) -> Result<libc::c_int> {
     }
 }
 
+/// Protects a new stream descriptor until it is close-on-exec or closed.
+pub(crate) struct StreamSetup {
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    _guard: crate::process::CloexecReadGuard,
+}
+
+impl StreamSetup {
+    pub(crate) fn lock() -> Self {
+        Self {
+            #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+            _guard: crate::process::CloexecReadGuard::lock(),
+        }
+    }
+
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    pub(crate) fn poll(
+        waiter: &crate::process::CloexecWaiter,
+        handle: &crate::reactor::driver::Handle,
+        waker: &core::task::Waker,
+    ) -> core::task::Poll<Self> {
+        waiter
+            .poll(handle, waker)
+            .map(|guard| Self { _guard: guard })
+    }
+
+    fn finish(self) {}
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_stream_flags(fd: Fd) -> Result<Fd> {
+    // SAFETY: `fd` owns the fresh descriptor, including on error.
+    unsafe {
+        let flags = check(libc::fcntl(fd.raw(), libc::F_GETFL))?;
+        check(libc::fcntl(
+            fd.raw(),
+            libc::F_SETFL,
+            flags | libc::O_NONBLOCK,
+        ))?;
+        let flags = check(libc::fcntl(fd.raw(), libc::F_GETFD))?;
+        check(libc::fcntl(
+            fd.raw(),
+            libc::F_SETFD,
+            flags | libc::FD_CLOEXEC,
+        ))?;
+    }
+    // Linux uses MSG_NOSIGNAL when sending; other targets set this option.
+    let _ = set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_NOSIGPIPE, true);
+    Ok(fd)
+}
+
 /// Create a non-blocking stream socket for `addr`'s family.
 ///
 /// Linux sets non-blocking and close-on-exec atomically. Other targets set
@@ -497,9 +547,9 @@ fn check(value: libc::c_int) -> Result<libc::c_int> {
 /// non-blocking setup, and `SO_NOSIGPIPE` for the same reason, since
 /// writing to a Unix socket whose peer has gone raises `SIGPIPE` exactly as a
 /// TCP one does.
-fn stream_socket(addr: &Addr) -> Result<Fd> {
-    // Linux sets both flags in `socket`; the fallback checks each flag-setting
-    // call while coordinated process spawning is excluded.
+fn stream_socket(addr: &Addr, setup: StreamSetup) -> Result<Fd> {
+    // Linux sets both flags in `socket`. Elsewhere, `setup` protects the
+    // descriptor until both flag-setting calls have succeeded.
     #[cfg(target_os = "linux")]
     let raw = check(unsafe {
         libc::socket(
@@ -508,58 +558,14 @@ fn stream_socket(addr: &Addr) -> Result<Fd> {
             0,
         )
     })?;
-
     #[cfg(not(target_os = "linux"))]
-    let raw = {
-        #[cfg(all(feature = "process", unix))]
-        let _cloexec_guard = crate::process::FD_CLOEXEC_LOCK
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let raw = check(unsafe { libc::socket(addr.family(), libc::SOCK_STREAM, 0) })?;
-        // Take ownership before setting flags so every failure closes it.
-        // SAFETY: `raw` is a descriptor the call above just returned.
-        let fd = unsafe { Fd::from_raw(raw) };
-        // SAFETY: `fd` owns the newly created descriptor throughout setup.
-        unsafe {
-            let flags = check(libc::fcntl(fd.raw(), libc::F_GETFL))?;
-            check(libc::fcntl(
-                fd.raw(),
-                libc::F_SETFL,
-                flags | libc::O_NONBLOCK,
-            ))?;
-            let flags = check(libc::fcntl(fd.raw(), libc::F_GETFD))?;
-            check(libc::fcntl(
-                fd.raw(),
-                libc::F_SETFD,
-                flags | libc::FD_CLOEXEC,
-            ))?;
-        }
-        fd.into_raw()
-    };
+    let raw = check(unsafe { libc::socket(addr.family(), libc::SOCK_STREAM, 0) })?;
 
     // SAFETY: `raw` is a fresh descriptor owned exclusively here.
     let fd = unsafe { Fd::from_raw(raw) };
-
-    // SIGPIPE on a closed peer would kill the process. Every socket in this
-    // crate wants the error return instead. macOS spells it as a socket
-    // option; Linux has no equivalent and uses MSG_NOSIGNAL per call, which
-    // `send_vectored` passes.
     #[cfg(not(target_os = "linux"))]
-    {
-        let on: libc::c_int = 1;
-        // SAFETY: SO_NOSIGPIPE takes an int, which is what is passed.
-        unsafe {
-            libc::setsockopt(
-                fd.raw(),
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                core::ptr::addr_of!(on).cast(),
-                mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-
+    let fd = set_stream_flags(fd)?;
+    setup.finish();
     Ok(fd)
 }
 
@@ -587,9 +593,7 @@ fn datagram_socket(addr: &Addr) -> Result<Fd> {
     #[cfg(not(target_os = "linux"))]
     let fd = {
         #[cfg(all(feature = "process", unix))]
-        let _cloexec_guard = crate::process::FD_CLOEXEC_LOCK
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cloexec_guard = crate::process::CloexecReadGuard::lock();
 
         let raw = check(unsafe { libc::socket(addr.family(), libc::SOCK_DGRAM, protocol) })?;
         // Take ownership before setting flags so every failure closes it.
@@ -686,7 +690,11 @@ impl TcpSocket {
     /// the same code; a caller written to TCP's shape should not read an
     /// instant answer as a bug.
     pub fn connect(addr: Addr) -> Result<Self> {
-        let fd = stream_socket(&addr)?;
+        Self::connect_with_setup(addr, StreamSetup::lock())
+    }
+
+    pub(crate) fn connect_with_setup(addr: Addr, setup: StreamSetup) -> Result<Self> {
+        let fd = stream_socket(&addr, setup)?;
         // SAFETY: zeroed storage, then written by `write_to` for this family.
         let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
         let len = addr.write_to(&mut storage);
@@ -1206,7 +1214,7 @@ impl TcpListener {
 
     fn bind_with(addr: Addr, backlog: i32, reuse_port: bool) -> Result<Self> {
         let family = addr.family();
-        let fd = stream_socket(&addr)?;
+        let fd = stream_socket(&addr, StreamSetup::lock())?;
         // Without this, a restart fails to bind while the previous socket's
         // connections drain through TIME_WAIT. There is no TIME_WAIT on a Unix
         // socket and no option to ask about, so it is not asked for.
@@ -1245,6 +1253,10 @@ impl TcpListener {
     ///
     /// The accepted socket is non-blocking, like everything else here.
     pub fn accept(&self) -> Result<(TcpSocket, Addr)> {
+        self.accept_with_setup(StreamSetup::lock())
+    }
+
+    pub(crate) fn accept_with_setup(&self, setup: StreamSetup) -> Result<(TcpSocket, Addr)> {
         // SAFETY: zeroed storage the kernel fills with the peer address.
         let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
         let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -1263,46 +1275,19 @@ impl TcpListener {
         })?;
 
         #[cfg(not(target_os = "linux"))]
-        let raw = {
-            #[cfg(all(feature = "process", unix))]
-            let _cloexec_guard = crate::process::FD_CLOEXEC_LOCK
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let raw = check(unsafe {
+            libc::accept(
+                self.raw(),
+                core::ptr::addr_of_mut!(storage).cast(),
+                core::ptr::addr_of_mut!(len),
+            )
+        })?;
 
-            let raw = check(unsafe {
-                libc::accept(
-                    self.raw(),
-                    core::ptr::addr_of_mut!(storage).cast(),
-                    core::ptr::addr_of_mut!(len),
-                )
-            })?;
-            // SAFETY: `raw` is the descriptor just accepted and uniquely owned.
-            let fd = unsafe { Fd::from_raw(raw) };
-            // SAFETY: `fd` owns the accepted descriptor throughout setup.
-            unsafe {
-                let flags = check(libc::fcntl(fd.raw(), libc::F_GETFL))?;
-                check(libc::fcntl(
-                    fd.raw(),
-                    libc::F_SETFL,
-                    flags | libc::O_NONBLOCK,
-                ))?;
-                let flags = check(libc::fcntl(fd.raw(), libc::F_GETFD))?;
-                check(libc::fcntl(
-                    fd.raw(),
-                    libc::F_SETFD,
-                    flags | libc::FD_CLOEXEC,
-                ))?;
-                let on: libc::c_int = 1;
-                libc::setsockopt(
-                    fd.raw(),
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    core::ptr::addr_of!(on).cast(),
-                    mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-            fd.into_raw()
-        };
+        // SAFETY: `raw` is the descriptor just accepted and uniquely owned.
+        let fd = unsafe { Fd::from_raw(raw) };
+        #[cfg(not(target_os = "linux"))]
+        let fd = set_stream_flags(fd)?;
+        setup.finish();
 
         let addr = match Addr::read_from(&storage, len) {
             Some(addr) => addr,
@@ -1314,8 +1299,7 @@ impl TcpListener {
             None if self.family == libc::AF_UNIX => Addr::Path(UnixPath::unnamed()),
             None => return Err(Errno(libc::EAFNOSUPPORT)),
         };
-        // SAFETY: `raw` is a fresh, non-blocking, connected descriptor.
-        let socket = unsafe { TcpSocket::from_raw(raw) };
+        let socket = TcpSocket(fd);
         // As in `connect`: TCP's option, and fatal on a Unix socket.
         if self.family != libc::AF_UNIX {
             socket.set_nodelay(true)?;

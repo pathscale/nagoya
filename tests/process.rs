@@ -46,6 +46,121 @@ fn on_tokio<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn cloexec_spawn_releases_pending_network_polls() {
+    use nagoya::net::{TcpListener, TcpStream};
+    use nagoya::reactor::Addr;
+    use std::io::Read as _;
+    use std::net::Shutdown;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::task::Wake;
+
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let reactor = Reactor::local().expect("local reactor");
+    let handle = reactor.handle();
+    let listener = TcpListener::bind(Addr::localhost(0), &handle).expect("listen");
+    let addr = listener.local_addr().expect("listener address");
+    let _peer = std::net::TcpStream::connect(("127.0.0.1", addr.port())).expect("queue peer");
+    reactor
+        .poll_once_timeout(Some(0))
+        .expect("drain listener readiness");
+
+    let (mut control, child_control) = UnixStream::pair().expect("spawn control");
+    control.set_read_timeout(Some(BOUND)).expect("read timeout");
+    let child_fd = child_control.as_raw_fd();
+    let mut command = Command::new("/usr/bin/true");
+    // SAFETY: The child uses only async-signal-safe syscalls on the inherited
+    // socket before exec. The parent keeps that descriptor open through spawn.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            let byte = 1u8;
+            if libc::write(child_fd, core::ptr::addr_of!(byte).cast(), 1) != 1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut byte = 0u8;
+            loop {
+                if libc::read(child_fd, core::ptr::addr_of_mut!(byte).cast(), 1) >= 0 {
+                    return Ok(());
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        });
+    }
+
+    let accept_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let connect_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let accept_waker = Waker::from(Arc::clone(&accept_wakes));
+    let connect_waker = Waker::from(Arc::clone(&connect_wakes));
+    let mut accept = pin!(listener.accept());
+    let mut connect = pin!(TcpStream::connect(addr, &handle));
+    let child_reactor = Reactor::local().expect("child reactor");
+    let child_handle = child_reactor.handle();
+
+    let mut child = std::thread::scope(|scope| {
+        let spawn = scope.spawn(|| command.spawn(&child_handle));
+        if let Err(error) = control.read_exact(&mut [0]) {
+            control.shutdown(Shutdown::Write).expect("release child");
+            panic!("child did not enter pre_exec: {error}");
+        }
+
+        let (release, released) = mpsc::channel();
+        let watchdog = scope.spawn(move || {
+            let polled_during_spawn = released.recv_timeout(BOUND).is_ok();
+            control.shutdown(Shutdown::Write).expect("release child");
+            polled_during_spawn
+        });
+        let accept_pending = accept
+            .as_mut()
+            .poll(&mut Context::from_waker(&accept_waker))
+            .is_pending();
+        let connect_pending = connect
+            .as_mut()
+            .poll(&mut Context::from_waker(&connect_waker))
+            .is_pending();
+        let _ = release.send(());
+        assert!(watchdog.join().expect("watchdog"), "network poll blocked");
+        assert!(accept_pending && connect_pending);
+        spawn.join().expect("spawn thread").expect("spawn")
+    });
+
+    // The network reactor has not been polled since spawn began. Its
+    // notification must be pending, and neither task ran on the spawn thread.
+    assert_eq!(accept_wakes.0.load(Ordering::Relaxed), 0);
+    assert_eq!(connect_wakes.0.load(Ordering::Relaxed), 0);
+    let deadline = Instant::now() + BOUND;
+    while accept_wakes.0.load(Ordering::Relaxed) == 0
+        || connect_wakes.0.load(Ordering::Relaxed) == 0
+    {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "gate release did not wake both polls");
+        reactor
+            .poll_once_timeout(Some(left.as_nanos() as u64))
+            .expect("reactor notification");
+        assert!(Instant::now() < deadline, "gate release exceeded deadline");
+    }
+    let status = nagoya::reactor::block_on_with(&child_reactor, child.wait()).expect("wait");
+    assert!(status.success());
+    nagoya::reactor::block_on_with(&reactor, async {
+        accept.as_mut().await.expect("accept after spawn");
+        connect.as_mut().await.expect("connect after spawn");
+    });
+}
+
 #[test]
 fn the_handles_are_send() {
     fn send<T: Send>() {}

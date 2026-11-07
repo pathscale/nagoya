@@ -110,12 +110,32 @@ struct Shared {
     slots: Mutex<HashMap<u64, Arc<Slot>>>,
     next_index: AtomicU64,
     running: AtomicBool,
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    deferred_wakes: Mutex<Vec<Waker>>,
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    has_deferred_wakes: AtomicBool,
     /// When the earliest known timer is due, in nagoya's clock, or
     /// [`NO_DEADLINE`] when none is armed.
     ///
     /// This is what makes timer servicing event driven rather than polled: the
     /// loop compares against it instead of asking the timer wheel.
     next_deadline: AtomicU64,
+}
+
+#[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+impl Shared {
+    fn take_deferred_wakes(&self) -> Vec<Waker> {
+        if !self.has_deferred_wakes.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.drain_deferred_wakes()
+    }
+
+    fn drain_deferred_wakes(&self) -> Vec<Waker> {
+        let mut queued = self.deferred_wakes.lock().expect("reactor wakes poisoned");
+        self.has_deferred_wakes.store(false, Ordering::Release);
+        core::mem::take(&mut *queued)
+    }
 }
 
 /// Sentinel for "no timer armed". A real deadline is a nanosecond clock
@@ -213,6 +233,31 @@ impl Handle {
         #[cfg(feature = "syscall-counters")]
         crate::reactor::counters::WAKE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.shared.poller.wake()
+    }
+
+    /// Queue a wake for the reactor to deliver, using its existing wake event.
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    pub(crate) fn defer_wake(&self, waker: Waker) {
+        let trigger = {
+            let mut queued = self
+                .shared
+                .deferred_wakes
+                .lock()
+                .expect("reactor wakes poisoned");
+            if !self.shared.running.load(Ordering::Acquire) {
+                return;
+            }
+            let trigger = queued.is_empty();
+            queued.push(waker);
+            self.shared
+                .has_deferred_wakes
+                .store(true, Ordering::Release);
+            trigger
+        };
+        if trigger {
+            // An interrupt must not consume the only notification for this batch.
+            while self.wake().is_err_and(|error| error.interrupted()) {}
+        }
     }
 
     /// Tell the reactor a timer was armed for `deadline`.
@@ -339,7 +384,9 @@ impl Registration {
         let mut cloned = None;
         loop {
             let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
-            let Wakers { readable, accept, .. } = &mut *wakers;
+            let Wakers {
+                readable, accept, ..
+            } = &mut *wakers;
             let accept = accept.get_or_insert_with(Box::default);
             let drained_current = drained == Some(accept.generation);
             // Dispatch also marks hang-ups readable. Unlike a stream read,
@@ -363,9 +410,11 @@ impl Registration {
                     accept.next_id
                 })
             });
-            let previous = match accept.waiting.iter_mut().find(|(key, waiting)| {
-                *key == id && (id.is_some() || waiting.will_wake(waker))
-            }) {
+            let previous = match accept
+                .waiting
+                .iter_mut()
+                .find(|(key, waiting)| *key == id && (id.is_some() || waiting.will_wake(waker)))
+            {
                 Some((_, waiting)) if !waiting.will_wake(waker) => {
                     core::mem::replace(waiting, parked)
                 }
@@ -559,6 +608,10 @@ impl Reactor {
                 slots: Mutex::new(HashMap::new()),
                 next_index: AtomicU64::new(0),
                 running: AtomicBool::new(true),
+                #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+                deferred_wakes: Mutex::new(Vec::new()),
+                #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+                has_deferred_wakes: AtomicBool::new(false),
                 next_deadline: AtomicU64::new(NO_DEADLINE),
             }),
             thread: None,
@@ -649,6 +702,10 @@ impl Reactor {
             slots: Mutex::new(HashMap::new()),
             next_index: AtomicU64::new(0),
             running: AtomicBool::new(true),
+            #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+            deferred_wakes: Mutex::new(Vec::new()),
+            #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+            has_deferred_wakes: AtomicBool::new(false),
             next_deadline: AtomicU64::new(NO_DEADLINE),
         });
 
@@ -714,6 +771,8 @@ impl Reactor {
 
     fn stop(&mut self) {
         self.shared.running.store(false, Ordering::Release);
+        #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+        drop(self.shared.drain_deferred_wakes());
         // The thread may be blocked in `wait`; this is what gets it out.
         let _ = self.shared.poller.wake();
         if let Some(thread) = self.thread.take() {
@@ -752,6 +811,12 @@ fn run(shared: &Arc<Shared>) {
         }
 
         dispatch(shared, &events, &mut pending);
+    }
+
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    {
+        shared.running.store(false, Ordering::Release);
+        drop(shared.drain_deferred_wakes());
     }
 }
 
@@ -844,6 +909,11 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
         // nothing to route onto and starting one here would be wrong.
         #[cfg(feature = "std")]
         let _routed = crate::runtime::route_reactor_wake(index);
+        waker.wake();
+    }
+
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    for waker in shared.take_deferred_wakes() {
         waker.wake();
     }
 }
