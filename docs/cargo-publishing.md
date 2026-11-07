@@ -1,17 +1,10 @@
 # Cargo publishing
 
-Edit the package version in `Cargo.toml`; its `publish` allowlist selects the
-permitted registry. The `Publish crate` workflow runs manually on `master` and
-requires the exact reviewed commit plus confirmation of completed local checks.
+Set the package version in `Cargo.toml`; `publish = ["crates-io"]` is the
+explicit registry allowlist. Publishing is a manual workflow dispatch on
+`master`, which runs `cargo publish --registry crates-io` directly.
 
-Before publishing, run the affected local checks, including:
-
-- `cargo test --release`
-- `cargo check --no-default-features` (preserves the no_std release requirement)
-- `cargo publish --dry-run --registry crates-io`
-
-The workflow does not run the remote test suite. Its helper rejects a dirty
-checkout, a mismatched commit, or a manifest without explicit crates.io
-eligibility. Existing versions are skipped; registry outages fail rather than
-being interpreted as an unpublished version. Publishing to another permitted
-registry is a separate operation with its own credentials and verification.
+Before dispatch, run the applicable local checks, including
+`cargo publish --dry-run --registry crates-io`. The workflow publishes the
+root package version from the manifest; it does not run remote tests or infer
+a version from a tag.
