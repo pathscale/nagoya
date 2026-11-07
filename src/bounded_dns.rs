@@ -421,14 +421,102 @@ mod tests {
         }
 
         fn wait_for_release(&self, port: u16) {
-            self.releases
+            let receiver = self
+                .releases
                 .lock()
                 .unwrap()
                 .remove(&port)
-                .expect("each held worker has a release channel")
+                .expect("each held worker has a release channel");
+            receiver
                 .recv_timeout(Duration::from_secs(5))
                 .expect("held worker receives bounded release");
         }
+    }
+
+    #[test]
+    fn release_gate_does_not_hold_map_lock_while_waiting() {
+        struct Releases([std::sync::mpsc::Sender<()>; 2]);
+        impl Releases {
+            fn release(&self) {
+                for sender in &self.0 {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        impl Drop for Releases {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let (entered_tx, _entered_rx) = std::sync::mpsc::channel();
+        let mut release_receivers = std::collections::HashMap::new();
+        let (first_release_tx, first_release_rx) = std::sync::mpsc::channel();
+        let (second_release_tx, second_release_rx) = std::sync::mpsc::channel();
+        release_receivers.insert(1, first_release_rx);
+        release_receivers.insert(2, second_release_rx);
+        let releases = Releases([first_release_tx, second_release_tx]);
+        let gate = Arc::new(EntryReleaseGate {
+            entered: entered_tx,
+            releases: Mutex::new(release_receivers),
+        });
+
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let (first_done_tx, first_done_rx) = std::sync::mpsc::channel();
+        let first_gate = Arc::clone(&gate);
+        let first = std::thread::spawn(move || {
+            let _ = first_started_tx.send(());
+            first_gate.wait_for_release(1);
+            let _ = first_done_tx.send(());
+        });
+
+        let started = first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        let observation_deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let mut receiver_removed = false;
+        while started && std::time::Instant::now() < observation_deadline {
+            if let Ok(map) = gate.releases.try_lock() {
+                if !map.contains_key(&1) {
+                    receiver_removed = true;
+                    break;
+                }
+            }
+            std::thread::yield_now();
+        }
+        let first_still_waiting = first_done_rx.try_recv().is_err();
+
+        // Buffer the independent release before asking the second helper to consume it.
+        let _ = releases.0[1].send(());
+        let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+        let second_gate = Arc::clone(&gate);
+        let second = std::thread::spawn(move || {
+            second_gate.wait_for_release(2);
+            let _ = second_done_tx.send(());
+        });
+        let second_completed = second_done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+
+        // Always unblock both workers before joining, including on assertion failure.
+        releases.release();
+        let first_joined = first.join().is_ok();
+        let second_joined = second.join().is_ok();
+
+        assert!(started, "first gate worker started within its bound");
+        assert!(
+            receiver_removed,
+            "waiting worker released the map lock after removing its receiver"
+        );
+        assert!(
+            first_still_waiting,
+            "first worker remained unreleased during observation"
+        );
+        assert!(
+            second_completed,
+            "second worker consumed its buffered release independently"
+        );
+        assert!(first_joined && second_joined, "both gate workers joined");
     }
 
     struct WorkerReleaseGuard<'a> {
