@@ -544,11 +544,18 @@ impl TcpListener {
 
     /// Accept one connection, parking `cx`'s waker if none is waiting.
     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<Result<(TcpStream, Addr)>> {
+        self.poll_accept_with(cx, || self.inner.accept())
+    }
+
+    fn poll_accept_with<F>(&self, cx: &mut Context<'_>, mut accept: F) -> Poll<Result<(TcpStream, Addr)>>
+    where
+        F: FnMut() -> Result<(TcpSocket, Addr)>,
+    {
         loop {
             if !self.registration.take_readable_or_park(cx.waker()) {
                 return Poll::Pending;
             }
-            match self.inner.accept() {
+            match accept() {
                 Ok((socket, addr)) => {
                     // Keep draining queued connections until accept would block.
                     self.registration.mark_readable();
@@ -571,7 +578,12 @@ impl TcpListener {
                     self.registration.mark_readable();
                     continue;
                 }
-                Err(error) => return Poll::Ready(Err(error)),
+                Err(error) => {
+                    // The caller may recover (for example, by freeing a descriptor).
+                    // Preserve the queued edge so its next poll retries accept.
+                    self.registration.mark_readable();
+                    return Poll::Ready(Err(error));
+                }
             }
         }
     }
@@ -1060,5 +1072,42 @@ impl crate::io::Stream for TcpStream {
 
     async fn write_all(&mut self, buffer: &[u8]) -> Result<()> {
         Self::write_all(self, buffer).await
+    }
+}
+
+#[cfg(test)]
+mod accept_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn accept_retries_after_emfile() {
+        let reactor = crate::reactor::Reactor::local().expect("reactor");
+        let listener = TcpListener::bind(Addr::localhost(0), &reactor.handle()).expect("listener");
+        let Addr::V4(ip, port) = listener.local_addr().expect("address") else { panic!("IPv4 listener") };
+        let peer = std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from((ip, port)), std::time::Duration::from_secs(1),
+        ).expect("queued peer");
+        let mut readiness = libc::pollfd { fd: listener.inner.raw(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: readiness is one live pollfd; the bounded call neither owns
+        // nor closes its descriptor. It does not drive the Nagoya reactor.
+        #[allow(unsafe_code)]
+        let ready = unsafe { libc::poll(&mut readiness, 1, 1000) };
+        assert_eq!(ready, 1, "peer did not reach the accept queue");
+        assert_ne!(readiness.revents & libc::POLLIN, 0);
+        let mut cx = Context::from_waker(core::task::Waker::noop());
+        listener.registration.mark_readable();
+        let mut attempts = 0;
+        let first = listener.poll_accept_with(&mut cx, || {
+            attempts += 1;
+            Err(crate::reactor::error::Errno(libc::EMFILE))
+        });
+        assert!(matches!(first, Poll::Ready(Err(error)) if error.0 == libc::EMFILE));
+        assert_eq!(attempts, 1);
+        // No event driving or readiness reseeding occurs between these polls.
+        let accepted = listener.poll_accept(&mut cx);
+        assert!(matches!(accepted, Poll::Ready(Ok(_))), "{accepted:?}");
+        assert!(listener.poll_accept(&mut cx).is_pending());
+        drop(peer);
+        reactor.shutdown();
     }
 }
