@@ -7,6 +7,10 @@
 //! where the dual-stack bug gets written again: take the first address, and
 //! `localhost` fails whenever that first address is the family the listener
 //! is not on.
+//!
+//! [`Resolver`] provides a bounded asynchronous handoff to this same system
+//! resolver. Initialize its shared pool during synchronous setup; existing
+//! [`resolve`] calls remain synchronous and unchanged.
 
 #![allow(unsafe_code)]
 
@@ -213,3 +217,9 @@ mod tests {
         assert!(v4 || v6, "localhost resolved to neither family: {addrs:?}");
     }
 }
+
+#[cfg(feature = "reactor")]
+#[path = "bounded_dns.rs"]
+mod bounded_dns;
+#[cfg(feature = "reactor")]
+pub use bounded_dns::{ResolveUntilError, Resolver, ResolverStartError};
