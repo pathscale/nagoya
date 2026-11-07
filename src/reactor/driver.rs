@@ -54,6 +54,7 @@ use super::poller::{Event, Interest, Poller};
 struct Wakers {
     reader: Option<Waker>,
     writer: Option<Waker>,
+    accept: Option<Box<AcceptWaiters>>,
     /// Whether an edge has been seen since the last read drained the socket.
     ///
     /// Inside the same lock as `reader` on purpose. As a separate atomic it
@@ -77,6 +78,14 @@ struct Wakers {
     /// separate is what lets a short read consume readiness without swallowing
     /// the hang-up that arrived on the same edge.
     hangup: bool,
+}
+
+#[derive(Debug, Default)]
+struct AcceptWaiters {
+    generation: u64,
+    next_id: u64,
+    // Futures have stable IDs. Direct polls are keyed by task waker.
+    waiting: Vec<(Option<u64>, Waker)>,
 }
 
 /// One descriptor's registration state.
@@ -317,6 +326,73 @@ impl Registration {
         if ready {
             waker.wake_by_ref();
         }
+    }
+
+    /// Peek at listener readiness, or park without replacing other acceptors.
+    /// A drained generation can only clear the edge it observed.
+    pub(crate) fn poll_accept_readable(
+        &self,
+        waker: &Waker,
+        waiter: Option<&mut Option<u64>>,
+        drained: Option<u64>,
+    ) -> Option<u64> {
+        let mut cloned = None;
+        loop {
+            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            let Wakers { readable, accept, .. } = &mut *wakers;
+            let accept = accept.get_or_insert_with(Box::default);
+            let drained_current = drained == Some(accept.generation);
+            // Dispatch also marks hang-ups readable. Unlike a stream read,
+            // an accept must still be able to park after WouldBlock.
+            if *readable && !drained_current {
+                return Some(accept.generation);
+            }
+            let Some(parked) = cloned.take() else {
+                // A waker's clone can call back into this registration.
+                // Recheck readiness after reacquiring the lock.
+                drop(wakers);
+                cloned = Some(waker.clone());
+                continue;
+            };
+            if drained_current {
+                *readable = false;
+            }
+            let id = waiter.map(|id| {
+                *id.get_or_insert_with(|| {
+                    accept.next_id = accept.next_id.wrapping_add(1);
+                    accept.next_id
+                })
+            });
+            let previous = match accept.waiting.iter_mut().find(|(key, waiting)| {
+                *key == id && (id.is_some() || waiting.will_wake(waker))
+            }) {
+                Some((_, waiting)) if !waiting.will_wake(waker) => {
+                    core::mem::replace(waiting, parked)
+                }
+                Some(_) => parked,
+                None => {
+                    accept.waiting.push((id, parked));
+                    return None;
+                }
+            };
+            drop(wakers);
+            drop(previous);
+            return None;
+        }
+    }
+
+    pub(crate) fn cancel_accept_wait(&self, mut matches: impl FnMut(Option<u64>, &Waker) -> bool) {
+        let removed = {
+            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            wakers.accept.as_mut().and_then(|accept| {
+                let index = accept
+                    .waiting
+                    .iter()
+                    .position(|(id, waker)| matches(*id, waker))?;
+                Some(accept.waiting.swap_remove(index))
+            })
+        };
+        drop(removed);
     }
 
     /// Take writable readiness, or park `waker` for the next edge.
@@ -741,6 +817,10 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
             if event.readable || event.hangup {
                 wakers.readable = true;
                 pending.extend(wakers.reader.take().map(|waker| (index, waker)));
+                if let Some(accept) = &mut wakers.accept {
+                    accept.generation = accept.generation.wrapping_add(1);
+                    pending.extend(accept.waiting.drain(..).map(|(_, waker)| (index, waker)));
+                }
             }
             if event.writable {
                 wakers.writable = true;
