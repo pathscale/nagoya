@@ -370,7 +370,6 @@ fn worker(inner: Arc<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
     use std::task::{Wake, Waker};
     use std::time::Duration;
     struct Signal(std::sync::mpsc::Sender<()>);
@@ -394,6 +393,61 @@ mod tests {
         ])
     }
     fn send_assert<T: Send>(_: T) {}
+
+    fn receive_entries(
+        receiver: &std::sync::mpsc::Receiver<u16>,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u16>, std::sync::mpsc::RecvTimeoutError> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut ports = Vec::with_capacity(count);
+        for _ in 0..count {
+            ports.push(
+                receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))?,
+            );
+        }
+        Ok(ports)
+    }
+
+    struct EntryReleaseGate {
+        entered: std::sync::mpsc::Sender<u16>,
+        releases: Mutex<std::collections::HashMap<u16, std::sync::mpsc::Receiver<()>>>,
+    }
+    impl EntryReleaseGate {
+        fn publish_and_wait(&self, port: u16) {
+            let _ = self.entered.send(port);
+            self.wait_for_release(port);
+        }
+
+        fn wait_for_release(&self, port: u16) {
+            self.releases
+                .lock()
+                .unwrap()
+                .remove(&port)
+                .expect("each held worker has a release channel")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("held worker receives bounded release");
+        }
+    }
+
+    struct WorkerReleaseGuard<'a> {
+        resolver: &'a Resolver,
+        senders: Vec<std::sync::mpsc::Sender<()>>,
+    }
+    impl WorkerReleaseGuard<'_> {
+        fn release(&self) {
+            for sender in &self.senders {
+                let _ = sender.send(());
+            }
+        }
+    }
+    impl Drop for WorkerReleaseGuard<'_> {
+        fn drop(&mut self) {
+            self.release();
+            self.resolver.close();
+        }
+    }
 
     #[test]
     fn expired_and_closed_requests_never_call_the_system_resolver() {
@@ -484,34 +538,51 @@ mod tests {
 
     #[test]
     fn saturation_expiry_and_recovery_keep_worker_bound() {
-        let entered = Arc::new(Barrier::new(WORKERS + 1));
-        let release = Arc::new(Barrier::new(WORKERS + 1));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let mut release_senders = Vec::with_capacity(WORKERS);
+        let mut release_receivers = std::collections::HashMap::with_capacity(WORKERS);
+        for port in 1..=WORKERS as u16 {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            release_senders.push(sender);
+            release_receivers.insert(port, receiver);
+        }
+        let gate = Arc::new(EntryReleaseGate {
+            entered: entered_tx,
+            releases: Mutex::new(release_receivers),
+        });
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let e = entered.clone();
-        let r = release.clone();
         let a = active.clone();
         let p = peak.clone();
         let c = calls.clone();
+        let worker_gate = Arc::clone(&gate);
         let resolver = Resolver::start(Arc::new(move |_, port| {
             if c.fetch_add(1, Ordering::SeqCst) < WORKERS {
                 let now = a.fetch_add(1, Ordering::SeqCst) + 1;
                 p.fetch_max(now, Ordering::SeqCst);
-                e.wait();
-                r.wait();
+                // Teardown can close the entry receiver after sending release.
+                // A late worker must still consume that buffered release signal.
+                worker_gate.publish_and_wait(port);
                 a.fetch_sub(1, Ordering::SeqCst);
             }
             addrs(port)
         }))
         .expect("workers");
+        let release_guard = WorkerReleaseGuard {
+            resolver: &resolver,
+            senders: release_senders,
+        };
         let (mut cx, _) = context();
         let deadline = time::now_ns().saturating_add(5_000_000_000);
         let mut active_futures = Vec::new();
         for port in 1..=WORKERS as u16 {
             active_futures.push(admit(&resolver, "held", port, deadline, &mut cx));
         }
-        entered.wait();
+        let mut entered_ports = receive_entries(&entered_rx, WORKERS, Duration::from_secs(2))
+            .expect("all resolver workers enter before the fixture timeout");
+        entered_ports.sort_unstable();
+        assert_eq!(entered_ports, (1..=WORKERS as u16).collect::<Vec<_>>());
         let mut queued = Vec::new();
         for port in 10..(10 + WAITING as u16) {
             let mut f = Box::pin(ResolveUntil {
@@ -551,7 +622,7 @@ mod tests {
                 .all(|mailbox| mailbox.waker.take().is_none()),
             "cancelled requests must release task wakers while workers remain held"
         );
-        release.wait();
+        release_guard.release();
         let mut finished = vec![false; WORKERS];
         while time::now_ns() < deadline {
             for (index, f) in active_futures.iter_mut().enumerate() {
@@ -573,20 +644,133 @@ mod tests {
         while time::now_ns() < recovery_deadline {
             let mut recovery = Box::pin(resolver.resolve_until("fresh", 443, recovery_deadline));
             loop {
+                if time::now_ns() >= recovery_deadline {
+                    break;
+                }
                 match recovery.as_mut().poll(&mut cx) {
                     Poll::Ready(Ok(found)) => {
                         assert_eq!(found, addrs(443).unwrap());
                         assert_eq!(calls.load(Ordering::SeqCst), WORKERS + 1);
-                        resolver.close();
                         return;
                     }
                     Poll::Ready(Err(ResolveUntilError::Busy)) => break,
                     Poll::Ready(other) => panic!("unexpected recovery result: {other:?}"),
-                    Poll::Pending => std::thread::yield_now(),
+                    Poll::Pending => {
+                        if time::now_ns() >= recovery_deadline {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
                 }
             }
         }
-        resolver.close();
         panic!("workers did not recover within bounded polling");
+    }
+
+    #[test]
+    fn suppressed_entry_is_detected_within_the_two_second_gate() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (called_tx, called_rx) = std::sync::mpsc::channel();
+        let mut release_senders = Vec::with_capacity(WORKERS);
+        let mut release_receivers = std::collections::HashMap::with_capacity(WORKERS);
+        for port in 1..=WORKERS as u16 {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            release_senders.push(sender);
+            release_receivers.insert(port, receiver);
+        }
+        let gate = Arc::new(EntryReleaseGate {
+            entered: entered_tx,
+            releases: Mutex::new(release_receivers),
+        });
+        let worker_gate = Arc::clone(&gate);
+        let resolver = Resolver::start(Arc::new(move |_, port| {
+            let _ = called_tx.send(port);
+            if port == 2 {
+                worker_gate.wait_for_release(port);
+            } else {
+                worker_gate.publish_and_wait(port);
+            }
+            addrs(port)
+        }))
+        .expect("workers");
+        let release_guard = WorkerReleaseGuard {
+            resolver: &resolver,
+            senders: release_senders,
+        };
+        let (mut cx, _) = context();
+        let deadline = time::now_ns().saturating_add(5_000_000_000);
+        let _first = admit(&resolver, "fault-injected", 1, deadline, &mut cx);
+        let _second = admit(&resolver, "fault-injected", 2, deadline, &mut cx);
+        let mut called = vec![
+            called_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first callback"),
+            called_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second callback"),
+        ];
+        called.sort_unstable();
+        assert_eq!(called, vec![1, 2]);
+        let started = std::time::Instant::now();
+        let result = receive_entries(&entered_rx, WORKERS, Duration::from_secs(2));
+        assert!(matches!(
+            result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(started.elapsed() <= Duration::from_secs(3));
+        release_guard.release();
+        resolver.close();
+    }
+
+    #[test]
+    fn late_entry_after_teardown_still_consumes_release() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let start_rx = Mutex::new(start_rx);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut release_receivers = std::collections::HashMap::new();
+        release_receivers.insert(1, release_rx);
+        let gate = Arc::new(EntryReleaseGate {
+            entered: entered_tx,
+            releases: Mutex::new(release_receivers),
+        });
+        let worker_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let resolver = Resolver::start(Arc::new(move |_, port| {
+            if port == 1 {
+                let _ = started_tx.send(());
+                start_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("test resumes callback after teardown");
+                worker_gate.publish_and_wait(port);
+                let _ = exited_tx.send(());
+            }
+            addrs(port)
+        }))
+        .expect("workers");
+        let (mut cx, _) = context();
+        let deadline = time::now_ns().saturating_add(5_000_000_000);
+        let future = admit(&resolver, "late-entry", 1, deadline, &mut cx);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback started before dropping its admitted future");
+        drop(future);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = WorkerReleaseGuard {
+                resolver: &resolver,
+                senders: vec![release_tx],
+            };
+            panic!("simulate fixture unwind before explicit release");
+        }));
+        assert!(result.is_err());
+        drop(entered_rx);
+        start_tx.send(()).unwrap();
+        exited_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("late worker exits after receiver teardown");
     }
 }
