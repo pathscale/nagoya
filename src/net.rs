@@ -30,11 +30,13 @@
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+#[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+use crate::process::CloexecWaiter;
 use crate::reactor::driver::{Handle, Registration};
 use crate::reactor::error::Result;
 use crate::reactor::poller::Interest;
 use crate::reactor::socket::{
-    Addr, TcpListener as Listener, TcpSocket, UdpSocket as DatagramSocket,
+    Addr, StreamSetup, TcpListener as Listener, TcpSocket, UdpSocket as DatagramSocket,
 };
 
 /// Name resolution, which tokio also puts under `net`.
@@ -97,7 +99,17 @@ impl TcpStream {
     /// because the first write appears to succeed into the socket buffer and
     /// the failure surfaces somewhere unrelated.
     pub async fn connect(addr: Addr, handle: &Handle) -> Result<Self> {
-        let mut stream = Self::connect_started(addr, handle)?;
+        #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+        let socket = {
+            let waiter = CloexecWaiter::future();
+            let setup =
+                core::future::poll_fn(|cx| StreamSetup::poll(&waiter, handle, cx.waker())).await;
+            TcpSocket::connect_with_setup(addr, setup)?
+        };
+        #[cfg(not(all(feature = "process", unix, not(target_os = "linux"))))]
+        let socket = TcpSocket::connect(addr)?;
+
+        let mut stream = Self::register_connect(socket, addr, handle)?;
         Connected {
             stream: &mut stream,
         }
@@ -114,7 +126,10 @@ impl TcpStream {
     /// already succeeded or already failed by the time this returns, and
     /// [`Self::connected`] resolves immediately.
     pub fn connect_started(addr: Addr, handle: &Handle) -> Result<Self> {
-        let socket = TcpSocket::connect(addr)?;
+        Self::register_connect(TcpSocket::connect(addr)?, addr, handle)
+    }
+
+    fn register_connect(socket: TcpSocket, addr: Addr, handle: &Handle) -> Result<Self> {
         let mut stream = Self::from_socket(socket, handle)?;
         // A Unix-domain connect does not go in flight, so there is no later
         // answer to wait for and waiting would never end.
@@ -501,6 +516,8 @@ impl core::future::Future for WriteAll<'_> {
 /// A TCP listener that yields instead of blocking on `accept`.
 #[derive(Debug)]
 pub struct TcpListener {
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    cloexec_waiter: CloexecWaiter,
     inner: Listener,
     registration: Registration,
     handle: Handle,
@@ -531,6 +548,8 @@ impl TcpListener {
     pub fn from_listener(listener: Listener, handle: &Handle) -> Result<Self> {
         let registration = handle.register(listener.raw(), Interest::READABLE)?;
         Ok(Self {
+            #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+            cloexec_waiter: CloexecWaiter::listener(),
             inner: listener,
             registration,
             handle: handle.clone(),
@@ -550,7 +569,7 @@ impl TcpListener {
     /// For cancellation on drop and automatic waker replacement, use
     /// [`Self::accept`].
     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<Result<(TcpStream, Addr)>> {
-        self.poll_accept_with(cx, None, || self.inner.accept())
+        self.poll_accept_with(cx, None, |setup| self.inner.accept_with_setup(setup))
     }
 
     /// Release the direct accept wait for this task's waker.
@@ -560,26 +579,48 @@ impl TcpListener {
     pub fn cancel_accept(&self, waker: &Waker) {
         self.registration
             .cancel_accept_wait(|id, parked| id.is_none() && parked.will_wake(waker));
+        #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+        self.cloexec_waiter.cancel(waker);
     }
 
     fn poll_accept_with<F>(
         &self,
         cx: &mut Context<'_>,
-        mut waiter: Option<&mut Option<u64>>,
+        waiter: Option<&mut AcceptWaiter>,
         mut accept: F,
     ) -> Poll<Result<(TcpStream, Addr)>>
     where
-        F: FnMut() -> Result<(TcpSocket, Addr)>,
+        F: FnMut(StreamSetup) -> Result<(TcpSocket, Addr)>,
     {
+        let mut readiness = None;
+        #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+        let mut gate = &self.cloexec_waiter;
+        if let Some(waiter) = waiter {
+            readiness = Some(&mut waiter.readiness);
+            #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+            {
+                gate = &waiter.cloexec;
+            }
+        }
+
         let waker = cx.waker();
-        let Some(generation) = self
-            .registration
-            .poll_accept_readable(waker, waiter.as_deref_mut(), None)
+        let Some(generation) =
+            self.registration
+                .poll_accept_readable(waker, readiness.as_deref_mut(), None)
         else {
+            #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+            gate.cancel(waker);
             return Poll::Pending;
         };
         loop {
-            match accept() {
+            // A busy gate has not drained the listener. Leave this generation
+            // readable so any parked accept can retry after spawn releases it.
+            #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+            let setup = core::task::ready!(StreamSetup::poll(gate, &self.handle, waker));
+            #[cfg(not(all(feature = "process", unix, not(target_os = "linux"))))]
+            let setup = StreamSetup::lock();
+
+            match accept(setup) {
                 Ok((socket, addr)) => {
                     return Poll::Ready(
                         TcpStream::from_socket(socket, &self.handle).map(|stream| (stream, addr)),
@@ -588,7 +629,7 @@ impl TcpListener {
                 Err(error) if error.would_block() => {
                     if self
                         .registration
-                        .poll_accept_readable(waker, waiter, Some(generation))
+                        .poll_accept_readable(waker, readiness, Some(generation))
                         .is_some()
                     {
                         waker.wake_by_ref();
@@ -612,16 +653,27 @@ impl TcpListener {
     pub fn accept(&self) -> Accept<'_> {
         Accept {
             listener: self,
-            waiter: None,
+            waiter: AcceptWaiter {
+                readiness: None,
+                #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+                cloexec: CloexecWaiter::future(),
+            },
         }
     }
+}
+
+#[derive(Debug)]
+struct AcceptWaiter {
+    readiness: Option<u64>,
+    #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
+    cloexec: CloexecWaiter,
 }
 
 /// The future returned by [`TcpListener::accept`].
 #[derive(Debug)]
 pub struct Accept<'a> {
     listener: &'a TcpListener,
-    waiter: Option<u64>,
+    waiter: AcceptWaiter,
 }
 
 impl core::future::Future for Accept<'_> {
@@ -630,17 +682,20 @@ impl core::future::Future for Accept<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let listener = this.listener;
-        listener.poll_accept_with(cx, Some(&mut this.waiter), || listener.inner.accept())
+        listener.poll_accept_with(cx, Some(&mut this.waiter), |setup| {
+            listener.inner.accept_with_setup(setup)
+        })
     }
 }
 
 impl Drop for Accept<'_> {
     fn drop(&mut self) {
-        if let Some(waiter) = self.waiter {
+        if let Some(waiter) = self.waiter.readiness {
             self.listener
                 .registration
                 .cancel_accept_wait(|id, _| id == Some(waiter));
         }
+        // The gate waiter removes its registration when its field drops.
     }
 }
 
@@ -1187,9 +1242,11 @@ mod accept_recovery_tests {
         assert!(Pin::new(&mut first).poll(&mut first_cx).is_pending());
         assert!(listener.poll_accept(&mut second_cx).is_pending());
         let mut cancelled = listener.accept();
-        assert!(Pin::new(&mut cancelled)
-            .poll(&mut Context::from_waker(&cancelled_waker))
-            .is_pending());
+        assert!(
+            Pin::new(&mut cancelled)
+                .poll(&mut Context::from_waker(&cancelled_waker))
+                .is_pending()
+        );
         drop(cancelled);
 
         let first_peer = connect_peer(&listener);
@@ -1224,12 +1281,18 @@ mod accept_recovery_tests {
         drop(cancelled);
 
         let mut migrated = listener.accept();
-        assert!(Pin::new(&mut migrated)
-            .poll(&mut Context::from_waker(&old))
-            .is_pending());
+        assert!(
+            Pin::new(&mut migrated)
+                .poll(&mut Context::from_waker(&old))
+                .is_pending()
+        );
         let mut new_cx = Context::from_waker(&new);
         assert!(Pin::new(&mut migrated).poll(&mut new_cx).is_pending());
-        assert!(listener.poll_accept(&mut Context::from_waker(&direct)).is_pending());
+        assert!(
+            listener
+                .poll_accept(&mut Context::from_waker(&direct))
+                .is_pending()
+        );
         listener.cancel_accept(&direct);
 
         let first = connect_peer(&listener);
@@ -1260,14 +1323,17 @@ mod accept_recovery_tests {
         let mut other_cx = Context::from_waker(&other_waker);
         let mut other_port = None;
         let mut cx = Context::from_waker(Waker::noop());
-        let first = listener.poll_accept_with(&mut cx, None, || {
-            let first = listener.inner.accept()?;
+        let first = listener.poll_accept_with(&mut cx, None, |setup| {
+            let first = listener.inner.accept_with_setup(setup)?;
             wait_for_peer(&listener);
             other_port = Some(accepted_port(listener.poll_accept(&mut other_cx)));
             Ok(first)
         });
         assert_peers(
-            [accepted_port(first), other_port.expect("overlapping accept")],
+            [
+                accepted_port(first),
+                other_port.expect("overlapping accept"),
+            ],
             [first_peer, second_peer],
         );
     }
@@ -1279,12 +1345,17 @@ mod accept_recovery_tests {
         let (wakes, waker) = counted_waker();
         let mut cx = Context::from_waker(&waker);
         let mut peer = None;
-        let result = listener.poll_accept_with(&mut cx, None, || {
-            let error = listener.inner.accept().expect_err("listener is empty");
+        let result = listener.poll_accept_with(&mut cx, None, |setup| {
+            let error = listener
+                .inner
+                .accept_with_setup(setup)
+                .expect_err("listener is empty");
             assert!(error.would_block());
             peer = Some(connect_peer(&listener));
             wait_for_peer(&listener);
-            reactor.poll_once_timeout(Some(0)).expect("new listener event");
+            reactor
+                .poll_once_timeout(Some(0))
+                .expect("new listener event");
             Err(error)
         });
 
@@ -1304,7 +1375,7 @@ mod accept_recovery_tests {
         let mut cx = Context::from_waker(core::task::Waker::noop());
         listener.registration.mark_readable();
         let mut attempts = 0;
-        let first = listener.poll_accept_with(&mut cx, None, || {
+        let first = listener.poll_accept_with(&mut cx, None, |_setup| {
             attempts += 1;
             Err(crate::reactor::error::Errno(libc::EMFILE))
         });

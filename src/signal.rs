@@ -535,9 +535,7 @@ mod platform {
             return Ok(existing);
         }
         #[cfg(all(feature = "process", unix))]
-        let _cloexec_guard = crate::process::FD_CLOEXEC_LOCK
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cloexec_guard = crate::process::CloexecReadGuard::lock();
 
         let mut ends = [0; 2];
         check(unsafe { libc::pipe(ends.as_mut_ptr()) })?;

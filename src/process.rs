@@ -80,17 +80,213 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
+#[cfg(not(target_os = "linux"))]
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Condvar, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use crate::reactor::driver::{Handle, Registration};
 use crate::reactor::poller::Interest;
 
 pub use std::process::{ExitStatus, Output, Stdio};
 
-// Non-Linux socket and signal-pipe creation holds a read guard until every
-// fresh descriptor is close-on-exec or closed. Command::spawn holds the write
-// guard only while std creates the child. Direct std spawns do not participate.
+// Managed spawns exclude descriptor setup until the descriptors are
+// close-on-exec or closed. A waiting spawn also keeps new readers out.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static FD_CLOEXEC_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+struct CloexecGate {
+    readers: usize,
+    writers: usize,
+    spawning: bool,
+    waiting: BTreeMap<u64, Vec<(Handle, Waker)>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+static CLOEXEC_GATE: Mutex<CloexecGate> = Mutex::new(CloexecGate {
+    readers: 0,
+    writers: 0,
+    spawning: false,
+    waiting: BTreeMap::new(),
+});
+
+#[cfg(not(target_os = "linux"))]
+static CLOEXEC_CHANGED: Condvar = Condvar::new();
+
+#[cfg(not(target_os = "linux"))]
+fn cloexec_gate() -> MutexGuard<'static, CloexecGate> {
+    CLOEXEC_GATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_cloexec(gate: MutexGuard<'static, CloexecGate>) -> MutexGuard<'static, CloexecGate> {
+    CLOEXEC_CHANGED
+        .wait(gate)
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct CloexecReadGuard {
+    // Drop runs before this field is dropped. Releasing the reader first
+    // lets a waker's destructor re-enter spawn without waiting on itself.
+    _unused_waker: Option<Waker>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl CloexecReadGuard {
+    pub(crate) fn lock() -> Self {
+        let mut gate = cloexec_gate();
+        while gate.writers != 0 {
+            gate = wait_cloexec(gate);
+        }
+        gate.readers += 1;
+        Self {
+            _unused_waker: None,
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for CloexecReadGuard {
+    fn drop(&mut self) {
+        let mut gate = cloexec_gate();
+        gate.readers -= 1;
+        if gate.readers == 0 && gate.writers != 0 {
+            CLOEXEC_CHANGED.notify_all();
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct SpawnCloexecGuard;
+
+#[cfg(not(target_os = "linux"))]
+impl SpawnCloexecGuard {
+    fn lock() -> Self {
+        let mut gate = cloexec_gate();
+        gate.writers += 1;
+        while gate.spawning || gate.readers != 0 {
+            gate = wait_cloexec(gate);
+        }
+        gate.spawning = true;
+        Self
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for SpawnCloexecGuard {
+    fn drop(&mut self) {
+        let waiting = {
+            let mut gate = cloexec_gate();
+            gate.spawning = false;
+            gate.writers -= 1;
+            CLOEXEC_CHANGED.notify_all();
+            if gate.writers != 0 {
+                return;
+            }
+            core::mem::take(&mut gate.waiting)
+        };
+        for (handle, waker) in waiting.into_values().flatten() {
+            handle.defer_wake(waker);
+        }
+    }
+}
+
+/// One gate wait per future, or one per direct poll waker on a listener.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) struct CloexecWaiter {
+    id: u64,
+    direct: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl CloexecWaiter {
+    fn new(direct: bool) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            direct,
+        }
+    }
+
+    pub(crate) fn future() -> Self {
+        Self::new(false)
+    }
+
+    pub(crate) fn listener() -> Self {
+        Self::new(true)
+    }
+
+    fn position(&self, parked: &[(Handle, Waker)], waker: &Waker) -> Option<usize> {
+        parked
+            .iter()
+            .position(|(_, existing)| !self.direct || existing.will_wake(waker))
+    }
+
+    pub(crate) fn cancel(&self, waker: &Waker) {
+        let removed = {
+            let mut gate = cloexec_gate();
+            let Some(parked) = gate.waiting.get_mut(&self.id) else {
+                return;
+            };
+            let Some(index) = self.position(parked, waker) else {
+                return;
+            };
+            let removed = parked.swap_remove(index);
+            if parked.is_empty() {
+                gate.waiting.remove(&self.id);
+            }
+            removed
+        };
+        drop(removed);
+    }
+
+    pub(crate) fn poll(&self, handle: &Handle, waker: &Waker) -> Poll<CloexecReadGuard> {
+        let mut cloned = None;
+        loop {
+            let mut gate = cloexec_gate();
+            if gate.writers == 0 {
+                gate.readers += 1;
+                return Poll::Ready(CloexecReadGuard {
+                    _unused_waker: cloned,
+                });
+            }
+            let Some(cloned) = cloned.take() else {
+                // Cloning can re-enter spawn. Recheck the gate afterward so a
+                // writer that finished in the meantime cannot miss this wait.
+                drop(gate);
+                cloned = Some(waker.clone());
+                continue;
+            };
+
+            let parked = gate.waiting.entry(self.id).or_default();
+            let previous = match self.position(parked, waker) {
+                Some(index) if !parked[index].1.will_wake(waker) => {
+                    core::mem::replace(&mut parked[index].1, cloned)
+                }
+                Some(_) => cloned,
+                None => {
+                    parked.push((handle.clone(), cloned));
+                    return Poll::Pending;
+                }
+            };
+            drop(gate);
+            drop(previous);
+            return Poll::Pending;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for CloexecWaiter {
+    fn drop(&mut self) {
+        let removed = cloexec_gate().waiting.remove(&self.id);
+        drop(removed);
+    }
+}
 
 /// A process to spawn, and how.
 ///
@@ -252,9 +448,7 @@ impl Command {
     pub fn spawn(&mut self, handle: &Handle) -> io::Result<Child> {
         let mut child = {
             #[cfg(not(target_os = "linux"))]
-            let _cloexec_guard = FD_CLOEXEC_LOCK
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
+            let _cloexec_guard = SpawnCloexecGuard::lock();
             self.std.spawn()?
         };
         match adopt(&mut child, handle) {
