@@ -703,6 +703,8 @@ fn unreachable_state() -> io::Error {
     io::Error::other("child has neither an exit status nor a process")
 }
 
+const MAX_PIPE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Read `pipe` to the end into `into`, forgetting the pipe once it is there.
 fn drain<R>(cx: &mut Context<'_>, pipe: &mut Option<R>, into: &mut Vec<u8>) -> Poll<io::Result<()>>
 where
@@ -718,7 +720,16 @@ where
                 *pipe = None;
                 return Poll::Ready(Ok(()));
             }
-            Poll::Ready(Ok(read)) => into.extend_from_slice(&chunk[..read]),
+            Poll::Ready(Ok(read)) => {
+                if into.len().saturating_add(read) > MAX_PIPE_OUTPUT_BYTES {
+                    *pipe = None;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::FileTooLarge,
+                        "child process output exceeded 64 MiB capture limit",
+                    )));
+                }
+                into.extend_from_slice(&chunk[..read]);
+            }
             Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
@@ -758,7 +769,17 @@ impl Process {
                 // only thing left is for it to become waitable. That is
                 // bounded by the rest of its own exit, not by anything it
                 // could still choose to do, so the blocking wait is short.
-                Readiness::Exiting => return Poll::Ready(self.child.wait()),
+                Readiness::Exiting => {
+                    match self.child.try_wait() {
+                        Ok(Some(status)) => return Poll::Ready(Ok(status)),
+                        Ok(None) => {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
+                }
             }
         }
     }
