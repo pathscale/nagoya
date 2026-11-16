@@ -1,0 +1,4 @@
+# HARD RULE: rustc builds everything here against an EMPTY sysroot. rustc supplies no core, no alloc and no std.
+# core and alloc come from ekostd bootstrap only. Do not remove, override or work around this.
+[build]
+rustflags = ["--sysroot", "/Users/revenge/code/nagoya/sysroot-empty"]

@@ -1,0 +1,2 @@
+This directory is the sysroot rustc is given for every unit built in this repository. It is empty on purpose.
+rustc supplies no core, alloc or std. They come from ekostd bootstrap only.
