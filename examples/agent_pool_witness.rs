@@ -100,14 +100,12 @@ fn exclusive(runtime: &Runtime, input: Arc<str>) {
             agent.turns.get()
         })
         .unwrap_or_else(|_| fail("OwnerFirstAdmission"));
-    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        owner.dispatch(runtime.executor(), 1_000_000, |agent| agent.turn())
-    }));
+    let second = owner.dispatch(runtime.executor(), 1_000_000, |agent| agent.turn());
     writer.write_all(&[7]).unwrap();
     require(nagoya::block_on(first) == Some(1), "OwnerTurnOutput");
     match second {
-        Ok(Err(rejected)) if rejected.reason == DispatchDenied::Busy => {}
-        Ok(Ok(handle)) => {
+        Err(rejected) if rejected.reason == DispatchDenied::Busy => {}
+        Ok(handle) => {
             let _ = nagoya::block_on(handle);
             fail("ExclusiveOwnerDuplicateAdmission");
         }

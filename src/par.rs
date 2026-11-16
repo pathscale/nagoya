@@ -27,8 +27,6 @@
 //! that it will not be, and neither is worth the unsafe until something asks
 //! for it. Move what you need into the closure, or put it in an `Arc`.
 
-#[cfg(feature = "std")]
-use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::future::Future;
 use core::ops::Range;
@@ -99,9 +97,8 @@ const PIECES_PER_WORKER: usize = 8;
 /// happens until it is polled: the first poll is what hands the work over, so
 /// a loop that is created and dropped costs one allocation and no work.
 ///
-/// With `std` and unwinding enabled, a body panic cancels remaining work and
-/// is rethrown by the awaiting future after all published pieces retire.
-/// Without `std`, panic handling is the host's responsibility.
+/// A body panic ends the process: every unit is compiled with `panic = "abort"`, so the loop
+/// has no panic path to cancel or rethrow.
 ///
 /// ```
 /// # use core::sync::atomic::{AtomicUsize, Ordering};
@@ -135,8 +132,6 @@ where
                 outstanding: AtomicUsize::new(1),
                 finished: AtomicBool::new(false),
                 waiter: Mutex::new(None),
-                #[cfg(feature = "std")]
-                panic: Mutex::new(None),
             }) as Arc<dyn Split>,
             pool,
             range,
@@ -155,10 +150,6 @@ trait Split: Send + Sync {
     fn retire(&self);
     fn is_finished(&self) -> bool;
     fn park(&self, waker: &Waker);
-    #[cfg(feature = "std")]
-    fn record_panic(&self, payload: Box<dyn core::any::Any + Send>);
-    #[cfg(feature = "std")]
-    fn resume_panic(&self);
 }
 
 struct Shared<F> {
@@ -169,8 +160,6 @@ struct Shared<F> {
     outstanding: AtomicUsize,
     finished: AtomicBool,
     waiter: Mutex<Option<Waker>>,
-    #[cfg(feature = "std")]
-    panic: Mutex<Option<Box<dyn core::any::Any + Send>>>,
 }
 
 impl<F> Split for Shared<F>
@@ -232,25 +221,6 @@ where
         let old = self.waiter.lock().replace(waker.clone());
         drop(old);
     }
-
-    #[cfg(feature = "std")]
-    fn record_panic(&self, payload: Box<dyn core::any::Any + Send>) {
-        let mut pending = self.panic.lock();
-        if pending.is_none() {
-            *pending = Some(payload);
-        } else {
-            drop(pending);
-            drop(payload);
-        }
-    }
-
-    #[cfg(feature = "std")]
-    fn resume_panic(&self) {
-        let payload = self.panic.lock().take();
-        if let Some(payload) = payload {
-            std::panic::resume_unwind(payload);
-        }
-    }
 }
 
 // One counted piece, including while it is queued. Dropping an unrun closure
@@ -270,19 +240,6 @@ impl Piece {
             self.cancel.cancel();
             return;
         };
-        #[cfg(feature = "std")]
-        {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.shared
-                    .clone()
-                    .work(&pool, self.range.clone(), self.leaf, &self.cancel);
-            }));
-            if let Err(payload) = result {
-                self.cancel.cancel();
-                self.shared.record_panic(payload);
-            }
-        }
-        #[cfg(not(feature = "std"))]
         self.shared
             .clone()
             .work(&pool, self.range.clone(), self.leaf, &self.cancel);
@@ -396,16 +353,12 @@ impl Future for ParFor {
         };
 
         if shared.is_finished() {
-            #[cfg(feature = "std")]
-            shared.resume_panic();
             return Poll::Ready(());
         }
         // Registered before the flag is read again, so a piece that finishes
         // between the two still finds a waker to call.
         shared.park(context.waker());
         if shared.is_finished() {
-            #[cfg(feature = "std")]
-            shared.resume_panic();
             return Poll::Ready(());
         }
         Poll::Pending

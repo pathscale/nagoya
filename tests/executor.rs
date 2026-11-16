@@ -336,47 +336,6 @@ fn dropping_a_pool_retires_queued_parallel_pieces() {
     assert!(loop_.as_mut().poll(&mut context).is_ready());
 }
 
-#[cfg(feature = "std")]
-#[test]
-fn a_panicking_task_does_not_take_the_only_worker_with_it() {
-    let running = Running::new(1);
-    let failed = running.executor.spawn(async { panic!("task failure") });
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        block_on(nagoya::timeout(std::time::Duration::from_secs(2), failed))
-    }));
-    assert!(
-        outcome.is_err(),
-        "the task panic was not propagated to its awaiter"
-    );
-    let next = running.executor.spawn(async { 42 });
-    assert_eq!(
-        block_on(nagoya::timeout(std::time::Duration::from_secs(2), next)),
-        Ok(Some(42)),
-    );
-}
-
-#[cfg(feature = "std")]
-#[test]
-fn a_panicking_parallel_body_retires_its_piece_and_preserves_the_worker() {
-    let running = Running::new(1);
-    let loop_ = nagoya::par_for(running.executor.pool().clone(), 0..32, |_| {
-        panic!("body failure")
-    })
-    .leaf(1);
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        block_on(nagoya::timeout(std::time::Duration::from_secs(2), loop_))
-    }));
-    assert!(
-        outcome.is_err(),
-        "the parallel-loop panic was not propagated"
-    );
-    let next = running.executor.spawn(async { 42 });
-    assert_eq!(
-        block_on(nagoya::timeout(std::time::Duration::from_secs(2), next)),
-        Ok(Some(42)),
-    );
-}
-
 #[test]
 fn host_block_on_retains_a_wake_delivered_during_poll() {
     let host = Arc::new(st3::fanout::AtomicHost::new(1, || 0));
