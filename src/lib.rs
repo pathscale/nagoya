@@ -64,7 +64,7 @@ pub mod credits;
 pub mod io;
 /// Tutorial and callsite reference, with compiled examples.
 #[cfg(feature = "std")]
-#[doc = include_str!(concat!(env!("OUT_DIR"), "/guide-examples.md"))]
+#[doc = include_str!("../docs/guide-examples.md")]
 pub mod guide {}
 // Sockets, unix signals and name resolution sit at the crate root beside
 // `sync`, `io` and `runtime`, which is where tokio puts the same three and so
