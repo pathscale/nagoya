@@ -37,7 +37,7 @@ std::thread_local! {
 /// measured 38 percent faster at eight connections and two and a half times
 /// slower at ten thousand, which is the wrong trade. Routing by descriptor
 /// spreads them and keeps each one settled.
-#[cfg(feature = "reactor")]
+#[cfg(all(feature = "std", any(feature = "reactor", feature = "eko")))]
 pub(crate) fn route_wakes(worker: usize) -> RouteGuard {
     let previous = ROUTE.with(|route| route.replace(Some(worker)));
     RouteGuard {
@@ -46,13 +46,21 @@ pub(crate) fn route_wakes(worker: usize) -> RouteGuard {
     }
 }
 
-#[cfg(feature = "reactor")]
+#[cfg(all(not(feature = "std"), feature = "eko"))]
+pub(crate) fn route_wakes(_worker: usize) -> RouteGuard {
+    RouteGuard {
+        _thread_bound: core::marker::PhantomData,
+    }
+}
+
+#[cfg(any(feature = "reactor", feature = "eko"))]
 pub(crate) struct RouteGuard {
+    #[cfg(feature = "std")]
     previous: Option<usize>,
     _thread_bound: core::marker::PhantomData<alloc::rc::Rc<()>>,
 }
 
-#[cfg(feature = "reactor")]
+#[cfg(all(feature = "std", any(feature = "reactor", feature = "eko")))]
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         ROUTE.with(|route| route.set(self.previous.take()));
@@ -340,5 +348,5 @@ mod tests {
 /// [`TaskSet`](crate::reactor::TaskSet) driven by
 /// [`block_on_with`](crate::reactor::block_on_with).
 pub use crate::yield_now::{YieldNow, yield_now};
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "eko"))]
 pub use crate::{JoinHandle, spawn};

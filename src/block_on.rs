@@ -17,6 +17,8 @@ struct Signal {
     woken: AtomicBool,
     #[cfg(feature = "std")]
     thread: std::thread::Thread,
+    #[cfg(all(feature = "eko", not(feature = "std")))]
+    host: crate::runtime::EkoHost,
 }
 
 impl Signal {
@@ -25,6 +27,8 @@ impl Signal {
             woken: AtomicBool::new(false),
             #[cfg(feature = "std")]
             thread: std::thread::current(),
+            #[cfg(all(feature = "eko", not(feature = "std")))]
+            host: crate::runtime::EkoHost::new(1),
         }
     }
 
@@ -32,6 +36,8 @@ impl Signal {
         self.woken.store(true, Ordering::Release);
         #[cfg(feature = "std")]
         self.thread.unpark();
+        #[cfg(all(feature = "eko", not(feature = "std")))]
+        self.host.unpark_slot(0);
     }
 
     /// Wait for a wake, and report whether one had already arrived.
@@ -44,10 +50,15 @@ impl Signal {
             std::thread::park();
         }
 
+        #[cfg(all(feature = "eko", not(feature = "std")))]
+        while !self.woken.swap(false, Ordering::AcqRel) {
+            self.host.park_slot(0);
+        }
+
         // Without a `std` there is no thread to park. Spinning is the honest
         // fallback: a caller on a target with an idle instruction should reach
         // for the pool and `Host::park` instead of this.
-        #[cfg(not(feature = "std"))]
+        #[cfg(not(any(feature = "std", feature = "eko")))]
         while !self.woken.swap(false, Ordering::AcqRel) {
             core::hint::spin_loop();
         }

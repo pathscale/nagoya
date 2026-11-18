@@ -58,7 +58,7 @@ pub mod error;
 pub mod local;
 pub mod poller;
 pub mod socket;
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod testing;
 
 // `net`, `signal` and `resolve` are `crate::net`, `crate::signal` and

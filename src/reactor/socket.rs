@@ -37,6 +37,177 @@ use core::mem;
 
 use super::error::{Errno, Result};
 
+#[cfg(all(feature = "eko", not(feature = "std")))]
+mod libc {
+    pub use core::ffi::{c_int, c_void};
+    pub use eko::libc_lite::{
+        AF_INET, AF_INET6, AF_UNIX, EAFNOSUPPORT, EINPROGRESS, EINVAL, EMSGSIZE, ENAMETOOLONG,
+        IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPV6_V6ONLY, MSG_NOSIGNAL, SO_ERROR, SO_RCVBUF,
+        SO_REUSEADDR, SO_REUSEPORT, SO_SNDBUF, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK,
+        SOCK_STREAM, SOL_SOCKET, TCP_NODELAY, accept4, bind, close, connect, getpeername,
+        getsockname, getsockopt, listen, recv, sa_family_t, setsockopt, sockaddr, sockaddr_in,
+        sockaddr_in6, sockaddr_storage, sockaddr_un, socket, socklen_t,
+    };
+
+    pub const FIONREAD: u64 = 0x541B;
+    pub const MSG_TRUNC: c_int = 0x20;
+    pub const SO_NOSIGPIPE: c_int = 0x1022;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct iovec {
+        pub iov_base: *mut c_void,
+        pub iov_len: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct msghdr {
+        pub msg_name: *mut c_void,
+        pub msg_namelen: socklen_t,
+        pub msg_iov: *mut iovec,
+        pub msg_iovlen: usize,
+        pub msg_control: *mut c_void,
+        pub msg_controllen: usize,
+        pub msg_flags: c_int,
+    }
+
+    #[inline]
+    pub unsafe fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
+        unsafe { eko::libc_lite::fcntl3(fd, cmd, arg) }
+    }
+
+    #[inline]
+    pub unsafe fn ioctl(fd: c_int, request: u64, arg: *mut c_int) -> c_int {
+        match eko::file::ioctl_ptr(fd, request, arg as usize) {
+            Ok(v) => v as c_int,
+            Err(_) => -1,
+        }
+    }
+
+    #[inline]
+    pub unsafe fn sendto(
+        socket: c_int,
+        buf: *const c_void,
+        len: usize,
+        flags: c_int,
+        addr: *const sockaddr,
+        addrlen: socklen_t,
+    ) -> isize {
+        if addr.is_null() || addrlen == 0 {
+            return unsafe { eko::libc_lite::send(socket, buf, len, flags) };
+        }
+        let family = unsafe { (*addr).sa_family } as c_int;
+        if family == AF_UNIX {
+            let mut sun = sockaddr_un {
+                sun_family: AF_UNIX as u16,
+                sun_path: [0; 108],
+            };
+            let copy_len = (addrlen as usize).min(core::mem::size_of::<sockaddr_un>());
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    addr.cast::<u8>(),
+                    core::ptr::from_mut(&mut sun).cast::<u8>(),
+                    copy_len,
+                );
+            }
+            let path_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    sun.sun_path.as_ptr().cast::<u8>(),
+                    copy_len.saturating_sub(2),
+                )
+            };
+            let end = path_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(path_bytes.len());
+            if unsafe { eko::libc_lite::connect(socket, addr, addrlen) } < 0 && end == 0 {
+                return -1;
+            }
+            return unsafe { eko::libc_lite::send(socket, buf, len, flags) };
+        }
+        unsafe { eko::libc_lite::sendto(socket, buf, len, flags, addr, addrlen) }
+    }
+
+    #[inline]
+    pub unsafe fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> isize {
+        if msg.is_null() {
+            return -1;
+        }
+        let hdr = unsafe { &*msg };
+        if hdr.msg_iov.is_null() || hdr.msg_iovlen == 0 {
+            return unsafe { eko::libc_lite::send(fd, core::ptr::null(), 0, flags) };
+        }
+        if hdr.msg_iovlen == 1 {
+            let iov = unsafe { &*hdr.msg_iov };
+            return unsafe { eko::libc_lite::send(fd, iov.iov_base, iov.iov_len, flags) };
+        }
+        let iov0 = unsafe { &*hdr.msg_iov };
+        let iov1 = unsafe { &*hdr.msg_iov.add(1) };
+        if iov0.iov_len == 0 {
+            return unsafe { eko::libc_lite::send(fd, iov1.iov_base, iov1.iov_len, flags) };
+        }
+        if iov1.iov_len == 0 {
+            return unsafe { eko::libc_lite::send(fd, iov0.iov_base, iov0.iov_len, flags) };
+        }
+        let total = iov0.iov_len.saturating_add(iov1.iov_len);
+        if total <= 2048 {
+            let mut stack_buf = [0u8; 2048];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    iov0.iov_base.cast::<u8>(),
+                    stack_buf.as_mut_ptr(),
+                    iov0.iov_len,
+                );
+                core::ptr::copy_nonoverlapping(
+                    iov1.iov_base.cast::<u8>(),
+                    stack_buf.as_mut_ptr().add(iov0.iov_len),
+                    iov1.iov_len,
+                );
+                eko::libc_lite::send(fd, stack_buf.as_ptr().cast(), total, flags)
+            }
+        } else {
+            let mut vec_buf = alloc::vec::Vec::with_capacity(total);
+            unsafe {
+                vec_buf.extend_from_slice(core::slice::from_raw_parts(
+                    iov0.iov_base.cast::<u8>(),
+                    iov0.iov_len,
+                ));
+                vec_buf.extend_from_slice(core::slice::from_raw_parts(
+                    iov1.iov_base.cast::<u8>(),
+                    iov1.iov_len,
+                ));
+                eko::libc_lite::send(fd, vec_buf.as_ptr().cast(), total, flags)
+            }
+        }
+    }
+
+    #[inline]
+    pub unsafe fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> isize {
+        if msg.is_null() {
+            return -1;
+        }
+        let hdr = unsafe { &mut *msg };
+        hdr.msg_flags = 0;
+        let (ptr, len) = if hdr.msg_iov.is_null() || hdr.msg_iovlen == 0 {
+            (core::ptr::null_mut(), 0)
+        } else {
+            let iov = unsafe { &*hdr.msg_iov };
+            (iov.iov_base, iov.iov_len)
+        };
+        unsafe {
+            eko::libc_lite::recvfrom(
+                fd,
+                ptr,
+                len,
+                flags,
+                hdr.msg_name.cast::<sockaddr>(),
+                core::ptr::addr_of_mut!(hdr.msg_namelen),
+            )
+        }
+    }
+}
+
 /// An owned file descriptor.
 ///
 /// Closes on drop. The whole reason to have this rather than a bare `i32` is
@@ -166,7 +337,7 @@ impl UnixPath {
     ///
     /// `EINVAL` for an empty name, `ENAMETOOLONG` for one that does not fit
     /// after the leading NUL that marks it as abstract.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", feature = "eko"))]
     pub fn abstract_name(name: &[u8]) -> Result<Self> {
         if name.is_empty() {
             return Err(Errno(libc::EINVAL));
@@ -447,7 +618,7 @@ impl Addr {
                     // Nowhere else has abstract sockets, so there the same
                     // bytes are a kernel reporting slack after an unnamed peer,
                     // and reading them as a name would invent one.
-                    if cfg!(target_os = "linux") {
+                    if cfg!(any(target_os = "linux", feature = "eko")) {
                         reported
                     } else {
                         0
@@ -515,7 +686,7 @@ impl StreamSetup {
     fn finish(self) {}
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
 fn set_stream_flags(fd: Fd) -> Result<Fd> {
     // SAFETY: `fd` owns the fresh descriptor, including on error.
     unsafe {
@@ -550,7 +721,7 @@ fn set_stream_flags(fd: Fd) -> Result<Fd> {
 fn stream_socket(addr: &Addr, setup: StreamSetup) -> Result<Fd> {
     // Linux sets both flags in `socket`. Elsewhere, `setup` protects the
     // descriptor until both flag-setting calls have succeeded.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
     let raw = check(unsafe {
         libc::socket(
             addr.family(),
@@ -558,12 +729,12 @@ fn stream_socket(addr: &Addr, setup: StreamSetup) -> Result<Fd> {
             0,
         )
     })?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
     let raw = check(unsafe { libc::socket(addr.family(), libc::SOCK_STREAM, 0) })?;
 
     // SAFETY: `raw` is a fresh descriptor owned exclusively here.
     let fd = unsafe { Fd::from_raw(raw) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
     let fd = set_stream_flags(fd)?;
     setup.finish();
     Ok(fd)
@@ -577,7 +748,7 @@ fn datagram_socket(addr: &Addr) -> Result<Fd> {
         libc::IPPROTO_UDP
     };
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
     let fd = {
         let raw = check(unsafe {
             libc::socket(
@@ -590,7 +761,7 @@ fn datagram_socket(addr: &Addr) -> Result<Fd> {
         unsafe { Fd::from_raw(raw) }
     };
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
     let fd = {
         #[cfg(all(feature = "process", unix))]
         let _cloexec_guard = crate::process::CloexecReadGuard::lock();
@@ -899,9 +1070,9 @@ impl TcpSocket {
         // MSG_NOSIGNAL is how Linux asks for EPIPE instead of SIGPIPE. The
         // BSDs have no such flag and use SO_NOSIGPIPE, set when the socket was
         // created.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
         let flags = libc::MSG_NOSIGNAL;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
         let flags = 0;
 
         // SAFETY: `message` points at `iovecs`, a live local, and describes
@@ -1137,9 +1308,9 @@ impl UdpSocket {
         } else {
             (core::ptr::null(), 0)
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
         let flags = libc::MSG_NOSIGNAL;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
         let flags = 0;
 
         #[cfg(feature = "syscall-counters")]
@@ -1264,7 +1435,7 @@ impl TcpListener {
         // Linux sets both flags atomically with `accept4`. Elsewhere, keep
         // coordinated process spawning out until the accepted descriptor is
         // close-on-exec or closed on failure.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
         let raw = check(unsafe {
             libc::accept4(
                 self.raw(),
@@ -1274,7 +1445,7 @@ impl TcpListener {
             )
         })?;
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
         let raw = check(unsafe {
             libc::accept(
                 self.raw(),
@@ -1285,7 +1456,7 @@ impl TcpListener {
 
         // SAFETY: `raw` is the descriptor just accepted and uniquely owned.
         let fd = unsafe { Fd::from_raw(raw) };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
         let fd = set_stream_flags(fd)?;
         setup.finish();
 

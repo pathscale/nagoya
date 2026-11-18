@@ -41,13 +41,67 @@
 //! a stale slot and is discarded rather than waking an unrelated task that has
 //! since taken the same index.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::Waker;
+use alloc::boxed::Box;
+#[cfg(all(feature = "eko", not(feature = "std")))]
+use alloc::collections::BTreeMap as SlotMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::task::Waker;
+#[cfg(feature = "std")]
+use std::collections::HashMap as SlotMap;
+#[cfg(feature = "std")]
+use std::sync::Mutex as StdMutex;
 
 use super::error::Result;
 use super::poller::{Event, Interest, Poller};
+
+#[cfg(feature = "std")]
+struct Lock<T>(StdMutex<T>);
+
+#[cfg(feature = "std")]
+impl<T> Lock<T> {
+    fn new(val: T) -> Self {
+        Self(StdMutex::new(val))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0.lock().expect("reactor mutex poisoned")
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T: core::fmt::Debug> core::fmt::Debug for Lock<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+#[cfg(all(feature = "eko", not(feature = "std")))]
+struct Lock<T>(eko::thread::Mutex<T>);
+
+#[cfg(all(feature = "eko", not(feature = "std")))]
+impl<T> Lock<T> {
+    fn new(val: T) -> Self {
+        Self(eko::thread::Mutex::new(val))
+    }
+
+    fn lock(&self) -> eko::thread::Guard<'_, T> {
+        self.0.lock()
+    }
+}
+
+#[cfg(all(feature = "eko", not(feature = "std")))]
+impl<T> core::fmt::Debug for Lock<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+#[cfg(feature = "std")]
+type ThreadJoinHandle = std::thread::JoinHandle<()>;
+#[cfg(all(feature = "eko", not(feature = "std")))]
+type ThreadJoinHandle = eko::thread::JoinHandle<()>;
 
 /// The wakers waiting on one descriptor.
 #[derive(Debug, Default)]
@@ -96,7 +150,7 @@ struct AcceptWaiters {
 struct Slot {
     /// Bumped on every reuse of this index, so a stale event can be spotted.
     generation: u64,
-    wakers: Mutex<Wakers>,
+    wakers: Lock<Wakers>,
 }
 
 /// Shared reactor state. The thread and every handle hold one of these.
@@ -107,11 +161,11 @@ struct Shared {
     ///
     /// Taken on registration and deregistration only. The per-message path
     /// goes through the `Arc<Slot>` a `Registration` already holds.
-    slots: Mutex<HashMap<u64, Arc<Slot>>>,
+    slots: Lock<SlotMap<u64, Arc<Slot>>>,
     next_index: AtomicU64,
     running: AtomicBool,
     #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
-    deferred_wakes: Mutex<Vec<Waker>>,
+    deferred_wakes: Lock<Vec<Waker>>,
     #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
     has_deferred_wakes: AtomicBool,
     /// When the earliest known timer is due, in nagoya's clock, or
@@ -132,7 +186,7 @@ impl Shared {
     }
 
     fn drain_deferred_wakes(&self) -> Vec<Waker> {
-        let mut queued = self.deferred_wakes.lock().expect("reactor wakes poisoned");
+        let mut queued = self.deferred_wakes.lock();
         self.has_deferred_wakes.store(false, Ordering::Release);
         core::mem::take(&mut *queued)
     }
@@ -198,24 +252,20 @@ impl Handle {
             // symmetry: a fresh socket has room by definition, so waiting for
             // an edge to be told so would be waiting for one that has already
             // gone by. That is a hang on the first write, not a slow one.
-            wakers: Mutex::new(Wakers {
+            wakers: Lock::new(Wakers {
                 readable: true,
                 writable: true,
                 ..Wakers::default()
             }),
         });
         {
-            let mut slots = self.shared.slots.lock().expect("reactor slots poisoned");
+            let mut slots = self.shared.slots.lock();
             slots.insert(index, Arc::clone(&slot));
         }
 
         let token = make_token(index, generation);
         if let Err(error) = self.shared.poller.add(fd, token, interest) {
-            self.shared
-                .slots
-                .lock()
-                .expect("reactor slots poisoned")
-                .remove(&index);
+            self.shared.slots.lock().remove(&index);
             return Err(error);
         }
 
@@ -239,11 +289,7 @@ impl Handle {
     #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
     pub(crate) fn defer_wake(&self, waker: Waker) {
         let trigger = {
-            let mut queued = self
-                .shared
-                .deferred_wakes
-                .lock()
-                .expect("reactor wakes poisoned");
+            let mut queued = self.shared.deferred_wakes.lock();
             if !self.shared.running.load(Ordering::Acquire) {
                 return;
             }
@@ -321,7 +367,7 @@ impl Registration {
     /// speculative call skippable: measured at 1.24 wasted reads per message
     /// across eight connections, 38 percent of all reads.
     pub fn take_readable_or_park(&self, waker: &Waker) -> bool {
-        let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+        let mut wakers = self.slot.wakers.lock();
         // A hung-up descriptor is permanently worth reading: `recv` answers 0
         // rather than `EWOULDBLOCK`, so this neither spins nor costs a wasted
         // syscall. It is checked because the hang-up may have arrived on the
@@ -340,7 +386,7 @@ impl Registration {
     /// Note that this descriptor may still have data, for a caller that filled
     /// its buffer and did not reach `EWOULDBLOCK`.
     pub fn mark_readable(&self) {
-        let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+        let mut wakers = self.slot.wakers.lock();
         wakers.readable = true;
     }
 
@@ -351,7 +397,7 @@ impl Registration {
     /// means waiting for an edge that has already passed.
     pub fn poll_readable(&self, waker: &Waker) {
         let ready = {
-            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            let mut wakers = self.slot.wakers.lock();
             // An edge can arrive after EWOULDBLOCK and before this lock.
             // In that case schedule another poll instead of parking after
             // the poller has already dispatched the only available edge.
@@ -383,7 +429,7 @@ impl Registration {
     ) -> Option<u64> {
         let mut cloned = None;
         loop {
-            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            let mut wakers = self.slot.wakers.lock();
             let Wakers {
                 readable, accept, ..
             } = &mut *wakers;
@@ -432,7 +478,7 @@ impl Registration {
 
     pub(crate) fn cancel_accept_wait(&self, mut matches: impl FnMut(Option<u64>, &Waker) -> bool) {
         let removed = {
-            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            let mut wakers = self.slot.wakers.lock();
             wakers.accept.as_mut().and_then(|accept| {
                 let index = accept
                     .waiting
@@ -449,7 +495,7 @@ impl Registration {
     /// The write side's twin of [`Self::take_readable_or_park`], and the thing
     /// that lets a write skip the syscall whose only job was to be rejected.
     pub fn take_writable_or_park(&self, waker: &Waker) -> bool {
-        let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+        let mut wakers = self.slot.wakers.lock();
         if wakers.writable {
             wakers.writable = false;
             return true;
@@ -464,14 +510,14 @@ impl Registration {
     /// Note that this descriptor may still have room, for a caller whose write
     /// was accepted whole and so never proved the buffer full.
     pub fn mark_writable(&self) {
-        let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+        let mut wakers = self.slot.wakers.lock();
         wakers.writable = true;
     }
 
     /// Park `waker` until the descriptor is writable. See [`Self::poll_readable`].
     pub fn poll_writable(&self, waker: &Waker) {
         let ready = {
-            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            let mut wakers = self.slot.wakers.lock();
             if wakers.writable {
                 true
             } else {
@@ -490,7 +536,7 @@ impl Registration {
     /// Release a cancelled UDP reader without consuming cached readiness.
     pub(crate) fn cancel_read_wait(&self) {
         let waiting = {
-            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            let mut wakers = self.slot.wakers.lock();
             wakers.reader.take()
         };
         drop(waiting);
@@ -499,7 +545,7 @@ impl Registration {
     /// Release a cancelled UDP writer without consuming cached readiness.
     pub(crate) fn cancel_write_wait(&self) {
         let waiting = {
-            let mut wakers = self.slot.wakers.lock().expect("reactor slot poisoned");
+            let mut wakers = self.slot.wakers.lock();
             wakers.writer.take()
         };
         drop(waiting);
@@ -517,11 +563,7 @@ impl Drop for Registration {
         // The reverse would leave a window where an event arrives for a slot
         // that is already gone, which is harmless but pointless work.
         let _ = self.shared.poller.remove(self.fd);
-        self.shared
-            .slots
-            .lock()
-            .expect("reactor slots poisoned")
-            .remove(&self.index);
+        self.shared.slots.lock().remove(&self.index);
     }
 }
 
@@ -564,7 +606,7 @@ impl Sharded {
 /// [`Reactor`] is dropped.
 pub struct Reactor {
     shared: Arc<Shared>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<ThreadJoinHandle>,
     /// Scratch for [`Self::poll_once`], so the local arrangement allocates per
     /// reactor rather than per wakeup.
     ///
@@ -579,7 +621,7 @@ pub struct Reactor {
     /// to take the buffers out and to put them back, never across the wakers,
     /// because a waker can re-enter `poll_once` on this thread and a
     /// non reentrant lock held across that deadlocks against itself.
-    scratch: Mutex<Scratch>,
+    scratch: Lock<Scratch>,
 }
 
 impl Reactor {
@@ -605,18 +647,18 @@ impl Reactor {
         Ok(Self {
             shared: Arc::new(Shared {
                 poller: Poller::new()?,
-                slots: Mutex::new(HashMap::new()),
+                slots: Lock::new(SlotMap::new()),
                 next_index: AtomicU64::new(0),
                 running: AtomicBool::new(true),
                 #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
-                deferred_wakes: Mutex::new(Vec::new()),
+                deferred_wakes: Lock::new(Vec::new()),
                 #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
                 has_deferred_wakes: AtomicBool::new(false),
                 next_deadline: AtomicU64::new(NO_DEADLINE),
             }),
             thread: None,
             // Same capacity the threaded loop reserves.
-            scratch: Mutex::new((Vec::with_capacity(64), Vec::with_capacity(64))),
+            scratch: Lock::new((Vec::with_capacity(64), Vec::with_capacity(64))),
         })
     }
 
@@ -666,7 +708,7 @@ impl Reactor {
         // rather than deadlocking, and the put back below restores the
         // capacity for the common case where nothing reentered.
         let (mut events, mut pending) = {
-            let mut scratch = self.scratch.lock().expect("reactor scratch poisoned");
+            let mut scratch = self.scratch.lock();
             (
                 core::mem::take(&mut scratch.0),
                 core::mem::take(&mut scratch.1),
@@ -683,7 +725,7 @@ impl Reactor {
         // may have left its own here, and dropping the bigger pair would undo
         // the point of keeping any.
         {
-            let mut scratch = self.scratch.lock().expect("reactor scratch poisoned");
+            let mut scratch = self.scratch.lock();
             if events.capacity() >= scratch.0.capacity() {
                 scratch.0 = events;
             }
@@ -699,17 +741,18 @@ impl Reactor {
     pub fn start() -> Result<Self> {
         let shared = Arc::new(Shared {
             poller: Poller::new()?,
-            slots: Mutex::new(HashMap::new()),
+            slots: Lock::new(SlotMap::new()),
             next_index: AtomicU64::new(0),
             running: AtomicBool::new(true),
             #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
-            deferred_wakes: Mutex::new(Vec::new()),
+            deferred_wakes: Lock::new(Vec::new()),
             #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
             has_deferred_wakes: AtomicBool::new(false),
             next_deadline: AtomicU64::new(NO_DEADLINE),
         });
 
         let worker = Arc::clone(&shared);
+        #[cfg(feature = "std")]
         let thread = std::thread::Builder::new()
             .name("nago-wss-reactor".into())
             // The one place this crate still needs `std`: it owns a thread.
@@ -719,12 +762,18 @@ impl Reactor {
             .spawn(move || run(&worker))
             .map_err(|error| super::error::Errno(error.raw_os_error().unwrap_or(libc::EAGAIN)))?;
 
+        #[cfg(all(feature = "eko", not(feature = "std")))]
+        let thread = eko::thread::Builder::new()
+            .name("nago-wss-reactor")
+            .spawn(move || run(&worker))
+            .map_err(|error| super::error::Errno(error.0))?;
+
         Ok(Self {
             shared,
             thread: Some(thread),
             // The threaded reactor keeps its scratch on the worker's stack and
             // never calls `poll_once`, so this stays empty.
-            scratch: Mutex::new((Vec::new(), Vec::new())),
+            scratch: Lock::new((Vec::new(), Vec::new())),
         })
     }
 
@@ -863,7 +912,7 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
     // waker may run arbitrary code, including code that registers another
     // descriptor, and this lock is not reentrant.
     {
-        let slots = shared.slots.lock().expect("reactor slots poisoned");
+        let slots = shared.slots.lock();
         for event in events {
             let (index, generation) = split_token(event.token);
             let Some(slot) = slots.get(&index) else {
@@ -873,7 +922,7 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
             if slot.generation != generation {
                 continue;
             }
-            let mut wakers = slot.wakers.lock().expect("reactor slot poisoned");
+            let mut wakers = slot.wakers.lock();
             // Latched before readiness is, so a reader waking on this edge
             // cannot observe the data without also observing the hang-up.
             if event.hangup {
@@ -907,7 +956,7 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
         // a hash.
         // `None` when no shared pool is running, in which case there is
         // nothing to route onto and starting one here would be wrong.
-        #[cfg(feature = "std")]
+        #[cfg(any(feature = "std", feature = "eko"))]
         let _routed = crate::runtime::route_reactor_wake(index);
         waker.wake();
     }

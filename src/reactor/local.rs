@@ -63,10 +63,18 @@ struct LocalWaker {
 /// instead: it is unique per thread, stable for the thread's life, and never
 /// zero, which is what the sentinel needs.
 fn thread_key() -> u64 {
-    thread_local! {
-        static KEY: u8 = const { 0 };
+    #[cfg(feature = "std")]
+    {
+        std::thread_local! {
+            static KEY: u8 = const { 0 };
+        }
+        KEY.with(|key| core::ptr::from_ref(key) as u64)
     }
-    KEY.with(|key| core::ptr::from_ref(key) as u64)
+    #[cfg(all(feature = "eko", not(feature = "std")))]
+    {
+        let id = eko::thread::current_id().as_u64();
+        if id == 0 { 1 } else { id }
+    }
 }
 
 impl Wake for LocalWaker {

@@ -213,7 +213,16 @@ pub fn now_ns() -> u64 {
     // Nothing to install: without `std` the consumer's `set_clock` is the only
     // way a clock ever arrives, so a zero here is the missing call, not a
     // default waiting to be taken.
-    #[cfg(not(feature = "std"))]
+    #[cfg(all(not(feature = "std"), feature = "eko"))]
+    let raw = {
+        let mut raw = CLOCK.load(Ordering::Acquire);
+        if raw == 0 {
+            set_clock(eko::clock::now_ns);
+            raw = CLOCK.load(Ordering::Acquire);
+        }
+        raw
+    };
+    #[cfg(all(not(feature = "std"), not(feature = "eko")))]
     let raw = CLOCK.load(Ordering::Acquire);
     assert!(raw != 0, "nagoya::time::set_clock has not been called");
     // SAFETY: the only value ever stored is a `fn() -> u64` cast to `usize` by
@@ -372,7 +381,7 @@ impl Future for Sleep {
                 let earliest = arm(this.deadline, &slot);
                 this.slot = Some(slot);
                 if earliest {
-                    #[cfg(feature = "std")]
+                    #[cfg(any(feature = "std", feature = "eko"))]
                     driver::nudge(this.deadline);
                 }
                 Poll::Pending
@@ -459,18 +468,18 @@ impl<F: Future> Future for Timeout<F> {
 }
 
 /// The timer backend was selected by an earlier timer or reactor binding.
-#[cfg(feature = "reactor")]
+#[cfg(any(feature = "reactor", feature = "eko"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimerDriverStarted;
 
-#[cfg(feature = "reactor")]
+#[cfg(any(feature = "reactor", feature = "eko"))]
 impl core::fmt::Display for TimerDriverStarted {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("nagoya timer driver already selected")
     }
 }
 
-#[cfg(feature = "reactor")]
+#[cfg(all(feature = "std", any(feature = "reactor", feature = "eko")))]
 impl std::error::Error for TimerDriverStarted {}
 
 /// Route all future timer arms to this retained reactor, without a timer thread.
@@ -479,9 +488,89 @@ impl std::error::Error for TimerDriverStarted {}
 /// armed timers and must have exactly one servicing loop. Runtime::readiness
 /// supplies that process-lifetime ownership. Clock reads alone do not select
 /// the backend. This function never replaces an already-selected driver.
-#[cfg(feature = "reactor")]
+#[cfg(any(feature = "reactor", feature = "eko"))]
 pub fn set_timer_reactor(handle: crate::reactor::Handle) -> Result<(), TimerDriverStarted> {
     driver::bind_reactor(handle)
+}
+
+#[cfg(all(not(feature = "std"), feature = "eko"))]
+mod driver {
+    use super::{now_ns, poll, set_clock};
+    use eko::thread::{Condvar, Mutex, OnceLock};
+
+    enum Host {
+        Dedicated,
+        Reactor(crate::reactor::Handle),
+    }
+
+    static HOST: OnceLock<Host> = OnceLock::new();
+    static NUDGE: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
+    static THREAD: OnceLock<()> = OnceLock::new();
+
+    pub(super) fn bind_reactor(
+        handle: crate::reactor::Handle,
+    ) -> Result<(), super::TimerDriverStarted> {
+        HOST.set(Host::Reactor(handle))
+            .map_err(|_| super::TimerDriverStarted)
+    }
+
+    fn nudge_pair() -> &'static (Mutex<bool>, Condvar) {
+        NUDGE.get_or_init(|| (Mutex::new(false), Condvar::new()))
+    }
+
+    pub(super) fn nudge(deadline: u64) {
+        match HOST.get_or_init(|| Host::Dedicated) {
+            Host::Dedicated => {
+                let _ = deadline;
+                start();
+                let (lock, signal) = nudge_pair();
+                *lock.lock() = true;
+                signal.notify_one();
+            }
+            Host::Reactor(handle) => {
+                handle
+                    .timer_armed(deadline)
+                    .expect("nagoya timer reactor wake");
+            }
+        }
+    }
+
+    fn start() {
+        THREAD.get_or_init(|| {
+            set_clock(eko::clock::now_ns);
+            let _ = eko::thread::Builder::new()
+                .name("nagoya-timer")
+                .spawn(run)
+                .expect("a timer thread");
+        });
+    }
+
+    fn run() {
+        let (lock, signal) = nudge_pair();
+        loop {
+            let next = poll(now_ns());
+            let mut nudged = lock.lock();
+            if *nudged {
+                *nudged = false;
+                continue;
+            }
+            match next {
+                Some(deadline) => {
+                    let now = now_ns();
+                    if deadline <= now {
+                        continue;
+                    }
+                    let wait_ms = ((deadline - now) / 1_000_000).clamp(1, 50);
+                    drop(nudged);
+                    eko::sleep_ms(wait_ms);
+                }
+                None => {
+                    nudged = signal.wait(nudged);
+                    *nudged = false;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "std")]

@@ -72,7 +72,7 @@ pub mod guide {}
 // owned by it, and burying them a level down under `reactor` described the
 // implementation rather than the API. `reactor` re-exports all three, because
 // that is the path already-published consumers compiled against.
-#[cfg(feature = "reactor")]
+#[cfg(any(feature = "reactor", feature = "eko"))]
 pub mod net;
 pub mod owner;
 mod par;
@@ -80,19 +80,19 @@ mod par;
 // their own that starts on first use, rather than one the caller passes, so a
 // child's futures finish under any executor. Unix only, because the reactor is:
 // see the module comment for how an exit is noticed without polling for it.
-#[cfg(all(feature = "process", unix))]
+#[cfg(any(all(feature = "process", unix), feature = "eko"))]
 pub mod process;
 // Needs an operating system, so it needs `std`. See its module comment for why
 // a crate whose point is running without one carries a driver that cannot.
-#[cfg(feature = "reactor")]
+#[cfg(any(feature = "reactor", feature = "eko"))]
 pub mod reactor;
-#[cfg(feature = "reactor")]
+#[cfg(any(feature = "reactor", feature = "eko"))]
 pub mod resolve;
-#[cfg(feature = "reactor")]
+#[cfg(any(feature = "reactor", feature = "eko"))]
 pub mod signal;
 // Owns threads, so it needs `std`. See its module comment for why a crate built
 // not to own threads carries one that does.
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "eko"))]
 pub mod runtime;
 // The four async primitives a consumer was otherwise taking from `tokio::sync`.
 // They are runtime-agnostic there too, which is exactly why the dependency was
@@ -109,7 +109,7 @@ mod yield_now;
 /// name a caller coming from tokio already has in their fingers. A caller that
 /// wants its own threads, its own count, or a pool it can stop builds a
 /// [`runtime::Runtime`] and spawns on that instead.
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "eko"))]
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: core::future::Future + Send + 'static,

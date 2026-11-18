@@ -30,6 +30,9 @@
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+#[cfg(all(feature = "eko", not(feature = "std")))]
+use eko::libc_lite as libc;
+
 #[cfg(all(feature = "process", unix, not(target_os = "linux")))]
 use crate::process::CloexecWaiter;
 use crate::reactor::driver::{Handle, Registration};
@@ -1166,7 +1169,7 @@ impl crate::io::Stream for TcpStream {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod accept_recovery_tests {
     use super::*;
     use core::future::Future;

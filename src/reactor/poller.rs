@@ -28,6 +28,8 @@
 // relying on.
 #![allow(unsafe_code)]
 
+use alloc::vec::Vec;
+
 use super::error::Result;
 
 /// What a caller is waiting for.
@@ -135,6 +137,7 @@ impl Poller {
 }
 
 /// The last OS error when `value` signals failure.
+#[cfg(feature = "std")]
 fn check(value: i32) -> Result<i32> {
     if value < 0 {
         Err(crate::reactor::error::last())
@@ -143,15 +146,122 @@ fn check(value: i32) -> Result<i32> {
     }
 }
 
+// --- eko ------------------------------------------------------------------
+
+#[cfg(all(feature = "eko", not(feature = "std")))]
+mod sys {
+    use alloc::vec::Vec;
+
+    use super::super::error::{Errno, Result};
+    use super::{Event, Interest};
+    use eko::epoll::{
+        EPOLLERR, EPOLLET, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP, Epoll, EpollEvent, WakerFd,
+    };
+
+    const WAKE_TOKEN: u64 = u64::MAX;
+
+    #[derive(Debug)]
+    pub(super) struct Poller {
+        epoll: Epoll,
+        wake: WakerFd,
+    }
+
+    impl Poller {
+        pub(super) fn new() -> Result<Self> {
+            let epoll = Epoll::new().map_err(|e| Errno(e.0))?;
+            let wake = WakerFd::new().map_err(|e| Errno(e.0))?;
+            epoll
+                .add(wake.as_raw_fd(), WAKE_TOKEN, EPOLLIN)
+                .map_err(|e| Errno(e.0))?;
+            Ok(Self { epoll, wake })
+        }
+
+        fn mask(interest: Interest) -> u32 {
+            let mut mask = EPOLLET;
+            if interest.readable {
+                mask |= EPOLLIN | EPOLLRDHUP;
+            }
+            if interest.writable {
+                mask |= EPOLLOUT;
+            }
+            mask
+        }
+
+        pub(super) fn add(&self, fd: i32, token: u64, interest: Interest) -> Result<()> {
+            self.epoll
+                .add(fd, token, Self::mask(interest))
+                .map_err(|e| Errno(e.0))
+        }
+
+        pub(super) fn modify(&self, fd: i32, token: u64, interest: Interest) -> Result<()> {
+            self.epoll
+                .modify(fd, token, Self::mask(interest))
+                .map_err(|e| Errno(e.0))
+        }
+
+        pub(super) fn remove(&self, fd: i32) -> Result<()> {
+            self.epoll.delete(fd).map_err(|e| Errno(e.0))
+        }
+
+        pub(super) fn wait(&self, out: &mut Vec<Event>, timeout_ns: Option<u64>) -> Result<()> {
+            const CAPACITY: usize = 256;
+            let mut events = [EpollEvent::default(); CAPACITY];
+
+            let timeout_ms = match timeout_ns {
+                None => -1,
+                Some(0) => 0,
+                Some(ns) => {
+                    let ms = ns.div_ceil(1_000_000);
+                    ms.min(i32::MAX as u64) as i32
+                }
+            };
+
+            let count = match self.epoll.wait(&mut events, timeout_ms) {
+                Ok(n) => n,
+                Err(error) => {
+                    let errno = Errno(error.0);
+                    if errno.interrupted() {
+                        return Ok(());
+                    }
+                    return Err(errno);
+                }
+            };
+
+            for event in &events[..count] {
+                if event.token == WAKE_TOKEN {
+                    let _ = self.wake.drain();
+                    continue;
+                }
+                let flags = event.events;
+                let failed = (flags & (EPOLLHUP | EPOLLERR)) != 0;
+                out.push(Event {
+                    token: event.token,
+                    readable: failed || (flags & EPOLLIN) != 0,
+                    writable: failed || (flags & EPOLLOUT) != 0,
+                    hangup: failed || (flags & EPOLLRDHUP) != 0,
+                });
+            }
+            Ok(())
+        }
+
+        pub(super) fn wake(&self) -> Result<()> {
+            self.wake.wake().map_err(|e| Errno(e.0))
+        }
+    }
+}
+
 // --- kqueue ---------------------------------------------------------------
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
+#[cfg(all(
+    feature = "std",
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
 ))]
 mod sys {
     use super::super::error::Result;
@@ -339,7 +449,7 @@ mod sys {
 
 // --- epoll ----------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 mod sys {
     use super::super::error::Result;
     use super::{Event, Interest, check};
@@ -523,7 +633,7 @@ mod sys {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::reactor::testing::{socket_pair, write_byte};
