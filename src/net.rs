@@ -30,7 +30,6 @@
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use eko::libc_lite as libc;
 
 #[cfg(all(feature = "process", unix, not(target_os = "linux")))]

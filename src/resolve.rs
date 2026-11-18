@@ -15,10 +15,6 @@
 #![allow(unsafe_code)]
 
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::ffi::CString;
-
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use eko::libc_lite as libc;
 
 use crate::net::TcpStream;
@@ -29,10 +25,9 @@ use crate::reactor::socket::Addr;
 /// Why [`resolve`] produced no addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveError {
-    /// `host` contained an interior nul, so it cannot be passed to `getaddrinfo`.
+    /// `host` contained an interior nul, so it cannot be passed to a resolver.
     Nul,
-    /// `getaddrinfo` failed. The number is the platform's `EAI_*` code, which
-    /// is not an errno and must not be compared with one.
+    /// Resolver failed with code.
     Failed(i32),
     /// The call succeeded and returned nothing this crate can connect to.
     Empty,
@@ -42,107 +37,15 @@ impl core::fmt::Display for ResolveError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Nul => formatter.write_str("host has a nul byte"),
-            Self::Failed(code) => write!(formatter, "getaddrinfo failed ({code})"),
+            Self::Failed(code) => write!(formatter, "resolver failed ({code})"),
             Self::Empty => formatter.write_str("resolver returned no address"),
         }
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for ResolveError {}
+impl core::error::Error for ResolveError {}
 
 /// Resolve `host` to every address the platform offers, at `port`.
-///
-/// All of them, in the resolver's order, rather than just the first. A host
-/// with both an A and an AAAA record is ordinary, and on a machine where only
-/// one family actually works, taking the first answer fails outright. The
-/// caller tries them in turn ([`connect_any`]).
-///
-/// Uses `getaddrinfo`, so it honours the hosts file, search domains and
-/// whatever else the machine is configured with. The port is the caller's:
-/// the service string is not passed, and each returned address carries `port`
-/// rather than whatever the resolver would have filled in.
-///
-/// **This blocks the calling thread, and there is nowhere here to put it.**
-/// `getaddrinfo` is synchronous and can sit in DNS for as long as the
-/// resolver's timeout, which is seconds, not milliseconds. This crate has no
-/// `spawn_blocking`. The arrangement the reactor documentation recommends is
-/// the one where the polling thread *is* the reactor thread, so a call to
-/// this function from inside a task stalls every other descriptor on that
-/// reactor for the whole lookup. It is a plain `fn` and not an `async fn`
-/// precisely so that this is visible at the call site rather than hidden
-/// behind an await.
-///
-/// Resolve before entering the reactor where the name is known up front,
-/// which is the common case for a client that connects to a configured host.
-/// A caller that must resolve names while a reactor is running needs a thread
-/// of its own for it; this function will not provide one.
-#[cfg(feature = "std")]
-pub fn resolve(host: &str, port: u16) -> core::result::Result<Vec<Addr>, ResolveError> {
-    let name = CString::new(host).map_err(|_| ResolveError::Nul)?;
-
-    // SAFETY: an all-zero `addrinfo` is a valid set of hints.
-    let mut hints: libc::addrinfo = unsafe { core::mem::zeroed() };
-    hints.ai_family = libc::AF_UNSPEC;
-    hints.ai_socktype = libc::SOCK_STREAM;
-
-    let mut result: *mut libc::addrinfo = core::ptr::null_mut();
-    // SAFETY: `name` is a live C string, `hints` a live local, and `result`
-    // receives a list that is freed below when the call succeeds.
-    let status = unsafe {
-        libc::getaddrinfo(
-            name.as_ptr(),
-            core::ptr::null(),
-            core::ptr::addr_of!(hints),
-            core::ptr::addr_of_mut!(result),
-        )
-    };
-    if status != 0 {
-        // A failed call leaves `result` undefined. Do not free it.
-        return Err(ResolveError::Failed(status));
-    }
-    if result.is_null() {
-        return Err(ResolveError::Empty);
-    }
-
-    let mut found = Vec::new();
-    let mut cursor = result;
-    while !cursor.is_null() {
-        // SAFETY: the list is well formed until the null terminator, and this
-        // walk finishes before `freeaddrinfo` below.
-        let entry = unsafe { &*cursor };
-        match entry.ai_family {
-            libc::AF_INET => {
-                // SAFETY: the family says this is a `sockaddr_in`.
-                let addr = unsafe { &*(entry.ai_addr as *const libc::sockaddr_in) };
-                found.push(Addr::V4(addr.sin_addr.s_addr.to_ne_bytes(), port));
-            }
-            libc::AF_INET6 => {
-                // SAFETY: the family says this is a `sockaddr_in6`.
-                let addr = unsafe { &*(entry.ai_addr as *const libc::sockaddr_in6) };
-                let octets = addr.sin6_addr.s6_addr;
-                found.push(if addr.sin6_scope_id == 0 {
-                    Addr::V6(octets, port)
-                } else {
-                    Addr::V6Scoped(octets, port, addr.sin6_scope_id)
-                });
-            }
-            // A family this crate does not speak, skipped rather than guessed at.
-            _ => {}
-        }
-        cursor = entry.ai_next;
-    }
-    // SAFETY: `result` came from a successful `getaddrinfo` and is freed once.
-    unsafe { libc::freeaddrinfo(result) };
-
-    if found.is_empty() {
-        return Err(ResolveError::Empty);
-    }
-    Ok(found)
-}
-
-/// Resolve `host` to every address the platform offers, at `port`.
-#[cfg(all(feature = "eko", not(feature = "std")))]
 pub fn resolve(host: &str, port: u16) -> core::result::Result<alloc::vec::Vec<Addr>, ResolveError> {
     if host.as_bytes().contains(&0) {
         return Err(ResolveError::Nul);
@@ -227,7 +130,6 @@ pub fn resolve(host: &str, port: u16) -> core::result::Result<alloc::vec::Vec<Ad
     Ok(found)
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 fn ip_to_addr(ip: core::net::IpAddr, port: u16) -> Addr {
     match ip {
         core::net::IpAddr::V4(v4) => Addr::V4(v4.octets(), port),
@@ -235,7 +137,6 @@ fn ip_to_addr(ip: core::net::IpAddr, port: u16) -> Addr {
     }
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 fn load_nameservers() -> Vec<core::net::SocketAddr> {
     let mut servers = Vec::new();
     if let Ok(contents) = eko::file::read_to_string("/etc/resolv.conf") {
@@ -276,7 +177,6 @@ fn load_nameservers() -> Vec<core::net::SocketAddr> {
     servers
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 fn next_dns_txid(salt: u16) -> u16 {
     static SEQ: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0x4123);
     let seq = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -285,7 +185,6 @@ fn next_dns_txid(salt: u16) -> u16 {
     if id == 0 { 1 } else { id }
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 fn build_dns_query(host: &str, qtype: u16, txid: u16) -> Option<Vec<u8>> {
     let mut pkt = Vec::with_capacity(64);
     pkt.extend_from_slice(&txid.to_be_bytes());
@@ -312,7 +211,6 @@ fn build_dns_query(host: &str, qtype: u16, txid: u16) -> Option<Vec<u8>> {
     Some(pkt)
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 fn send_dns_udp(ns: &core::net::SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
     let bind_addr = match ns {
         core::net::SocketAddr::V4(_) => core::net::SocketAddr::V4(
@@ -339,7 +237,6 @@ fn send_dns_udp(ns: &core::net::SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
     Some(buf[..n].to_vec())
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 fn read_dns_name(pkt: &[u8], mut offset: usize) -> Option<(alloc::string::String, usize)> {
     let mut name = alloc::string::String::new();
     let mut end_offset = None;
@@ -392,7 +289,6 @@ fn read_dns_name(pkt: &[u8], mut offset: usize) -> Option<(alloc::string::String
     Some((name, end_offset?))
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 fn parse_dns_response(
     pkt: &[u8],
     expected_txid: u16,
@@ -594,8 +490,38 @@ mod tests {
     }
 }
 
-#[cfg(any(feature = "reactor", feature = "eko"))]
+#[cfg(feature = "reactor")]
 #[path = "bounded_dns.rs"]
 mod bounded_dns;
-#[cfg(any(feature = "reactor", feature = "eko"))]
+#[cfg(feature = "reactor")]
 pub use bounded_dns::{ResolveUntilError, Resolver, ResolverStartError};
+
+#[cfg(test)]
+mod udp_dns_tests {
+    use super::*;
+
+    #[test]
+    fn udp_dns_query_and_response_parser_roundtrip() {
+        let server = eko::net::UdpSocket::bind(eko::net::SocketAddr::V4(eko::net::SocketAddrV4::new(eko::net::Ipv4Addr::LOCALHOST, 0))).expect("bind mock dns");
+        let server_addr = server.local_addr().expect("local_addr");
+        let handle = eko::thread::spawn(move || {
+            let mut req = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut req).expect("recv_from");
+            assert!(n >= 12);
+            // Build minimal A response for example.test -> 93.184.216.34
+            let mut resp = alloc::vec::Vec::new();
+            resp.extend_from_slice(&req[0..2]); // txid
+            resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+            resp.extend_from_slice(&req[12..n]); // echo question
+            resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 93, 184, 216, 34]);
+            server.send_to(&resp, peer).expect("send_to");
+        });
+        let txid = 0x4242;
+        let pkt = build_dns_query("example.test", 1, txid).expect("build_dns_query");
+        let raw = send_dns_udp(&server_addr, &pkt).expect("send_dns_udp");
+        let mut out = alloc::vec::Vec::new();
+        parse_dns_response(&raw, txid, "example.test", 1, 443, &mut out);
+        let _ = handle.expect("spawn").join();
+        assert_eq!(out, alloc::vec![Addr::V4([93, 184, 216, 34], 443)]);
+    }
+}

@@ -25,20 +25,14 @@
 use alloc::sync::Arc;
 use core::future::Future;
 
-#[cfg(feature = "std")]
-use core::num::NonZeroUsize;
-#[cfg(feature = "std")]
-use st3::fanout::StdHost;
 use st3::fanout::{Pool, Tuning};
 
 use crate::{Executor, JoinHandle};
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 pub(crate) struct EkoHost {
     slots: alloc::vec::Vec<(eko::thread::Mutex<u8>, eko::thread::Condvar)>,
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 impl core::fmt::Debug for EkoHost {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EkoHost")
@@ -47,7 +41,6 @@ impl core::fmt::Debug for EkoHost {
     }
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 impl EkoHost {
     pub(crate) fn new(workers: usize) -> Self {
         let mut slots = alloc::vec::Vec::with_capacity(workers);
@@ -89,7 +82,6 @@ impl EkoHost {
     }
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 impl st3::fanout::Host for EkoHost {
     fn park(&self, worker: usize) {
         self.park_slot(worker);
@@ -118,9 +110,6 @@ pub struct Runtime {
     /// It is exact rather than sampled, which matters here: a profiler cannot
     /// see this workload at all, because the echo is short enough that every
     /// worker is parked in almost every wall-clock sample at any pool size.
-    #[cfg(feature = "std")]
-    parking: Arc<StdHost>,
-    #[cfg(all(feature = "eko", not(feature = "std")))]
     parking: Arc<EkoHost>,
     executor: Executor,
 }
@@ -179,45 +168,19 @@ impl Runtime {
             workers <= usize::BITS as usize,
             "worker count exceeds the pool bitmap capacity"
         );
-        #[cfg(feature = "std")]
-        let host = Arc::new(StdHost::new(workers));
-        #[cfg(all(feature = "eko", not(feature = "std")))]
         let host = Arc::new(EkoHost::new(workers));
         let parking = host.clone();
         let pool = Pool::with_tuning(workers, 1024, host, builder.tuning);
-        #[cfg(feature = "std")]
-        {
-            let label = &builder.label;
-            for id in 0..workers {
-                let pool = pool.clone();
-                let runner = pool.runner(id);
-                let mut thread = std::thread::Builder::new().name(alloc::format!("{label}-{id}"));
-                if let Some(bytes) = builder.stack_size {
-                    thread = thread.stack_size(bytes);
-                }
-                thread
-                    .spawn(move || {
-                        // Tells the scheduler that a wake happening on this thread
-                        // belongs to worker `id`, so it can skip the injector. See
-                        // `task::mark_current`.
-                        let _current = crate::task::mark_current(&pool, id);
-                        let _ = pool.run(runner);
-                    })
-                    .expect("a runtime thread");
-            }
-        }
-        #[cfg(all(feature = "eko", not(feature = "std")))]
-        {
-            let _ = &builder.label;
-            let stack_bytes = builder.stack_size.unwrap_or(2 * 1024 * 1024);
-            for id in 0..workers {
-                let pool = pool.clone();
-                let runner = pool.runner(id);
-                eko::thread::spawn_detached(stack_bytes, move || {
-                    let _ = pool.run(runner);
-                })
-                .expect("a runtime thread");
-            }
+        let _ = &builder.label;
+        let stack_bytes = builder.stack_size.unwrap_or(2 * 1024 * 1024);
+        for id in 0..workers {
+            let pool = pool.clone();
+            let runner = pool.runner(id);
+            eko::thread::spawn_detached(stack_bytes, move || {
+                let _current = crate::task::mark_current(&pool, id);
+                let _ = pool.run(runner);
+            })
+            .expect("a runtime thread");
         }
         Self {
             parking,
@@ -301,11 +264,11 @@ impl core::fmt::Display for ReadinessError {
 }
 
 #[cfg(feature = "reactor")]
-impl std::error::Error for ReadinessError {}
+impl core::error::Error for ReadinessError {}
 
 #[cfg(feature = "reactor")]
-static READINESS: std::sync::OnceLock<Result<crate::reactor::Reactor, ReadinessError>> =
-    std::sync::OnceLock::new();
+static READINESS: eko::thread::OnceLock<Result<crate::reactor::Reactor, ReadinessError>> =
+    eko::thread::OnceLock::new();
 
 /// A [`Runtime`] described before it is started, from [`Runtime::builder`].
 ///
@@ -429,8 +392,7 @@ impl core::fmt::Display for BackgroundStarted {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for BackgroundStarted {}
+impl core::error::Error for BackgroundStarted {}
 
 /// Threads for the shared pool.
 ///
@@ -451,14 +413,7 @@ impl std::error::Error for BackgroundStarted {}
 /// nothing: a caller who wants every core still asks for it by building a
 /// `Runtime` with the count it wants.
 fn shared_threads() -> usize {
-    #[cfg(feature = "std")]
-    let available = std::thread::available_parallelism()
-        .ok()
-        .map(NonZeroUsize::get);
-    #[cfg(not(feature = "std"))]
-    let available: Option<usize> = None;
-
-    supported_default_threads(performance_cores().or(available).unwrap_or(2))
+    supported_default_threads(performance_cores().unwrap_or(2))
 }
 
 /// Cores in the fastest class, where the platform distinguishes classes.
@@ -536,7 +491,7 @@ fn supported_default_threads(available: usize) -> usize {
 /// Spreads descriptors over the pool by index while keeping each one on a
 /// stable worker, so a task finds its own cache lines without every
 /// connection sharing a queue.
-#[cfg(any(feature = "reactor", feature = "eko"))]
+#[cfg(feature = "reactor")]
 pub(crate) fn route_reactor_wake(index: u64) -> Option<crate::task::RouteGuard> {
     // Only route onto a pool that is already running. Asking `background()`
     // for its width *starts* it, one thread per core, and the reactor is not
@@ -563,66 +518,7 @@ pub fn background() -> &'static Runtime {
 ///
 /// Named rather than function-local so that [`route_reactor_wake`] can ask
 /// whether it exists without bringing it into existence.
-#[cfg(feature = "std")]
-static SHARED: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
-
-#[cfg(all(feature = "eko", not(feature = "std")))]
-struct OnceRuntime {
-    state: core::sync::atomic::AtomicU8,
-    value: core::cell::UnsafeCell<Option<Runtime>>,
-}
-
-#[cfg(all(feature = "eko", not(feature = "std")))]
-unsafe impl Sync for OnceRuntime {}
-
-#[cfg(all(feature = "eko", not(feature = "std")))]
-impl OnceRuntime {
-    const fn new() -> Self {
-        Self {
-            state: core::sync::atomic::AtomicU8::new(0),
-            value: core::cell::UnsafeCell::new(None),
-        }
-    }
-
-    fn get(&self) -> Option<&Runtime> {
-        use core::sync::atomic::Ordering;
-        if self.state.load(Ordering::Acquire) == 2 {
-            // SAFETY: state == 2 means `value` is initialized and immutable.
-            unsafe { (*self.value.get()).as_ref() }
-        } else {
-            None
-        }
-    }
-
-    fn get_or_init(&self, f: impl FnOnce() -> Runtime) -> &Runtime {
-        use core::sync::atomic::Ordering;
-        if self.state.load(Ordering::Acquire) == 2 {
-            // SAFETY: state == 2 means `value` is initialized and immutable.
-            return unsafe { (*self.value.get()).as_ref().unwrap_unchecked() };
-        }
-        if self
-            .state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let rt = f();
-            // SAFETY: we hold the initializing state (1).
-            unsafe {
-                *self.value.get() = Some(rt);
-            }
-            self.state.store(2, Ordering::Release);
-        } else {
-            while self.state.load(Ordering::Acquire) != 2 {
-                core::hint::spin_loop();
-            }
-        }
-        // SAFETY: state == 2 means `value` is initialized and immutable.
-        unsafe { (*self.value.get()).as_ref().unwrap_unchecked() }
-    }
-}
-
-#[cfg(all(feature = "eko", not(feature = "std")))]
-static SHARED: OnceRuntime = OnceRuntime::new();
+static SHARED: eko::thread::OnceLock<Runtime> = eko::thread::OnceLock::new();
 
 #[cfg(test)]
 mod tests {

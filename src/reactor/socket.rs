@@ -37,7 +37,80 @@ use core::mem;
 
 use super::error::{Errno, Result};
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
+#[cfg(not(target_os = "none"))]
+mod libc {
+    pub use core::ffi::{c_int, c_void};
+    pub use eko::libc_lite::{
+        AF_INET, AF_INET6, AF_UNIX, EAFNOSUPPORT, EINPROGRESS, EINVAL, EMSGSIZE, ENAMETOOLONG,
+        FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP,
+        IPV6_V6ONLY, O_NONBLOCK, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SO_ERROR, SO_RCVBUF,
+        SO_REUSEADDR, SO_REUSEPORT, SO_SNDBUF, TCP_NODELAY, bind, close, connect, getpeername,
+        getsockname, getsockopt, listen, recv, recvfrom, sa_family_t, send, sendto, setsockopt,
+        sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage, sockaddr_un, socket, socklen_t,
+    };
+    #[cfg(target_os = "linux")]
+    pub use eko::libc_lite::{MSG_NOSIGNAL, SOCK_CLOEXEC, SOCK_NONBLOCK, accept4};
+    #[cfg(target_os = "macos")]
+    pub use eko::libc_lite::SO_NOSIGPIPE;
+
+    #[cfg(target_os = "linux")]
+    pub const FIONREAD: core::ffi::c_ulong = 0x541B;
+    #[cfg(target_os = "macos")]
+    pub const FIONREAD: core::ffi::c_ulong = 0x4004_667f;
+
+    #[cfg(target_os = "linux")]
+    pub const MSG_TRUNC: c_int = 0x20;
+    #[cfg(target_os = "macos")]
+    pub const MSG_TRUNC: c_int = 0x10;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct iovec {
+        pub iov_base: *mut c_void,
+        pub iov_len: usize,
+    }
+
+    #[cfg(target_os = "macos")]
+    pub type MsgIovLen = c_int;
+    #[cfg(not(target_os = "macos"))]
+    pub type MsgIovLen = usize;
+
+    #[cfg(target_os = "macos")]
+    pub type MsgControlLen = socklen_t;
+    #[cfg(not(target_os = "macos"))]
+    pub type MsgControlLen = usize;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct msghdr {
+        pub msg_name: *mut c_void,
+        pub msg_namelen: socklen_t,
+        pub msg_iov: *mut iovec,
+        pub msg_iovlen: MsgIovLen,
+        pub msg_control: *mut c_void,
+        pub msg_controllen: MsgControlLen,
+        pub msg_flags: c_int,
+    }
+
+    #[inline]
+    pub unsafe fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
+        unsafe { eko::libc_lite::fcntl3(fd, cmd, arg) }
+    }
+
+    #[inline]
+    pub unsafe fn fcntl_get(fd: c_int, cmd: c_int) -> c_int {
+        unsafe { eko::libc_lite::fcntl2(fd, cmd) }
+    }
+
+    unsafe extern "C" {
+        pub fn accept(socket: c_int, address: *mut sockaddr, address_len: *mut socklen_t) -> c_int;
+        pub fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> isize;
+        pub fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> isize;
+        pub fn ioctl(fd: c_int, request: core::ffi::c_ulong, ...) -> c_int;
+    }
+}
+
+#[cfg(target_os = "none")]
 mod libc {
     pub use core::ffi::{c_int, c_void};
     pub use eko::libc_lite::{
@@ -337,7 +410,7 @@ impl UnixPath {
     ///
     /// `EINVAL` for an empty name, `ENAMETOOLONG` for one that does not fit
     /// after the leading NUL that marks it as abstract.
-    #[cfg(any(target_os = "linux", feature = "eko"))]
+    #[cfg(any(target_os = "linux", target_os = "none"))]
     pub fn abstract_name(name: &[u8]) -> Result<Self> {
         if name.is_empty() {
             return Err(Errno(libc::EINVAL));
@@ -618,7 +691,7 @@ impl Addr {
                     // Nowhere else has abstract sockets, so there the same
                     // bytes are a kernel reporting slack after an unnamed peer,
                     // and reading them as a name would invent one.
-                    if cfg!(any(target_os = "linux", feature = "eko")) {
+                    if cfg!(any(target_os = "linux", target_os = "none")) {
                         reported
                     } else {
                         0
@@ -686,17 +759,17 @@ impl StreamSetup {
     fn finish(self) {}
 }
 
-#[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
+#[cfg(not(any(target_os = "linux", target_os = "none")))]
 fn set_stream_flags(fd: Fd) -> Result<Fd> {
     // SAFETY: `fd` owns the fresh descriptor, including on error.
     unsafe {
-        let flags = check(libc::fcntl(fd.raw(), libc::F_GETFL))?;
+        let flags = check(libc::fcntl_get(fd.raw(), libc::F_GETFL))?;
         check(libc::fcntl(
             fd.raw(),
             libc::F_SETFL,
             flags | libc::O_NONBLOCK,
         ))?;
-        let flags = check(libc::fcntl(fd.raw(), libc::F_GETFD))?;
+        let flags = check(libc::fcntl_get(fd.raw(), libc::F_GETFD))?;
         check(libc::fcntl(
             fd.raw(),
             libc::F_SETFD,
@@ -721,7 +794,7 @@ fn set_stream_flags(fd: Fd) -> Result<Fd> {
 fn stream_socket(addr: &Addr, setup: StreamSetup) -> Result<Fd> {
     // Linux sets both flags in `socket`. Elsewhere, `setup` protects the
     // descriptor until both flag-setting calls have succeeded.
-    #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
+    #[cfg(any(target_os = "linux", target_os = "none"))]
     let raw = check(unsafe {
         libc::socket(
             addr.family(),
@@ -729,12 +802,12 @@ fn stream_socket(addr: &Addr, setup: StreamSetup) -> Result<Fd> {
             0,
         )
     })?;
-    #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
+    #[cfg(not(any(target_os = "linux", target_os = "none")))]
     let raw = check(unsafe { libc::socket(addr.family(), libc::SOCK_STREAM, 0) })?;
 
     // SAFETY: `raw` is a fresh descriptor owned exclusively here.
     let fd = unsafe { Fd::from_raw(raw) };
-    #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
+    #[cfg(not(any(target_os = "linux", target_os = "none")))]
     let fd = set_stream_flags(fd)?;
     setup.finish();
     Ok(fd)
@@ -748,7 +821,7 @@ fn datagram_socket(addr: &Addr) -> Result<Fd> {
         libc::IPPROTO_UDP
     };
 
-    #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
+    #[cfg(any(target_os = "linux", target_os = "none"))]
     let fd = {
         let raw = check(unsafe {
             libc::socket(
@@ -761,7 +834,7 @@ fn datagram_socket(addr: &Addr) -> Result<Fd> {
         unsafe { Fd::from_raw(raw) }
     };
 
-    #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
+    #[cfg(not(any(target_os = "linux", target_os = "none")))]
     let fd = {
         #[cfg(all(feature = "process", unix))]
         let _cloexec_guard = crate::process::CloexecReadGuard::lock();
@@ -770,9 +843,9 @@ fn datagram_socket(addr: &Addr) -> Result<Fd> {
         // Take ownership before setting flags so every failure closes it.
         // SAFETY: this is a fresh descriptor owned exclusively here.
         let fd = unsafe { Fd::from_raw(raw) };
-        let flags = check(unsafe { libc::fcntl(fd.raw(), libc::F_GETFL) })?;
+        let flags = check(unsafe { libc::fcntl_get(fd.raw(), libc::F_GETFL) })?;
         check(unsafe { libc::fcntl(fd.raw(), libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
-        let flags = check(unsafe { libc::fcntl(fd.raw(), libc::F_GETFD) })?;
+        let flags = check(unsafe { libc::fcntl_get(fd.raw(), libc::F_GETFD) })?;
         check(unsafe { libc::fcntl(fd.raw(), libc::F_SETFD, flags | libc::FD_CLOEXEC) })?;
         set_flag(fd.raw(), libc::SOL_SOCKET, libc::SO_NOSIGPIPE, true)?;
         fd
@@ -1070,9 +1143,9 @@ impl TcpSocket {
         // MSG_NOSIGNAL is how Linux asks for EPIPE instead of SIGPIPE. The
         // BSDs have no such flag and use SO_NOSIGPIPE, set when the socket was
         // created.
-        #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
+        #[cfg(any(target_os = "linux", target_os = "none"))]
         let flags = libc::MSG_NOSIGNAL;
-        #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
+        #[cfg(not(any(target_os = "linux", target_os = "none")))]
         let flags = 0;
 
         // SAFETY: `message` points at `iovecs`, a live local, and describes
@@ -1308,9 +1381,9 @@ impl UdpSocket {
         } else {
             (core::ptr::null(), 0)
         };
-        #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
+        #[cfg(any(target_os = "linux", target_os = "none"))]
         let flags = libc::MSG_NOSIGNAL;
-        #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
+        #[cfg(not(any(target_os = "linux", target_os = "none")))]
         let flags = 0;
 
         #[cfg(feature = "syscall-counters")]
@@ -1435,7 +1508,7 @@ impl TcpListener {
         // Linux sets both flags atomically with `accept4`. Elsewhere, keep
         // coordinated process spawning out until the accepted descriptor is
         // close-on-exec or closed on failure.
-        #[cfg(any(target_os = "linux", all(feature = "eko", not(feature = "std"))))]
+        #[cfg(any(target_os = "linux", target_os = "none"))]
         let raw = check(unsafe {
             libc::accept4(
                 self.raw(),
@@ -1445,7 +1518,7 @@ impl TcpListener {
             )
         })?;
 
-        #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
+        #[cfg(not(any(target_os = "linux", target_os = "none")))]
         let raw = check(unsafe {
             libc::accept(
                 self.raw(),
@@ -1456,7 +1529,7 @@ impl TcpListener {
 
         // SAFETY: `raw` is the descriptor just accepted and uniquely owned.
         let fd = unsafe { Fd::from_raw(raw) };
-        #[cfg(not(any(target_os = "linux", all(feature = "eko", not(feature = "std")))))]
+        #[cfg(not(any(target_os = "linux", target_os = "none")))]
         let fd = set_stream_flags(fd)?;
         setup.finish();
 

@@ -11,7 +11,6 @@
 
 pub use crate::io::StreamError as Errno;
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use eko::libc_lite as libc;
 
 /// The result of a syscall.
@@ -52,23 +51,6 @@ pub fn transient_accept(error: Errno) -> bool {
 /// DragonFly say `__errno_location`, apple and FreeBSD say `__error`, and the
 /// NetBSD-likes say `__errno`. `signal.rs` needs the same cell and gates it
 /// the same way.
-#[allow(unsafe_code)]
 pub fn last() -> Errno {
-    #[cfg(feature = "std")]
-    {
-        #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
-        use libc::__errno as errno_location;
-        #[cfg(any(target_os = "linux", target_os = "dragonfly"))]
-        use libc::__errno_location as errno_location;
-        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
-        use libc::__error as errno_location;
-
-        // SAFETY: the call returns a pointer to this thread's errno, valid for
-        // the life of the thread.
-        Errno(unsafe { *errno_location() })
-    }
-    #[cfg(all(feature = "eko", not(feature = "std")))]
-    {
-        Errno(eko::Errno::current().0)
-    }
+    Errno(eko::Errno::current().0)
 }

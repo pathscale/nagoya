@@ -201,19 +201,6 @@ pub fn now_ns() -> u64 {
     // never arm, and installing unconditionally put a second `OnceLock` on that
     // path to answer a question already settled by the first call in the
     // process.
-    #[cfg(feature = "std")]
-    let raw = {
-        let mut raw = CLOCK.load(Ordering::Acquire);
-        if raw == 0 {
-            driver::install_default_clock();
-            raw = CLOCK.load(Ordering::Acquire);
-        }
-        raw
-    };
-    // Nothing to install: without `std` the consumer's `set_clock` is the only
-    // way a clock ever arrives, so a zero here is the missing call, not a
-    // default waiting to be taken.
-    #[cfg(all(not(feature = "std"), feature = "eko"))]
     let raw = {
         let mut raw = CLOCK.load(Ordering::Acquire);
         if raw == 0 {
@@ -222,8 +209,6 @@ pub fn now_ns() -> u64 {
         }
         raw
     };
-    #[cfg(all(not(feature = "std"), not(feature = "eko")))]
-    let raw = CLOCK.load(Ordering::Acquire);
     assert!(raw != 0, "nagoya::time::set_clock has not been called");
     // SAFETY: the only value ever stored is a `fn() -> u64` cast to `usize` by
     // `set_clock`, and the compare-exchange there means it is written once.
@@ -381,7 +366,6 @@ impl Future for Sleep {
                 let earliest = arm(this.deadline, &slot);
                 this.slot = Some(slot);
                 if earliest {
-                    #[cfg(any(feature = "std", feature = "eko"))]
                     driver::nudge(this.deadline);
                 }
                 Poll::Pending
@@ -425,8 +409,7 @@ impl core::fmt::Display for Elapsed {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Elapsed {}
+impl core::error::Error for Elapsed {}
 
 /// Run `future`, giving up after `duration`.
 ///
@@ -468,19 +451,19 @@ impl<F: Future> Future for Timeout<F> {
 }
 
 /// The timer backend was selected by an earlier timer or reactor binding.
-#[cfg(any(feature = "reactor", feature = "eko"))]
+#[cfg(feature = "reactor")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimerDriverStarted;
 
-#[cfg(any(feature = "reactor", feature = "eko"))]
+#[cfg(feature = "reactor")]
 impl core::fmt::Display for TimerDriverStarted {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("nagoya timer driver already selected")
     }
 }
 
-#[cfg(all(feature = "std", any(feature = "reactor", feature = "eko")))]
-impl std::error::Error for TimerDriverStarted {}
+#[cfg(feature = "reactor")]
+impl core::error::Error for TimerDriverStarted {}
 
 /// Route all future timer arms to this retained reactor, without a timer thread.
 ///
@@ -488,18 +471,18 @@ impl std::error::Error for TimerDriverStarted {}
 /// armed timers and must have exactly one servicing loop. Runtime::readiness
 /// supplies that process-lifetime ownership. Clock reads alone do not select
 /// the backend. This function never replaces an already-selected driver.
-#[cfg(any(feature = "reactor", feature = "eko"))]
+#[cfg(feature = "reactor")]
 pub fn set_timer_reactor(handle: crate::reactor::Handle) -> Result<(), TimerDriverStarted> {
     driver::bind_reactor(handle)
 }
 
-#[cfg(all(not(feature = "std"), feature = "eko"))]
 mod driver {
     use super::{now_ns, poll, set_clock};
     use eko::thread::{Condvar, Mutex, OnceLock};
 
     enum Host {
         Dedicated,
+        #[cfg(feature = "reactor")]
         Reactor(crate::reactor::Handle),
     }
 
@@ -507,6 +490,7 @@ mod driver {
     static NUDGE: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
     static THREAD: OnceLock<()> = OnceLock::new();
 
+    #[cfg(feature = "reactor")]
     pub(super) fn bind_reactor(
         handle: crate::reactor::Handle,
     ) -> Result<(), super::TimerDriverStarted> {
@@ -527,6 +511,7 @@ mod driver {
                 *lock.lock() = true;
                 signal.notify_one();
             }
+            #[cfg(feature = "reactor")]
             Host::Reactor(handle) => {
                 handle
                     .timer_armed(deadline)
@@ -573,114 +558,12 @@ mod driver {
     }
 }
 
-#[cfg(feature = "std")]
-mod driver {
-    use super::{now_ns, poll, set_clock};
-    use std::sync::{Condvar, Mutex, OnceLock};
-    use std::time::{Duration, Instant};
-
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    static NUDGE: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
-    static THREAD: OnceLock<()> = OnceLock::new();
-
-    enum Host {
-        Dedicated,
-        #[cfg(feature = "reactor")]
-        Reactor(crate::reactor::Handle),
-    }
-
-    static HOST: OnceLock<Host> = OnceLock::new();
-
-    #[cfg(feature = "reactor")]
-    pub(super) fn bind_reactor(
-        handle: crate::reactor::Handle,
-    ) -> Result<(), super::TimerDriverStarted> {
-        HOST.set(Host::Reactor(handle))
-            .map_err(|_| super::TimerDriverStarted)
-    }
-
-    fn std_clock() -> u64 {
-        let origin = ORIGIN.get_or_init(Instant::now);
-        u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    }
-
-    /// Point the registry at `Instant` unless a consumer already chose a clock.
-    pub(super) fn install_default_clock() {
-        let _ = ORIGIN.get_or_init(Instant::now);
-        set_clock(std_clock);
-    }
-
-    fn nudge_pair() -> &'static (Mutex<bool>, Condvar) {
-        NUDGE.get_or_init(|| (Mutex::new(false), Condvar::new()))
-    }
-
-    /// Wake the driver because a nearer deadline than it is waiting for now
-    /// exists. Starts the driver if this is the first timer in the process.
-    pub(super) fn nudge(deadline: u64) {
-        match HOST.get_or_init(|| Host::Dedicated) {
-            Host::Dedicated => {
-                let _ = deadline;
-                start();
-                let (lock, signal) = nudge_pair();
-                *lock.lock().expect("the nudge lock") = true;
-                signal.notify_one();
-            }
-            #[cfg(feature = "reactor")]
-            Host::Reactor(handle) => {
-                handle
-                    .timer_armed(deadline)
-                    .expect("nagoya timer reactor wake");
-            }
-        }
-    }
-
-    fn start() {
-        THREAD.get_or_init(|| {
-            install_default_clock();
-            std::thread::Builder::new()
-                .name("nagoya-timer".into())
-                .spawn(run)
-                .expect("a timer thread");
-        });
-    }
-
-    fn run() {
-        let (lock, signal) = nudge_pair();
-        loop {
-            let next = poll(now_ns());
-            let mut nudged = lock.lock().expect("the nudge lock");
-            if *nudged {
-                // A timer was armed while the heap above was being drained, so
-                // `next` may already be stale. Go round rather than wait on it.
-                *nudged = false;
-                continue;
-            }
-            match next {
-                Some(deadline) => {
-                    let now = now_ns();
-                    if deadline <= now {
-                        continue;
-                    }
-                    let (guard, _) = signal
-                        .wait_timeout(nudged, Duration::from_nanos(deadline - now))
-                        .expect("the nudge lock");
-                    nudged = guard;
-                }
-                // Nothing pending. Waiting rather than looping is what keeps an
-                // idle timer thread off the CPU entirely.
-                None => nudged = signal.wait(nudged).expect("the nudge lock"),
-            }
-            *nudged = false;
-        }
-    }
-}
-
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 mod tests {
     use super::{Elapsed, now_ns, sleep, timeout};
     use crate::block_on;
     use core::time::Duration;
-    use std::time::Instant;
+    use eko::time::Instant;
 
     fn slot() -> alloc::sync::Arc<super::Slot> {
         alloc::sync::Arc::new(super::Slot {
@@ -740,8 +623,8 @@ mod tests {
         use core::future::Future;
         use core::pin::Pin;
         use core::task::Context;
-        use std::sync::Arc;
-        use std::task::Waker;
+        use alloc::sync::Arc;
+        use core::task::Waker;
         let waker = Waker::noop();
         let mut sleep = super::sleep_until(u64::MAX);
         assert!(

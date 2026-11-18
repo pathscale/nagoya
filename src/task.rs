@@ -14,104 +14,82 @@ use st3::fanout::{Act, Job, Pool};
 
 use crate::WorkerContext;
 
-// The worker scope owns one pool lease. Wakes borrow it without modifying
-// the pool-wide Arc counter. Queued tasks still hold only Weak<Pool>.
-#[cfg(feature = "std")]
-std::thread_local! {
-    static CURRENT: core::cell::RefCell<Option<(Arc<Pool>, usize)>> =
-        const { core::cell::RefCell::new(None) };
-    /// Where wakes from this thread should land, for a thread that is not a
-    /// worker but knows which worker a task belongs near. See [`route_wakes`].
-    static ROUTE: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
-}
+static CURRENT: eko::thread::ThreadLocal<core::cell::RefCell<Option<(Arc<Pool>, usize)>>> =
+    eko::thread::ThreadLocal::new();
+static ROUTE: eko::thread::ThreadLocal<core::cell::Cell<Option<usize>>> =
+    eko::thread::ThreadLocal::new();
 
-/// Send wakes from this thread to `worker` until the guard drops.
-///
-/// [`mark_current`] says "this thread *is* worker N". This says "wakes from
-/// here belong on worker N", which is a different claim and the one an I/O
-/// reactor can make: it is not a worker, but it knows which task it is waking
-/// and can keep that task on one worker across wakeups.
-///
-/// The distinction matters because the reactor must vary the answer. Pinning
-/// every wake to one worker funnels every connection through one queue: it
-/// measured 38 percent faster at eight connections and two and a half times
-/// slower at ten thousand, which is the wrong trade. Routing by descriptor
-/// spreads them and keeps each one settled.
-#[cfg(all(feature = "std", any(feature = "reactor", feature = "eko")))]
+#[cfg(feature = "reactor")]
 pub(crate) fn route_wakes(worker: usize) -> RouteGuard {
-    let previous = ROUTE.with(|route| route.replace(Some(worker)));
+    let previous = ROUTE
+        .with_ref(|| core::cell::Cell::new(None), |route| route.replace(Some(worker)))
+        .flatten();
     RouteGuard {
         previous,
         _thread_bound: core::marker::PhantomData,
     }
 }
 
-#[cfg(all(not(feature = "std"), feature = "eko"))]
-pub(crate) fn route_wakes(_worker: usize) -> RouteGuard {
-    RouteGuard {
-        _thread_bound: core::marker::PhantomData,
-    }
-}
-
-#[cfg(any(feature = "reactor", feature = "eko"))]
+#[cfg(feature = "reactor")]
 pub(crate) struct RouteGuard {
-    #[cfg(feature = "std")]
     previous: Option<usize>,
     _thread_bound: core::marker::PhantomData<alloc::rc::Rc<()>>,
 }
 
-#[cfg(all(feature = "std", any(feature = "reactor", feature = "eko")))]
+#[cfg(feature = "reactor")]
 impl Drop for RouteGuard {
     fn drop(&mut self) {
-        ROUTE.with(|route| route.set(self.previous.take()));
+        let prev = self.previous.take();
+        let _ = ROUTE.with_ref(|| core::cell::Cell::new(None), |route| route.set(prev));
     }
 }
 
-#[cfg(feature = "std")]
 fn routed_worker() -> Option<usize> {
-    ROUTE.try_with(core::cell::Cell::get).ok().flatten()
+    ROUTE
+        .with_ref(|| core::cell::Cell::new(None), core::cell::Cell::get)
+        .flatten()
 }
 
-#[cfg(not(feature = "std"))]
-fn routed_worker() -> Option<usize> {
-    None
-}
-
-#[cfg(feature = "std")]
 pub(crate) fn mark_current(pool: &Arc<Pool>, worker: usize) -> CurrentGuard {
-    let previous = CURRENT.with(|current| current.replace(Some((pool.clone(), worker))));
+    let previous = CURRENT
+        .with_ref(
+            || core::cell::RefCell::new(None),
+            |current| current.replace(Some((pool.clone(), worker))),
+        )
+        .flatten();
     CurrentGuard {
         previous,
         _thread_bound: core::marker::PhantomData,
     }
 }
 
-#[cfg(feature = "std")]
 pub(crate) struct CurrentGuard {
     previous: Option<(Arc<Pool>, usize)>,
     _thread_bound: core::marker::PhantomData<alloc::rc::Rc<()>>,
 }
 
-#[cfg(feature = "std")]
 impl Drop for CurrentGuard {
     fn drop(&mut self) {
-        CURRENT.with(|current| {
-            current.replace(self.previous.take());
-        });
+        let prev = self.previous.take();
+        let _ = CURRENT.with_ref(
+            || core::cell::RefCell::new(None),
+            |current| {
+                current.replace(prev);
+            },
+        );
     }
 }
 
-#[cfg(feature = "std")]
 fn with_current_worker(mut visit: impl FnMut(&Pool, usize)) {
-    let _ = CURRENT.try_with(|current| {
-        if let Some((pool, worker)) = current.borrow().as_ref() {
-            visit(pool, *worker);
-        }
-    });
+    let _ = CURRENT.with_ref(
+        || core::cell::RefCell::new(None),
+        |current| {
+            if let Some((pool, worker)) = current.borrow().as_ref() {
+                visit(pool, *worker);
+            }
+        },
+    );
 }
-
-#[cfg(not(feature = "std"))]
-fn with_current_worker(_visit: impl FnMut(&Pool, usize)) {}
 
 pub(crate) fn current_worker(pool: &Arc<Pool>) -> Option<usize> {
     let mut found = None;
@@ -348,5 +326,4 @@ mod tests {
 /// [`TaskSet`](crate::reactor::TaskSet) driven by
 /// [`block_on_with`](crate::reactor::block_on_with).
 pub use crate::yield_now::{YieldNow, yield_now};
-#[cfg(any(feature = "std", feature = "eko"))]
 pub use crate::{JoinHandle, spawn};

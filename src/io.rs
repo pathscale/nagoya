@@ -445,86 +445,171 @@ impl From<SeekFrom> for std::io::SeekFrom {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "reactor"))]
+pub use host::Compat;
 pub use host::{
-    Compat, HostFile, append, create, create_dir_all, metadata, open, open_or_create, read,
+    AsPath, HostFile, append, create, create_dir_all, metadata, open, open_or_create, read,
     remove_dir_all, remove_file, rename, write,
 };
 
-#[cfg(feature = "std")]
 mod host {
-    //! The implementation for a target that has a filesystem.
-    //!
-    //! Blocking `std::fs`, reached through `async fn`s that do not await
-    //! anything. That is not a pretence of asynchrony: it is the honest shape,
-    //! because the platform has no asynchronous file I/O to offer and the two
-    //! crates that claim otherwise are thread pools in a trench coat.
+    //! The implementation for a target that has a filesystem, over `ekostd`.
 
-    use super::{Error, File, Read, Seek, SeekFrom, Write};
-    use std::path::Path;
+    #![allow(unsafe_code)]
 
-    /// A [`File`] backed by `std::fs`.
+    use super::{Error, ErrorKind, File, Read, Seek, SeekFrom, Write};
+
+    /// A path that can be passed to [`crate::io`] filesystem helpers.
+    pub trait AsPath {
+        /// Borrow as an [`eko::path::Path`].
+        fn as_eko_path(&self) -> Result<&eko::path::Path, Error>;
+    }
+
+    impl AsPath for str {
+        fn as_eko_path(&self) -> Result<&eko::path::Path, Error> {
+            Ok(eko::path::Path::new(self))
+        }
+    }
+
+    impl AsPath for alloc::string::String {
+        fn as_eko_path(&self) -> Result<&eko::path::Path, Error> {
+            Ok(eko::path::Path::new(self.as_str()))
+        }
+    }
+
+    impl AsPath for eko::path::Path {
+        fn as_eko_path(&self) -> Result<&eko::path::Path, Error> {
+            Ok(self)
+        }
+    }
+
+    impl AsPath for eko::path::PathBuf {
+        fn as_eko_path(&self) -> Result<&eko::path::Path, Error> {
+            Ok(self.as_path())
+        }
+    }
+
+    impl<T: AsPath + ?Sized> AsPath for &T {
+        fn as_eko_path(&self) -> Result<&eko::path::Path, Error> {
+            (*self).as_eko_path()
+        }
+    }
+
+    #[cfg(any(test, feature = "std"))]
+    impl AsPath for std::path::Path {
+        fn as_eko_path(&self) -> Result<&eko::path::Path, Error> {
+            self.to_str()
+                .map(eko::path::Path::new)
+                .ok_or_else(|| Error::new(ErrorKind::Other))
+        }
+    }
+
+    #[cfg(any(test, feature = "std"))]
+    impl AsPath for std::path::PathBuf {
+        fn as_eko_path(&self) -> Result<&eko::path::Path, Error> {
+            self.as_path().as_eko_path()
+        }
+    }
+
+    fn map_eko_err(err: eko::file::Error) -> Error {
+        match err.kind() {
+            eko::file::ErrorKind::NotFound => Error::new(ErrorKind::NotFound),
+            eko::file::ErrorKind::PermissionDenied => Error::new(ErrorKind::PermissionDenied),
+            _ => match err.errno().0 {
+                4 => Error::new(ErrorKind::Interrupted),
+                _ => Error::new(ErrorKind::Other),
+            },
+        }
+    }
+
+    fn map_errno(errno: eko::Errno) -> Error {
+        map_eko_err(eko::file::Error::from_errno(errno, "io"))
+    }
+
+    /// A [`File`] backed by `eko::file::File`.
     #[derive(Debug)]
     pub struct HostFile {
-        inner: std::fs::File,
+        inner: eko::file::File,
     }
 
     impl HostFile {
         /// Take an already-open file.
         #[must_use]
-        pub fn new(inner: std::fs::File) -> Self {
+        pub fn new(inner: eko::file::File) -> Self {
             Self { inner }
         }
 
         /// The file underneath, for the platform-specific things this trait
         /// deliberately does not cover.
         #[must_use]
-        pub fn get_ref(&self) -> &std::fs::File {
+        pub fn get_ref(&self) -> &eko::file::File {
             &self.inner
         }
     }
 
-    // `async fn` rather than a computed `Result` handed to an `async move`
-    // block: the second form runs the syscall when the method is called, so a
-    // future that is built and dropped unpolled would still have written. A
-    // future does nothing until it is polled, blocking body or not.
     impl Read for HostFile {
         async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
-            std::io::Read::read(&mut self.inner, buffer).map_err(Error::from)
+            self.inner.read(buffer).map_err(map_eko_err)
         }
     }
 
     impl Write for HostFile {
         async fn write(&mut self, buffer: &[u8]) -> Result<usize, Error> {
-            std::io::Write::write(&mut self.inner, buffer).map_err(Error::from)
+            let n = unsafe {
+                eko::libc_lite::write(
+                    self.inner.as_raw_fd(),
+                    buffer.as_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if n < 0 {
+                Err(map_errno(eko::Errno::current()))
+            } else {
+                Ok(n as usize)
+            }
         }
 
         async fn flush(&mut self) -> Result<(), Error> {
-            std::io::Write::flush(&mut self.inner).map_err(Error::from)
+            Ok(())
         }
     }
 
     impl Seek for HostFile {
         async fn seek(&mut self, from: SeekFrom) -> Result<u64, Error> {
-            std::io::Seek::seek(&mut self.inner, from.into()).map_err(Error::from)
+            let (offset, whence) = match from {
+                SeekFrom::Start(n) => (n as i64, 0),
+                SeekFrom::Current(n) => (n, 1),
+                SeekFrom::End(n) => (n, 2),
+            };
+            let pos = unsafe { eko::libc_lite::lseek(self.inner.as_raw_fd(), offset, whence) };
+            if pos < 0 {
+                Err(map_errno(eko::Errno::current()))
+            } else {
+                Ok(pos as u64)
+            }
         }
     }
 
     impl File for HostFile {
         async fn length(&mut self) -> Result<u64, Error> {
-            self.inner.metadata().map(|m| m.len()).map_err(Error::from)
+            self.inner.metadata().map(|m| m.len()).map_err(map_eko_err)
         }
 
         async fn set_length(&mut self, length: u64) -> Result<(), Error> {
-            self.inner.set_len(length).map_err(Error::from)
+            let rc = unsafe { eko::libc_lite::ftruncate(self.inner.as_raw_fd(), length as i64) };
+            if rc < 0 {
+                Err(map_errno(eko::Errno::current()))
+            } else {
+                Ok(())
+            }
         }
 
         async fn sync_all(&mut self) -> Result<(), Error> {
-            self.inner.sync_all().map_err(Error::from)
+            self.inner.sync_all().map_err(map_eko_err)
         }
 
         async fn sync_data(&mut self) -> Result<(), Error> {
-            self.inner.sync_data().map_err(Error::from)
+            self.inner.sync_all().map_err(map_eko_err)
         }
     }
 
@@ -534,9 +619,11 @@ mod host {
     /// For consumers that already hold something from that ecosystem. It cannot
     /// give you a [`File`]: the four methods there have no `futures-io`
     /// equivalent, which is the whole reason [`File`] exists.
+    #[cfg(all(feature = "std", feature = "reactor"))]
     #[derive(Debug)]
     pub struct Compat<T>(pub T);
 
+    #[cfg(all(feature = "std", feature = "reactor"))]
     impl<T> Read for Compat<T>
     where
         T: futures_io::AsyncRead + Unpin + Send,
@@ -548,6 +635,7 @@ mod host {
         }
     }
 
+    #[cfg(all(feature = "std", feature = "reactor"))]
     impl<T> Write for Compat<T>
     where
         T: futures_io::AsyncWrite + Unpin + Send,
@@ -565,6 +653,7 @@ mod host {
         }
     }
 
+    #[cfg(all(feature = "std", feature = "reactor"))]
     impl<T> Seek for Compat<T>
     where
         T: futures_io::AsyncSeek + Unpin + Send,
@@ -577,83 +666,75 @@ mod host {
     }
 
     /// Open an existing file for reading and writing.
-    pub async fn open(path: impl AsRef<Path>) -> Result<HostFile, Error> {
-        Ok(HostFile::new(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)?,
-        ))
+    pub async fn open(path: impl AsPath) -> Result<HostFile, Error> {
+        let p = path.as_eko_path()?;
+        eko::file::File::open_rw(p).map(HostFile::new).map_err(map_eko_err)
     }
 
     /// Create a file for reading and writing, truncating one already there.
-    pub async fn create(path: impl AsRef<Path>) -> Result<HostFile, Error> {
-        Ok(HostFile::new(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)?,
-        ))
+    pub async fn create(path: impl AsPath) -> Result<HostFile, Error> {
+        let p = path.as_eko_path()?;
+        eko::file::File::create_rw(p).map(HostFile::new).map_err(map_eko_err)
     }
 
     /// Open for reading and writing, creating it if absent and keeping what is
     /// there if not.
-    pub async fn open_or_create(path: impl AsRef<Path>) -> Result<HostFile, Error> {
-        Ok(HostFile::new(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)?,
-        ))
+    pub async fn open_or_create(path: impl AsPath) -> Result<HostFile, Error> {
+        let p = path.as_eko_path()?;
+        match eko::file::File::open_rw(p) {
+            Ok(f) => Ok(HostFile::new(f)),
+            Err(e) if e.is_not_found() => eko::file::File::create_rw(p).map(HostFile::new).map_err(map_eko_err),
+            Err(e) => Err(map_eko_err(e)),
+        }
     }
 
     /// Open for appending, creating it if absent.
-    pub async fn append(path: impl AsRef<Path>) -> Result<HostFile, Error> {
-        Ok(HostFile::new(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(path)?,
-        ))
+    pub async fn append(path: impl AsPath) -> Result<HostFile, Error> {
+        let p = path.as_eko_path()?;
+        eko::file::File::append(p).map(HostFile::new).map_err(map_eko_err)
     }
 
     /// Read a whole file.
-    pub async fn read(path: impl AsRef<Path>) -> Result<std::vec::Vec<u8>, Error> {
-        Ok(std::fs::read(path)?)
+    pub async fn read(path: impl AsPath) -> Result<alloc::vec::Vec<u8>, Error> {
+        let p = path.as_eko_path()?;
+        eko::compat::fs::read(p).map_err(map_eko_err)
     }
 
     /// Replace a file's contents.
-    pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<(), Error> {
-        Ok(std::fs::write(path, contents)?)
+    pub async fn write(path: impl AsPath, contents: impl AsRef<[u8]>) -> Result<(), Error> {
+        let p = path.as_eko_path()?;
+        eko::compat::fs::write(p, contents).map_err(map_eko_err)
     }
 
     /// How long the file at `path` is, without opening it.
-    pub async fn metadata(path: impl AsRef<Path>) -> Result<u64, Error> {
-        Ok(std::fs::metadata(path)?.len())
+    pub async fn metadata(path: impl AsPath) -> Result<u64, Error> {
+        let p = path.as_eko_path()?;
+        Ok(eko::compat::fs::metadata(p).map_err(map_eko_err)?.len())
     }
 
     /// Remove a file.
-    pub async fn remove_file(path: impl AsRef<Path>) -> Result<(), Error> {
-        Ok(std::fs::remove_file(path)?)
+    pub async fn remove_file(path: impl AsPath) -> Result<(), Error> {
+        let p = path.as_eko_path()?;
+        eko::compat::fs::remove_file(p).map_err(map_eko_err)
     }
 
     /// Remove a directory and everything under it.
-    pub async fn remove_dir_all(path: impl AsRef<Path>) -> Result<(), Error> {
-        Ok(std::fs::remove_dir_all(path)?)
+    pub async fn remove_dir_all(path: impl AsPath) -> Result<(), Error> {
+        let p = path.as_eko_path()?;
+        eko::compat::fs::remove_dir_all(p).map_err(map_eko_err)
     }
 
     /// Rename a file, replacing the destination if it exists.
-    pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<(), Error> {
-        Ok(std::fs::rename(from, to)?)
+    pub async fn rename(from: impl AsPath, to: impl AsPath) -> Result<(), Error> {
+        let from = from.as_eko_path()?;
+        let to = to.as_eko_path()?;
+        eko::compat::fs::rename(from, to).map_err(map_eko_err)
     }
 
     /// Create a directory and every missing parent.
-    pub async fn create_dir_all(path: impl AsRef<Path>) -> Result<(), Error> {
-        Ok(std::fs::create_dir_all(path)?)
+    pub async fn create_dir_all(path: impl AsPath) -> Result<(), Error> {
+        let p = path.as_eko_path()?;
+        eko::compat::fs::create_dir_all(p).map_err(map_eko_err)
     }
 }
 
@@ -819,15 +900,16 @@ mod portable {
     }
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 mod tests {
     use super::{
         ErrorKind, File, Read, Seek, SeekFrom, Write, create, metadata, open, remove_file,
     };
     use crate::block_on;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("nagoya-io-{name}-{}", std::process::id()))
+    fn scratch(name: &str) -> eko::path::PathBuf {
+        eko::compat::env::temp_dir()
+            .join(&alloc::format!("nagoya-io-{name}-{}", eko::proc::id()))
     }
 
     #[test]
@@ -841,7 +923,7 @@ mod tests {
             file.read_exact(&mut back).await.unwrap();
             assert_eq!(&back, b"the bytes");
         });
-        let _ = std::fs::remove_file(&path);
+        let _ = eko::compat::fs::remove_file(&path);
     }
 
     #[test]
@@ -859,7 +941,7 @@ mod tests {
 
             file.sync_data().await.unwrap();
         });
-        let _ = std::fs::remove_file(&path);
+        let _ = eko::compat::fs::remove_file(&path);
     }
 
     #[test]
@@ -881,7 +963,7 @@ mod tests {
             let error = file.read_exact(&mut exact).await.unwrap_err();
             assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
         });
-        let _ = std::fs::remove_file(&path);
+        let _ = eko::compat::fs::remove_file(&path);
     }
 
     #[test]
@@ -897,7 +979,7 @@ mod tests {
             assert_eq!(file.seek(SeekFrom::End(-1)).await.unwrap(), 99);
             assert_eq!(file.stream_position().await.unwrap(), 99);
         });
-        let _ = std::fs::remove_file(&path);
+        let _ = eko::compat::fs::remove_file(&path);
     }
 
     #[test]
@@ -911,9 +993,9 @@ mod tests {
         let path = scratch("removed");
         block_on(async {
             create(&path).await.unwrap();
-            assert!(path.exists());
+            assert!(eko::compat::fs::metadata(&path).is_ok());
             remove_file(&path).await.unwrap();
         });
-        assert!(!path.exists());
+        assert!(eko::compat::fs::metadata(&path).is_err());
     }
 }

@@ -42,45 +42,17 @@
 //! since taken the same index.
 
 use alloc::boxed::Box;
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use alloc::collections::BTreeMap as SlotMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::Waker;
-#[cfg(feature = "std")]
-use std::collections::HashMap as SlotMap;
-#[cfg(feature = "std")]
-use std::sync::Mutex as StdMutex;
 
 use super::error::Result;
 use super::poller::{Event, Interest, Poller};
 
-#[cfg(feature = "std")]
-struct Lock<T>(StdMutex<T>);
-
-#[cfg(feature = "std")]
-impl<T> Lock<T> {
-    fn new(val: T) -> Self {
-        Self(StdMutex::new(val))
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, T> {
-        self.0.lock().expect("reactor mutex poisoned")
-    }
-}
-
-#[cfg(feature = "std")]
-impl<T: core::fmt::Debug> core::fmt::Debug for Lock<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(&self.0, f)
-    }
-}
-
-#[cfg(all(feature = "eko", not(feature = "std")))]
 struct Lock<T>(eko::thread::Mutex<T>);
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 impl<T> Lock<T> {
     fn new(val: T) -> Self {
         Self(eko::thread::Mutex::new(val))
@@ -91,16 +63,12 @@ impl<T> Lock<T> {
     }
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 impl<T> core::fmt::Debug for Lock<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(&self.0, f)
     }
 }
 
-#[cfg(feature = "std")]
-type ThreadJoinHandle = std::thread::JoinHandle<()>;
-#[cfg(all(feature = "eko", not(feature = "std")))]
 type ThreadJoinHandle = eko::thread::JoinHandle<()>;
 
 /// The wakers waiting on one descriptor.
@@ -752,17 +720,6 @@ impl Reactor {
         });
 
         let worker = Arc::clone(&shared);
-        #[cfg(feature = "std")]
-        let thread = std::thread::Builder::new()
-            .name("nago-wss-reactor".into())
-            // The one place this crate still needs `std`: it owns a thread.
-            // Everything on the I/O path below is libc. A spawn failure is an
-            // OS refusal, so it is reported as one rather than as a new error
-            // kind that would exist for this single call.
-            .spawn(move || run(&worker))
-            .map_err(|error| super::error::Errno(error.raw_os_error().unwrap_or(libc::EAGAIN)))?;
-
-        #[cfg(all(feature = "eko", not(feature = "std")))]
         let thread = eko::thread::Builder::new()
             .name("nago-wss-reactor")
             .spawn(move || run(&worker))
@@ -956,7 +913,6 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
         // a hash.
         // `None` when no shared pool is running, in which case there is
         // nothing to route onto and starting one here would be wrong.
-        #[cfg(any(feature = "std", feature = "eko"))]
         let _routed = crate::runtime::route_reactor_wake(index);
         waker.wake();
     }

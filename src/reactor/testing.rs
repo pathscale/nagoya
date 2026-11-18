@@ -8,6 +8,7 @@
 // crate-wide deny is lifted here for the same reason as in `poller`.
 #![allow(unsafe_code)]
 
+use eko::libc_lite as libc;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// A connected pair of non-blocking Unix sockets.
@@ -19,8 +20,8 @@ pub(super) fn socket_pair() -> (OwnedFd, OwnedFd) {
     for fd in fds {
         // SAFETY: `fd` is a descriptor socketpair just returned.
         unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let flags = libc::fcntl2(fd, libc::F_GETFL);
+            libc::fcntl3(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
     }
     // SAFETY: both descriptors are fresh and owned exclusively here.

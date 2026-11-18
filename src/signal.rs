@@ -49,7 +49,7 @@
 
 #![allow(unsafe_code)]
 
-#[cfg(feature = "std")]
+#[cfg(any())]
 mod std_signal {
     use std::future::Future;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -829,10 +829,6 @@ mod std_signal {
     }
 }
 
-#[cfg(feature = "std")]
-pub use self::std_signal::*;
-
-#[cfg(all(feature = "eko", not(feature = "std")))]
 mod eko_signal {
     use core::future::Future;
     use core::pin::Pin;
@@ -1023,7 +1019,7 @@ mod eko_signal {
             }
             let bit = 1u64 << sig;
             if CLAIMED.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
-                return Err(Errno(eko::libc_lite::EBUSY));
+                return Err(Errno(16));
             }
             Ok(Self(sig))
         }
@@ -1134,5 +1130,4 @@ mod eko_signal {
     }
 }
 
-#[cfg(all(feature = "eko", not(feature = "std")))]
 pub use self::eko_signal::*;

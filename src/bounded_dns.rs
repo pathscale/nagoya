@@ -7,29 +7,19 @@
 use crate::reactor::socket::Addr;
 use crate::resolve::{self, ResolveError};
 use crate::time::{self, Sleep};
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use alloc::borrow::ToOwned;
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use alloc::format;
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use alloc::string::String;
 use alloc::sync::Arc;
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
-#[cfg(all(feature = "eko", not(feature = "std")))]
 use eko::thread::{self, Condvar, Mutex, OnceLock};
 use futures_util::task::AtomicWaker;
-#[cfg(feature = "std")]
-use std::sync::{Condvar, Mutex, OnceLock};
-#[cfg(feature = "std")]
-use std::thread;
 
 const WORKERS: usize = 2;
 const WAITING: usize = 8;
@@ -45,8 +35,7 @@ impl core::fmt::Display for ResolverStartError {
         f.write_str(&self.message)
     }
 }
-#[cfg(feature = "std")]
-impl std::error::Error for ResolverStartError {}
+impl core::error::Error for ResolverStartError {}
 
 /// Failure to accept a DNS result before the absolute deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,8 +60,7 @@ impl core::fmt::Display for ResolveUntilError {
         }
     }
 }
-#[cfg(feature = "std")]
-impl std::error::Error for ResolveUntilError {}
+impl core::error::Error for ResolveUntilError {}
 
 struct Mailbox {
     value: Mutex<Option<Result<Vec<Addr>, ResolveError>>>,
@@ -90,14 +78,7 @@ struct ReplySender {
 impl ReplySender {
     fn send(self, result: Result<Vec<Addr>, ResolveError>) {
         if !self.abandoned.load(Ordering::Acquire) {
-            #[cfg(feature = "std")]
-            if let Ok(mut slot) = self.mailbox.value.lock() {
-                *slot = Some(result);
-            }
-            #[cfg(all(feature = "eko", not(feature = "std")))]
-            {
-                *self.mailbox.value.lock() = Some(result);
-            }
+            *self.mailbox.value.lock() = Some(result);
         }
         self.mailbox.waker.wake();
     }
@@ -177,15 +158,8 @@ impl Resolver {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
                     // Publish the predicate under the same mutex workers use for wait.
-                    #[cfg(feature = "std")]
-                    if let Ok(_queue) = inner.queue.lock() {
-                        inner.closed.store(true, Ordering::Release);
-                    }
-                    #[cfg(all(feature = "eko", not(feature = "std")))]
-                    {
-                        let _queue = inner.queue.lock();
-                        inner.closed.store(true, Ordering::Release);
-                    }
+                    let _queue = inner.queue.lock();
+                    inner.closed.store(true, Ordering::Release);
                     inner.available.notify_all();
                     for handle in handles {
                         let _ = handle.join();
@@ -203,18 +177,6 @@ impl Resolver {
     /// Permanently close admission and drain queued requests without joining workers.
     /// A call already inside libc finishes on its worker; this resolver cannot restart.
     pub fn close(&self) {
-        #[cfg(feature = "std")]
-        let drained = match self.inner.queue.lock() {
-            Ok(mut queue) => {
-                self.inner.closed.store(true, Ordering::Release);
-                queue.drain(..).collect::<Vec<_>>()
-            }
-            Err(poisoned) => {
-                self.inner.closed.store(true, Ordering::Release);
-                poisoned.into_inner().drain(..).collect::<Vec<_>>()
-            }
-        };
-        #[cfg(all(feature = "eko", not(feature = "std")))]
         let drained = {
             let mut queue = self.inner.queue.lock();
             self.inner.closed.store(true, Ordering::Release);
@@ -249,13 +211,6 @@ impl Resolver {
             },
             abandoned: Arc::clone(&abandoned),
         };
-        #[cfg(feature = "std")]
-        let mut queue = match self.inner.queue.try_lock() {
-            Ok(q) => q,
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(ResolveUntilError::Closed),
-            Err(std::sync::TryLockError::WouldBlock) => return Err(ResolveUntilError::Busy),
-        };
-        #[cfg(all(feature = "eko", not(feature = "std")))]
         let Some(mut queue) = self.inner.queue.try_lock() else {
             return Err(ResolveUntilError::Busy);
         };
@@ -347,21 +302,6 @@ fn poll_mailbox(
 ) -> Option<Result<Result<Vec<Addr>, ResolveError>, ()>> {
     let mut registered = false;
     for _ in 0..2 {
-        #[cfg(feature = "std")]
-        let mut slot = match reply.mailbox.value.try_lock() {
-            Ok(slot) => slot,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if !registered {
-                    reply.mailbox.waker.register(cx.waker());
-                    registered = true;
-                    continue;
-                } else {
-                    return None;
-                }
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => return Some(Err(())),
-        };
-        #[cfg(all(feature = "eko", not(feature = "std")))]
         let mut slot = match reply.mailbox.value.try_lock() {
             Some(slot) => slot,
             None => {
@@ -392,25 +332,9 @@ fn poll_mailbox(
 fn worker(inner: Arc<Inner>) {
     loop {
         let job = {
-            #[cfg(feature = "std")]
-            let mut queue = match inner.queue.lock() {
-                Ok(q) => q,
-                Err(_) => return,
-            };
-            #[cfg(all(feature = "eko", not(feature = "std")))]
             let mut queue = inner.queue.lock();
             while queue.is_empty() && !inner.closed.load(Ordering::Acquire) {
-                #[cfg(feature = "std")]
-                {
-                    queue = match inner.available.wait(queue) {
-                        Ok(q) => q,
-                        Err(_) => return,
-                    };
-                }
-                #[cfg(all(feature = "eko", not(feature = "std")))]
-                {
-                    queue = inner.available.wait(queue);
-                }
+                queue = inner.available.wait(queue);
             }
             if inner.closed.load(Ordering::Acquire) {
                 return;
@@ -488,7 +412,6 @@ mod tests {
             let receiver = self
                 .releases
                 .lock()
-                .unwrap()
                 .remove(&port)
                 .expect("each held worker has a release channel");
             receiver
@@ -540,7 +463,7 @@ mod tests {
         let observation_deadline = std::time::Instant::now() + Duration::from_millis(500);
         let mut receiver_removed = false;
         while started && std::time::Instant::now() < observation_deadline {
-            if let Ok(map) = gate.releases.try_lock() {
+            if let Some(map) = gate.releases.try_lock() {
                 if !map.contains_key(&1) {
                     receiver_removed = true;
                     break;
@@ -710,7 +633,6 @@ mod tests {
         let resolver = Resolver::start(Arc::new(move |_, port| {
             release_rx
                 .lock()
-                .unwrap()
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap();
             addrs(port)
@@ -802,7 +724,7 @@ mod tests {
         guard.release();
 
         wait_for_disconnect(reply);
-        assert!(reply.mailbox.value.lock().unwrap().is_none());
+        assert!(reply.mailbox.value.lock().is_none());
         assert_eq!(
             future.as_mut().poll(&mut cx),
             Poll::Ready(Err(ResolveUntilError::Deadline))

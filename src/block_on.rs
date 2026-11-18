@@ -15,9 +15,6 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 /// A one-shot signal from a waker to the thread inside `block_on`.
 struct Signal {
     woken: AtomicBool,
-    #[cfg(feature = "std")]
-    thread: std::thread::Thread,
-    #[cfg(all(feature = "eko", not(feature = "std")))]
     host: crate::runtime::EkoHost,
 }
 
@@ -25,42 +22,19 @@ impl Signal {
     fn new() -> Self {
         Self {
             woken: AtomicBool::new(false),
-            #[cfg(feature = "std")]
-            thread: std::thread::current(),
-            #[cfg(all(feature = "eko", not(feature = "std")))]
             host: crate::runtime::EkoHost::new(1),
         }
     }
 
     fn wake(&self) {
         self.woken.store(true, Ordering::Release);
-        #[cfg(feature = "std")]
-        self.thread.unpark();
-        #[cfg(all(feature = "eko", not(feature = "std")))]
         self.host.unpark_slot(0);
     }
 
     /// Wait for a wake, and report whether one had already arrived.
     fn wait(&self) {
-        #[cfg(feature = "std")]
-        while !self.woken.swap(false, Ordering::AcqRel) {
-            // `park` may return spuriously, which the loop absorbs, and a wake
-            // that landed before the park leaves a permit, so this cannot miss
-            // one.
-            std::thread::park();
-        }
-
-        #[cfg(all(feature = "eko", not(feature = "std")))]
         while !self.woken.swap(false, Ordering::AcqRel) {
             self.host.park_slot(0);
-        }
-
-        // Without a `std` there is no thread to park. Spinning is the honest
-        // fallback: a caller on a target with an idle instruction should reach
-        // for the pool and `Host::park` instead of this.
-        #[cfg(not(any(feature = "std", feature = "eko")))]
-        while !self.woken.swap(false, Ordering::AcqRel) {
-            core::hint::spin_loop();
         }
     }
 }
