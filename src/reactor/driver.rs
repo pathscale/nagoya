@@ -197,6 +197,24 @@ impl Handle {
     /// is in use; dropping it deregisters. `fd` must be non-blocking and must
     /// outlive the registration.
     pub fn register(&self, fd: i32, interest: Interest) -> Result<Registration> {
+        self.register_with(fd, interest, true)
+    }
+
+    /// Register a socket whose non-blocking `connect` is still in flight.
+    ///
+    /// Starts with `writable` cleared before inserting the descriptor into the
+    /// poller so [`Connected`](crate::net::Connected) sleeps until the kernel
+    /// delivers the completion edge instead of spinning on cached writability.
+    pub(crate) fn register_connecting(&self, fd: i32, interest: Interest) -> Result<Registration> {
+        self.register_with(fd, interest, false)
+    }
+
+    fn register_with(
+        &self,
+        fd: i32,
+        interest: Interest,
+        initial_writable: bool,
+    ) -> Result<Registration> {
         let index = self.shared.next_index.fetch_add(1, Ordering::Relaxed);
 
         // A fresh index is never already present, so the generation starts at
@@ -216,13 +234,14 @@ impl Handle {
             // registration. If data is there it is read, and if it is not the
             // `EWOULDBLOCK` path parks correctly with the edge still ahead.
             //
-            // `writable` starts there too, and for a stronger reason than
-            // symmetry: a fresh socket has room by definition, so waiting for
-            // an edge to be told so would be waiting for one that has already
-            // gone by. That is a hang on the first write, not a slow one.
+            // For an already-connected socket, `writable` starts there too:
+            // a fresh socket has room by definition, so waiting for an edge to
+            // be told so would be waiting for one that has already gone by.
+            // An in-flight connect starts at `false` and marks writability once
+            // its handshake settles.
             wakers: Lock::new(Wakers {
                 readable: true,
-                writable: true,
+                writable: initial_writable,
                 ..Wakers::default()
             }),
         });
@@ -893,7 +912,7 @@ fn dispatch(shared: &Arc<Shared>, events: &[Event], pending: &mut Vec<(u64, Wake
                     pending.extend(accept.waiting.drain(..).map(|(_, waker)| (index, waker)));
                 }
             }
-            if event.writable {
+            if event.writable || event.hangup {
                 wakers.writable = true;
                 pending.extend(wakers.writer.take().map(|waker| (index, waker)));
             }

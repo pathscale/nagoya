@@ -132,11 +132,19 @@ impl TcpStream {
     }
 
     fn register_connect(socket: TcpSocket, addr: Addr, handle: &Handle) -> Result<Self> {
-        let mut stream = Self::from_socket(socket, handle)?;
         // A Unix-domain connect does not go in flight, so there is no later
         // answer to wait for and waiting would never end.
-        stream.connecting = !matches!(addr, Addr::Path(_));
-        Ok(stream)
+        if matches!(addr, Addr::Path(_)) {
+            return Self::from_socket(socket, handle);
+        }
+        let registration = handle.register_connecting(socket.raw(), Interest::BOTH)?;
+        let send_capacity = socket.send_buffer().unwrap_or(0);
+        Ok(Self {
+            inner: socket,
+            registration,
+            connecting: true,
+            send_capacity,
+        })
     }
 
     /// Wait for an in-flight connect to finish.
@@ -396,8 +404,10 @@ impl core::future::Future for Connected<'_> {
             Err(error) => return Poll::Ready(Err(error)),
             Ok(()) if this.stream.inner.peer_addr().is_ok() => {
                 // Settled, so a second await of this is free rather than two
-                // more syscalls.
+                // more syscalls, and the first write can proceed without
+                // waiting for another writable edge.
                 this.stream.connecting = false;
+                this.stream.registration.mark_writable();
                 return Poll::Ready(Ok(()));
             }
             Ok(()) => {}
@@ -1388,6 +1398,57 @@ mod accept_recovery_tests {
         assert!(matches!(accepted, Poll::Ready(Ok(_))), "{accepted:?}");
         assert!(listener.poll_accept(&mut cx).is_pending());
         drop(peer);
+        reactor.shutdown();
+    }
+
+    #[test]
+    fn in_flight_connect_parks_without_self_waking() {
+        let reactor = crate::reactor::Reactor::local().expect("reactor");
+        let handle = reactor.handle();
+        // Unroutable TEST-NET-1 endpoint keeps non-blocking connect in EINPROGRESS
+        // during the immediate first poll so we can assert zero spurious self-wake.
+        let mut stream = TcpStream::connect_started(Addr::V4([192, 0, 2, 1], 443), &handle)
+            .expect("connect_started");
+        if stream.peer_addr().is_err() && stream.inner.connect_error().is_ok() {
+            let (wakes, waker) = counted_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = core::pin::pin!(stream.connected());
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(
+                wakes.0.load(Ordering::Relaxed),
+                0,
+                "in-flight connect must park rather than self-wake in a busy loop"
+            );
+        }
+        drop(stream);
+
+        // Also verify localhost connect completes and leaves the stream writable.
+        let listener = TcpListener::bind(Addr::localhost(0), &handle).expect("listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut client = TcpStream::connect_started(addr, &handle).expect("client connect");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (_, waker) = counted_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = core::pin::pin!(client.connected());
+            if let Poll::Ready(res) = fut.as_mut().poll(&mut cx) {
+                res.expect("connected");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "localhost connect timed out"
+            );
+            reactor
+                .poll_once_timeout(Some(20_000_000))
+                .expect("poll_once");
+        }
+        let (_, waker) = counted_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            client.poll_write(&mut cx, b"ok"),
+            Poll::Ready(Ok(2))
+        ));
         reactor.shutdown();
     }
 }

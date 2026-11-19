@@ -1,6 +1,6 @@
 [package]
 name = "nagoya"
-version = "0.1.25"
+version = "0.1.26"
 publish = ["crates-io"]
 edition = "2024"
 rust-version = "1.85"
