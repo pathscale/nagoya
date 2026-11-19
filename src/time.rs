@@ -545,15 +545,17 @@ mod driver {
                     if deadline <= now {
                         continue;
                     }
-                    let wait_ms = ((deadline - now) / 1_000_000).clamp(1, 50);
-                    drop(nudged);
-                    eko::sleep_ms(wait_ms);
+                    let (guard, _) = signal.wait_timeout(
+                        nudged,
+                        core::time::Duration::from_nanos(deadline - now),
+                    );
+                    nudged = guard;
                 }
                 None => {
                     nudged = signal.wait(nudged);
-                    *nudged = false;
                 }
             }
+            *nudged = false;
         }
     }
 }
@@ -710,5 +712,23 @@ mod tests {
         let first = now_ns();
         let second = now_ns();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn shorter_timer_armed_after_longer_timer_interrupts_driver_wait() {
+        let started = Instant::now();
+        block_on(async {
+            let out = timeout(Duration::from_secs(2), async {
+                sleep(Duration::from_millis(5)).await;
+                42
+            })
+            .await;
+            assert_eq!(out, Ok(42));
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "5ms sleep inside 2s timeout took {:?}",
+            started.elapsed()
+        );
     }
 }
