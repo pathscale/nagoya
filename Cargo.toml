@@ -1,6 +1,6 @@
 [package]
 name = "nagoya"
-version = "0.1.22"
+version = "0.1.23"
 publish = ["crates-io"]
 edition = "2024"
 rust-version = "1.85"
@@ -23,7 +23,7 @@ syscall-counters = ["reactor"]
 [dependencies]
 ps-st3 = { version = "^0.6", default-features = false, features = ["fanout"] }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
-ekostd = { version = "^0.2.10", default-features = false }
+ekostd = { version = "0.2.10" }
 libc = { version = "^0.2.189", default-features = false, optional = true }
 # The task itself: one allocation holding the future, its state machine, its
 # waker vtable and its output, with `Runnable::into_raw` handing the pointer
