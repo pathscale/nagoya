@@ -135,8 +135,7 @@ impl core::fmt::Display for CreditRequestTooLarge {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for CreditRequestTooLarge {}
+impl core::error::Error for CreditRequestTooLarge {}
 
 /// CPU admission using a host's monotonic current-worker CPU nanosecond clock.
 ///

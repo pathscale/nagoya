@@ -352,8 +352,7 @@ impl core::fmt::Display for StreamError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for StreamError {}
+impl core::error::Error for StreamError {}
 
 #[cfg(feature = "std")]
 impl From<StreamError> for std::io::Error {

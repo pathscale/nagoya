@@ -79,8 +79,7 @@ impl core::fmt::Display for DeadlineOverflow {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for DeadlineOverflow {}
+impl core::error::Error for DeadlineOverflow {}
 
 /// Round up to a configured coarse delivery quantum. Never round earlier.
 /// u64::MAX is reserved by the reactor for an unarmed deadline.
