@@ -138,6 +138,96 @@ impl Poller {
 
 // --- eko ------------------------------------------------------------------
 
+#[cfg(target_os = "none")]
+mod sys {
+    use alloc::vec::Vec;
+
+    use super::super::error::{Errno, Result};
+    use super::{Event, Interest};
+    use eko::epoll::{EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP};
+    use eko::reactive::{ReactiveRing, UkReactiveEvent};
+
+    pub(super) struct Poller {
+        ring: ReactiveRing,
+    }
+
+    impl core::fmt::Debug for Poller {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Poller")
+                .field("capacity", &self.ring.capacity())
+                .finish()
+        }
+    }
+
+    impl Poller {
+        pub(super) fn new() -> Result<Self> {
+            let ring = ReactiveRing::create(0).map_err(|e| Errno(e.0))?;
+            Ok(Self { ring })
+        }
+
+        fn mask(interest: Interest) -> u32 {
+            let mut mask = 0u32;
+            if interest.readable {
+                mask |= EPOLLIN | EPOLLRDHUP;
+            }
+            if interest.writable {
+                mask |= EPOLLOUT;
+            }
+            mask
+        }
+
+        pub(super) fn add(&self, fd: i32, token: u64, interest: Interest) -> Result<()> {
+            self.ring
+                .add(fd, token, Self::mask(interest))
+                .map_err(|e| Errno(e.0))
+        }
+
+        pub(super) fn modify(&self, fd: i32, token: u64, interest: Interest) -> Result<()> {
+            self.ring
+                .modify(fd, token, Self::mask(interest))
+                .map_err(|e| Errno(e.0))
+        }
+
+        pub(super) fn remove(&self, fd: i32) -> Result<()> {
+            self.ring.remove(fd).map_err(|e| Errno(e.0))
+        }
+
+        pub(super) fn wait(&self, out: &mut Vec<Event>, timeout_ns: Option<u64>) -> Result<()> {
+            const CAPACITY: usize = 256;
+            let mut events = [UkReactiveEvent::default(); CAPACITY];
+
+            let (count, _user_wake, _overflow) = match self.ring.wait_timeout_ns(&mut events, timeout_ns) {
+                Ok(res) => res,
+                Err(error) => {
+                    let errno = Errno(error.0);
+                    if errno.interrupted() {
+                        return Ok(());
+                    }
+                    return Err(errno);
+                }
+            };
+
+            for event in &events[..count] {
+                let flags = event.flags;
+                let failed = (flags & (EPOLLHUP | EPOLLERR)) != 0;
+                out.push(Event {
+                    token: event.token,
+                    readable: failed || (flags & EPOLLIN) != 0,
+                    writable: failed || (flags & EPOLLOUT) != 0,
+                    hangup: failed || (flags & EPOLLRDHUP) != 0,
+                });
+            }
+
+            Ok(())
+        }
+
+        pub(super) fn wake(&self) -> Result<()> {
+            self.ring.wake().map_err(|e| Errno(e.0))
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
 mod sys {
     use alloc::vec::Vec;
 
